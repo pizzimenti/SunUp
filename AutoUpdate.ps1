@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.4.0'
+$script:Version = '0.4.1'
 
 $Root          = 'C:\ProgramData\AutoUpdate'
 $LogDir        = Join-Path $Root 'logs'

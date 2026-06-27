@@ -214,13 +214,16 @@ else {
 # Closing via the X also counts as "seen".
 $script:win.Add_Closed({ Clear-PendingShow })
 
+# NOTE: use $script:isDark here, NOT $using: — $using only works in remoting/job scriptblocks;
+# in a WPF event handler it throws and the try/catch would silently skip BOTH DWM calls.
+$script:isDark = ($light -eq 0)
 $script:win.Add_SourceInitialized({
   try {
     $h = (New-Object System.Windows.Interop.WindowInteropHelper $script:win).Handle
     Add-Type -Namespace W -Name Dwm -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr h, int a, ref int v, int s);' -ErrorAction SilentlyContinue
-    $dark = [int]([int]$using:light -eq 0)
-    [W.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$dark, 4) | Out-Null
-    $acrylic = 3; [W.Dwm]::DwmSetWindowAttribute($h, 38, [ref]$acrylic, 4) | Out-Null
+    $dark = [int]$script:isDark
+    [W.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$dark, 4) | Out-Null    # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE
+    $acrylic = 3; [W.Dwm]::DwmSetWindowAttribute($h, 38, [ref]$acrylic, 4) | Out-Null  # 38 = backdrop, 3 = Acrylic
   } catch {}
   if ($showCountdown) { $script:timer.Start() }
 })

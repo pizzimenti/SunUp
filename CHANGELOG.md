@@ -2,6 +2,15 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.1] - 2026-06-27
+
+### Fixed
+- Dialog title bar stayed light on a dark system theme: the `SourceInitialized` handler used
+  `$using:light`, which is only valid in remoting/job scriptblocks — in a WPF event handler it
+  throws, and the `try/catch` silently skipped BOTH DWM calls (dark title bar *and* acrylic).
+  Switched to a script-scope `$script:isDark`. Title bar now follows the theme and the acrylic
+  backdrop actually applies.
+
 ## [0.4.0] - 2026-06-27
 
 ### Changed
@@ -100,6 +109,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.4.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.1
 [0.4.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.0
 [0.3.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.1
