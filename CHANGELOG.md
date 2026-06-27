@@ -2,6 +2,25 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-06-27
+
+### Changed
+- **Dialog shows after EVERY cycle**, even when nothing was updated (friendly "You're up to date"
+  empty state).
+- **Reboot trigger reverted to "is a reboot pending when checked"** (`Test-PendingReboot`), not the
+  v0.3.1 per-run signal. Chrome sets no pending flag → never prompts; Dell/WU drivers do → countdown
+  — even if a *prior* run installed them. (Removes the v0.3.1/0.3.2 "only this run" gating.)
+- **Pre- and post-reboot dialogs both show the changes table.** One payload drives both; the dialog
+  re-checks the live pending-reboot state at display time: pending now → table + cancellable
+  countdown (Restart now / Postpone); already rebooted → table + "Restarted to finish" + Close.
+- **A newer cycle replaces an open dialog** (`AutoUpdate-Notify` → `MultipleInstances=StopExisting`).
+- Post-reboot (and headless-run) summaries appear at next sign-in via an **AtLogon trigger** on the
+  notify task; display is gated by a `pendingShow` flag the dialog clears once seen.
+
+### Added
+- `notify\` subfolder (payload `latest-updates.json` moved here); installer grants the interactive
+  user **Modify** on it so the non-elevated dialog can clear `pendingShow`.
+
 ## [0.3.2] - 2026-06-27
 
 ### Changed
@@ -81,6 +100,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.4.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.0
 [0.3.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.1
 [0.3.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.0

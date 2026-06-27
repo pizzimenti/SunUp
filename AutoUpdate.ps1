@@ -36,17 +36,19 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.3.2'
+$script:Version = '0.4.0'
 
-$Root        = 'C:\ProgramData\AutoUpdate'
-$LogDir      = Join-Path $Root 'logs'
-$LogFile     = Join-Path $LogDir 'autoupdate.log'
-$HistoryFile = Join-Path $LogDir 'history.jsonl'
-$RunsDir     = Join-Path $LogDir 'runs'
-$ReportFile  = Join-Path $Root 'REPORT.md'
-$ConfigFile  = Join-Path $Root 'config.json'
-$StampFile   = Join-Path $Root 'lastrun.json'
-$EvtSource   = 'AutoUpdate'
+$Root          = 'C:\ProgramData\AutoUpdate'
+$LogDir        = Join-Path $Root 'logs'
+$LogFile       = Join-Path $LogDir 'autoupdate.log'
+$HistoryFile   = Join-Path $LogDir 'history.jsonl'
+$RunsDir       = Join-Path $LogDir 'runs'
+$ReportFile    = Join-Path $Root 'REPORT.md'
+$ConfigFile    = Join-Path $Root 'config.json'
+$StampFile     = Join-Path $Root 'lastrun.json'
+$NotifyDir     = Join-Path $Root 'notify'                       # user-writable (Install grants Modify)
+$NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
+$EvtSource     = 'AutoUpdate'
 $SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
 
 $script:RunDir = $null   # set in Run mode once we create the per-run dir
@@ -462,14 +464,14 @@ $result = [ordered]@{
   components          = $results
   updates             = @($script:Updates)
 }
-# Only reboot when an update INSTALLED THIS RUN asked for it — never for a pre-existing
-# pending-reboot state (so e.g. a Chrome-only run never prompts a restart).
-# Ownership: user logged in → the dialog owns a cancellable countdown; headless → engine reboots.
+# Reboot when one is actually PENDING when checked — Chrome sets no pending flag (no prompt),
+# Dell/WU drivers do (countdown). Ownership: user logged in → the dialog owns a cancellable
+# countdown; headless → the engine reboots itself. policy=never never reboots.
 $interactive      = Test-InteractiveUser
 $graceInteractive = if ($cfg.rebootGraceInteractiveSec) { [int]$cfg.rebootGraceInteractiveSec } else { 300 }
-$willReboot       = $rebootRequiredByRun -and $cfg.rebootPolicy -eq 'always'
-if ($willReboot)              { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
-elseif ($rebootRequiredByRun) { $result.rebootAction = 'suppressed' }
+$willReboot       = $rebootPending -and $cfg.rebootPolicy -eq 'always'
+if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
+elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
 $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
@@ -500,43 +502,41 @@ try {
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 } catch { Write-Log WARN "run-dir retention: $_" }
 
-# ---- notify dialog payload --------------------------------------------------
+# ---- notify dialog payload (shown after EVERY cycle; pendingShow gates display) ----
 $notifyEnabled = (-not ($cfg.PSObject.Properties.Name -contains 'notify')) -or $cfg.notify.enabled
 $totalSize = ($script:Updates | ForEach-Object { $_.sizeMB } | Where-Object { $_ } | Measure-Object -Sum).Sum
 $payload = [ordered]@{
-  title              = 'Updates installed'
+  title              = if (@($script:Updates).Count -gt 0) { 'Updates installed' } else { 'Update check complete' }
   runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
   totalDurationSec   = $durSec
   totalSizeMB        = if ($totalSize) { [math]::Round($totalSize, 1) } else { $null }
-  rebootRequired     = $willReboot          # only true when we actually intend to reboot
+  rebootRequired     = $willReboot          # dialog re-checks live pending state to flip pre/post
   rebootCountdownSec = $graceInteractive
+  pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
 }
-try { $payload | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Root 'latest-updates.json') } catch { Write-Log WARN "latest-updates.json: $_" }
+try { New-Item -ItemType Directory -Force -Path $NotifyDir | Out-Null } catch {}
+try { $payload | ConvertTo-Json -Depth 6 | Set-Content $NotifyPayload } catch { Write-Log WARN "notify payload: $_" }
 
 # ---- coordinated reboot -----------------------------------------------------
 if ($willReboot -and $interactive) {
   Write-Log INFO "Reboot pending; interactive user — the dialog owns a ${graceInteractive}s countdown (engine will NOT reboot out from under you)."
-  Write-Evt 2005 Warning "AutoUpdate: updates applied; ${graceInteractive}s restart countdown handed to the user dialog."
+  Write-Evt 2005 Warning "AutoUpdate: ${graceInteractive}s restart countdown handed to the user dialog."
 }
 elseif ($willReboot) {
-  Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in)."
-  Write-Evt 2005 Warning "AutoUpdate applied updates; headless reboot in $($cfg.rebootDelaySeconds)s."
-}
-elseif ($rebootRequiredByRun) {
-  # An update this run needed a reboot, but policy=never — surface it, don't act.
-  Write-Log INFO 'An update required a reboot but rebootPolicy != always — leaving box up.'
-  Write-Evt 2005 Warning 'AutoUpdate: an installed update needs a reboot (policy=never). Manual reboot needed.'
-  Raise-SysSentryAlert 'An installed update requires a reboot (rebootPolicy=never) — reboot when convenient.'
+  Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in); summary shows at next logon."
+  Write-Evt 2005 Warning "AutoUpdate: headless reboot in $($cfg.rebootDelaySeconds)s."
 }
 elseif ($rebootPending) {
-  # Pre-existing pending reboot, NOT caused by this run — note it quietly, never prompt.
-  Write-Log INFO 'Note: a reboot is pending from a prior operation (not this run) — not prompting.'
+  Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
+  Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
 }
 else { Write-Log INFO 'No reboot required.' }
 
-# Show the summary dialog if something changed, or a reboot needs the user's decision.
-if ($notifyEnabled -and (@($script:Updates).Count -gt 0 -or ($willReboot -and $interactive))) {
+# Show the dialog now if a user is logged in (covers every cycle, even 0 updates). Headless
+# runs leave pendingShow=true so the AutoUpdate-Notify logon trigger shows it at next sign-in
+# (also how the post-reboot summary appears). StopExisting makes a newer cycle replace it.
+if ($notifyEnabled -and $interactive) {
   try { Start-ScheduledTask -TaskName 'AutoUpdate-Notify' -ErrorAction Stop; Write-Log INFO 'Launched AutoUpdate-Notify dialog.' }
   catch { Write-Log WARN "could not start AutoUpdate-Notify: $_" }
 }

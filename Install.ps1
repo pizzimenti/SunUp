@@ -8,9 +8,15 @@ doesn't read as security drift.
 #>
 $ErrorActionPreference = 'Stop'
 
-$Root = 'C:\ProgramData\AutoUpdate'
-$Bin  = Join-Path $Root 'bin'
-New-Item -ItemType Directory -Force -Path $Bin, (Join-Path $Root 'logs') | Out-Null
+$Root    = 'C:\ProgramData\AutoUpdate'
+$Bin     = Join-Path $Root 'bin'
+$Notify  = Join-Path $Root 'notify'
+New-Item -ItemType Directory -Force -Path $Bin, (Join-Path $Root 'logs'), $Notify | Out-Null
+# The dialog runs as the non-elevated interactive user and must read the payload + clear its
+# pendingShow flag, so grant that account Modify on the notify subfolder only (rest stays admin-only).
+$nUser = "$env:USERDOMAIN\$env:USERNAME"
+& icacls $Notify /grant "${nUser}:(OI)(CI)M" /T 2>&1 | Out-Null
+Write-Host "Granted $nUser Modify on $Notify"
 Copy-Item (Join-Path $PSScriptRoot 'AutoUpdate.ps1')       $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')          $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Show-UpdateDialog.ps1') $Bin -Force
@@ -120,14 +126,17 @@ Write-Host "Registered task 'AutoUpdate' (Daily 08:00, Boot+1h, Resume+1h)."
 # On-demand only (no triggers) — the SYSTEM engine fires it via Start-ScheduledTask.
 # Interactive logon type = no stored password, runs in the user's desktop session;
 # if nobody's logged in it simply doesn't run (no one to show UI to).
-$nUser      = "$env:USERDOMAIN\$env:USERNAME"
 $nAction    = New-ScheduledTaskAction -Execute $pwsh -Argument "-STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\Show-UpdateDialog.ps1`""
 $nPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Limited
+# Parallel (StopExisting isn't exposed by this cmdlet) + the dialog closes any other open
+# AutoUpdate dialog on startup => a newer cycle replaces an open one. AtLogon trigger => post-reboot
+# (and headless-run) summaries appear at sign-in (the dialog self-gates on the pendingShow flag).
 $nSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName 'AutoUpdate-Notify' -Action $nAction -Principal $nPrincipal -Settings $nSettings -Force `
-  -Description 'Shows the AutoUpdate summary dialog (and owns the restart countdown) in the interactive user session. Started on demand by the AutoUpdate engine.' | Out-Null
-Write-Host "Registered task 'AutoUpdate-Notify' (interactive, on-demand) as $nUser."
+  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel
+$nLogon     = New-ScheduledTaskTrigger -AtLogOn -User $nUser
+Register-ScheduledTask -TaskName 'AutoUpdate-Notify' -Action $nAction -Principal $nPrincipal -Settings $nSettings -Trigger $nLogon -Force `
+  -Description 'Shows the AutoUpdate summary dialog (and owns the restart countdown) in the interactive user session. Fired on demand by the engine; AtLogon shows a not-yet-seen cycle (e.g. post-reboot). Self-gates on notify\latest-updates.json pendingShow.' | Out-Null
+Write-Host "Registered task 'AutoUpdate-Notify' (interactive, on-demand + AtLogon) as $nUser."
 
 # ---- refresh SysSentry baseline so the new task isn't flagged as drift ------
 $sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'
