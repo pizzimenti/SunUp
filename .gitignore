@@ -1,0 +1,6 @@
+# Runtime/deployed artifacts never belong in source
+logs/
+*.log
+lastrun.json
+state.json
+dell-bios-scan.log
