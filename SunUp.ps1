@@ -154,7 +154,7 @@ function Flush-Report {
 
 function Raise-SysSentryAlert { param($Msg)
   if (-not (Test-Path $SysSentryAlerts)) { return }
-  try { "- **{0:yyyy-MM-dd HH:mm}** `[AUTOUPDATE`] {1}" -f (Get-Date), $Msg | Add-Content $SysSentryAlerts } catch {}
+  try { "- **{0:yyyy-MM-dd HH:mm}** `[$($Name.ToUpper())`] {1}" -f (Get-Date), $Msg | Add-Content $SysSentryAlerts } catch {}
 }
 
 # ---- per-day stamp ----------------------------------------------------------
