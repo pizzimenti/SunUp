@@ -6,10 +6,13 @@ param([switch]$Purge)
 $ErrorActionPreference = 'Continue'
 
 $Name = 'SunUp'
-foreach ($t in @($Name, "$Name-Notify", 'AutoUpdate', 'AutoUpdate-Notify')) {
+# Stop the tray process if it's running, then remove all tasks.
+Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", 'AutoUpdate', 'AutoUpdate-Notify')) {
   Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
 }
-Write-Host "Unregistered tasks '$Name' + '$Name-Notify' (and any legacy AutoUpdate tasks)."
+Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' (and any legacy AutoUpdate tasks)."
 
 if ($Purge) {
   Remove-Item "C:\ProgramData\$Name" -Recurse -Force -ErrorAction SilentlyContinue
