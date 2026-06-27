@@ -2,6 +2,18 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] - 2026-06-27
+
+### Changed
+- **Restart is offered only when an update installed THIS RUN actually requires it** — never for a
+  pre-existing/unrelated pending-reboot state. A Chrome-only run (winget exit 0) never prompts a
+  restart. The per-run signal comes from each installer: winget reboot exit codes (MSI 3010 +
+  `0x8A150077/78/79`, treated as success-with-reboot), Windows Update's per-update/post-install
+  reboot status, and dcu-cli exit **1** (reboot required by this apply) — exit **5** (reboot pending
+  from a prior op) explicitly does NOT count. `result.json` gains `rebootRequiredByRun`; the global
+  `rebootPending` is kept for Status/info only. A pre-existing pending reboot is logged quietly,
+  never prompted.
+
 ## [0.3.0] - 2026-06-27
 
 ### Added
@@ -59,6 +71,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.3.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.1
 [0.3.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.1.0

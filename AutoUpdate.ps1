@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.3.0'
+$script:Version = '0.3.1'
 
 $Root        = 'C:\ProgramData\AutoUpdate'
 $LogDir      = Join-Path $Root 'logs'
@@ -174,10 +174,10 @@ function Test-PendingReboot {
 function Invoke-Component { param([string]$Name, [scriptblock]$Body)
   Write-Log INFO "${Name}: starting…"
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $r  = [ordered]@{ name = $Name; status = 'error'; detail = ''; error = $null; durationSec = 0; log = "$Name.log" }
+  $r  = [ordered]@{ name = $Name; status = 'error'; detail = ''; error = $null; reboot = $false; durationSec = 0; log = "$Name.log" }
   try {
     $res = & $Body
-    if ($res) { $r.status = $res.status; $r.detail = "$($res.detail)"; if ($res.error) { $r.error = "$($res.error)" } }
+    if ($res) { $r.status = $res.status; $r.detail = "$($res.detail)"; if ($res.error) { $r.error = "$($res.error)" }; if ($res.reboot) { $r.reboot = $true } }
   } catch {
     $r.status = 'error'
     $r.error  = $_.Exception.Message
@@ -225,9 +225,13 @@ function Comp-WindowsUpdate { param($Cfg)
     $kb = if ($u.KB) { "$($u.KB)" } else { 'installed' }
     Add-Update -Name "$($u.Title)" -Source 'Windows Update' -Old '—' -New $kb -DurationSec $null -SizeMB $mb
   }
-  $detail = "$installed installed, $failed failed ($($items.Count) offered)"
-  if ($failed -gt 0) { return @{ status = 'error'; detail = $detail; error = "$failed update(s) failed — see windowsupdate.log" } }
-  @{ status = 'ok'; detail = $detail }
+  # Did any update we just installed ask for a reboot? Prefer the per-update flag; fall
+  # back to WU's post-install reboot status (the box's WU flag was clear before this run).
+  $reboot = @($items | Where-Object { $_.PSObject.Properties.Name -contains 'RebootRequired' -and $_.RebootRequired }).Count -gt 0
+  if (-not $reboot) { try { $reboot = [bool](Get-WURebootStatus -Silent -ErrorAction Stop) } catch {} }
+  $detail = "$installed installed, $failed failed ($($items.Count) offered)" + $(if ($reboot) { '; reboot required' } else { '' })
+  if ($failed -gt 0) { return @{ status = 'error'; detail = $detail; error = "$failed update(s) failed — see windowsupdate.log"; reboot = $reboot } }
+  @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
 
 # Parse winget's fixed-width "upgrade" table into {name,id,old,new}. English headers
@@ -274,7 +278,9 @@ function Comp-Winget { param($Cfg)
   if ($excl) { $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl }) }
   if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
 
-  $ok = 0; $fail = 0
+  # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
+  $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
+  $ok = 0; $fail = 0; $reboot = $false
   foreach ($p in $pending) {
     Write-CompLog 'winget' "--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -282,14 +288,15 @@ function Comp-Winget { param($Cfg)
     $sw.Stop(); $code = $LASTEXITCODE
     $txt = $o | Out-String
     Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
-    if ($code -eq 0) {
+    if ($code -eq 0 -or $code -in $rebootCodes) {
       $ok++
+      if ($code -in $rebootCodes) { $reboot = $true; Write-Log INFO "winget: $($p.id) installed — reboot required" }
       Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetSizeMB $txt)
     } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
-  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))"
-  if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log" } }
-  @{ status = 'ok'; detail = $detail }
+  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))" + $(if ($reboot) { '; reboot required' } else { '' })
+  if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log"; reboot = $reboot } }
+  @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
 
 function Comp-Dell { param($Cfg)
@@ -312,12 +319,15 @@ function Comp-Dell { param($Cfg)
   Write-CompLog 'dell-bios-scan' $scanOut
   $m = [regex]::Match(($scanOut | Out-String), 'applicable updates?\D*(\d+)')
   $biosCount = if ($m.Success) { [int]$m.Groups[1].Value } else { -1 }
+  # dcu exit 1 = reboot required by THIS apply (count it). exit 5 = reboot pending from a
+  # PRIOR op / nothing applied now (do NOT count — that's not this run's doing).
+  $reboot = ($applyCode -eq 1)
   if ($biosCount -gt 0) {
     Raise-SysSentryAlert "Dell BIOS update available ($biosCount, not auto-applied) — review the run dir dell-bios-scan.log"
-    return @{ status = 'ok'; detail = "drivers/firmware applied (exit $applyCode); BIOS update AVAILABLE ($biosCount, not flashed)" }
+    return @{ status = 'ok'; reboot = $reboot; detail = "drivers/firmware applied (exit $applyCode); BIOS update AVAILABLE ($biosCount, not flashed)" }
   }
   $biosDetail = if ($biosCount -eq 0) { 'no BIOS update' } else { 'BIOS scan inconclusive (see dell-bios-scan.log)' }
-  @{ status = 'ok'; detail = "drivers/firmware applied (exit $applyCode); $biosDetail" }
+  @{ status = 'ok'; reboot = $reboot; detail = "drivers/firmware applied (exit $applyCode); $biosDetail" }
 }
 
 function Comp-PSModules {
@@ -428,7 +438,8 @@ if ($cfg.winget.enabled)        { $results.Add( (Invoke-Component 'winget'      
 if ($cfg.dell.enabled)          { $results.Add( (Invoke-Component 'dell'          { Comp-Dell $cfg }) ) }
 if ($cfg.psModules.enabled)     { $results.Add( (Invoke-Component 'psModules'     { Comp-PSModules }) ) }
 
-$rebootPending = Test-PendingReboot
+$rebootPending       = Test-PendingReboot                                  # global state (info/Status only)
+$rebootRequiredByRun = @($results | Where-Object reboot).Count -gt 0        # did THIS run's updates ask for it?
 $errors  = @($results | Where-Object status -eq 'error')
 $endUtc  = (Get-Date).ToUniversalTime()
 $durSec  = [math]::Round(($endUtc - $startUtc).TotalSeconds, 1)
@@ -443,18 +454,20 @@ $result = [ordered]@{
   durationSec   = $durSec
   version       = $script:Version
   forced        = [bool]$Force
-  rebootPending = $rebootPending
-  rebootAction  = 'none'
-  components    = $results
-  updates       = @($script:Updates)
+  rebootPending       = $rebootPending
+  rebootRequiredByRun = $rebootRequiredByRun
+  rebootAction        = 'none'
+  components          = $results
+  updates             = @($script:Updates)
 }
-# Reboot ownership: with a user logged in, the interactive dialog owns a cancellable
-# countdown; headless (nobody to ask), the engine reboots itself. policy=never never reboots.
+# Only reboot when an update INSTALLED THIS RUN asked for it — never for a pre-existing
+# pending-reboot state (so e.g. a Chrome-only run never prompts a restart).
+# Ownership: user logged in → the dialog owns a cancellable countdown; headless → engine reboots.
 $interactive      = Test-InteractiveUser
 $graceInteractive = if ($cfg.rebootGraceInteractiveSec) { [int]$cfg.rebootGraceInteractiveSec } else { 300 }
-$willReboot       = $rebootPending -and $cfg.rebootPolicy -eq 'always'
-if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
-elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
+$willReboot       = $rebootRequiredByRun -and $cfg.rebootPolicy -eq 'always'
+if ($willReboot)              { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
+elseif ($rebootRequiredByRun) { $result.rebootAction = 'suppressed' }
 
 $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
@@ -508,10 +521,15 @@ elseif ($willReboot) {
   Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in)."
   Write-Evt 2005 Warning "AutoUpdate applied updates; headless reboot in $($cfg.rebootDelaySeconds)s."
 }
+elseif ($rebootRequiredByRun) {
+  # An update this run needed a reboot, but policy=never — surface it, don't act.
+  Write-Log INFO 'An update required a reboot but rebootPolicy != always — leaving box up.'
+  Write-Evt 2005 Warning 'AutoUpdate: an installed update needs a reboot (policy=never). Manual reboot needed.'
+  Raise-SysSentryAlert 'An installed update requires a reboot (rebootPolicy=never) — reboot when convenient.'
+}
 elseif ($rebootPending) {
-  Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
-  Write-Evt 2005 Warning 'AutoUpdate: reboot pending (policy=never). Manual reboot needed.'
-  Raise-SysSentryAlert 'Reboot pending after updates (rebootPolicy=never) — reboot when convenient.'
+  # Pre-existing pending reboot, NOT caused by this run — note it quietly, never prompt.
+  Write-Log INFO 'Note: a reboot is pending from a prior operation (not this run) — not prompting.'
 }
 else { Write-Log INFO 'No reboot required.' }
 
