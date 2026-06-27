@@ -2,6 +2,27 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] - 2026-06-27
+
+### Changed — capture every column the sources actually expose (no more avoidable blanks)
+- **Dell now records real name + version + download size** per applied update, parsed from
+  `dcu-cli /scan -report` XML (`<name>`/`<version>`/`<bytes>`), instead of the old generic
+  `'installed'` / `—`. The engine scans to an XML report first, partitions into apply (driver/
+  firmware/utility) vs BIOS (report-only), applies, then records the applied set from the report.
+- **Dell exit codes are interpreted correctly.** Previously every result was labelled
+  "drivers/firmware applied (exit N)" even when nothing applied. Now: `0`=applied, `1`=applied+reboot,
+  `5`=reboot pending from a prior op (nothing applied now), `500`=no applicable updates, else=warn.
+- **Windows Update fills the "old" column for OS updates** by snapshotting the build (`CurrentBuild.UBR`)
+  before/after the run — a Cumulative/Feature/Servicing-Stack update shows `26200.8737 -> 26200.9xxx`
+  instead of a blank. Per-update size is still taken from WU when it reports it.
+- **Batch installers (WU, Dell) now show a Duration** — the measured install/apply batch span. Exact
+  for a single-item batch; the shared batch total when several install together (documented).
+
+### Notes — the only two cells that can still legitimately show "—"
+- **Defender download size**: no Defender API exposes the signature-package size.
+- **Dell "old" version**: dcu-cli's report lists only the *available* version, never the installed one.
+These are source limitations, not logging gaps — the data doesn't exist to capture.
+
 ## [0.5.0] - 2026-06-27
 
 ### Changed
@@ -165,6 +186,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.6.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.5.0
 [0.4.3]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.3
 [0.4.2]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.2
