@@ -54,6 +54,21 @@ If — and only if — an update leaves a reboot **pending**, the dialog owns a 
 logged in, the engine reboots headlessly after a grace period and shows the summary at next sign-in.
 Set `rebootPolicy: "never"` to never auto-reboot.
 
+## System tray
+
+Windows has no service-manager UI for a scheduled task, so SunUp adds a **tray presence** — a sun
+icon (amber when a reboot is pending) launched at logon. Right-click for:
+
+<img src="docs/tray-menu.png" alt="SunUp tray menu" width="280">
+
+- **Run now** — trigger an update pass immediately
+- **Show last summary** — re-open the most recent dialog
+- **Open logs folder**
+- **Auto-reboot when needed** — toggle `rebootPolicy` (checkmark reflects current state)
+- **Exit**
+
+The tooltip shows the last run and reboot-pending state; a balloon pops when a run completes.
+
 ## Logging
 
 Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:

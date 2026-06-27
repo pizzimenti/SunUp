@@ -78,6 +78,7 @@ Write-Host "Granted $nUser Modify on $Notify"
 Copy-Item (Join-Path $PSScriptRoot 'SunUp.ps1')            $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')          $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Show-UpdateDialog.ps1') $Bin -Force
+Copy-Item (Join-Path $PSScriptRoot 'SunUp-Tray.ps1')       $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
@@ -198,6 +199,25 @@ Register-ScheduledTask -TaskName $NotifyTask -Action $nAction -Principal $nPrinc
   -Description 'Shows the SunUp summary dialog (and owns the restart countdown) in the interactive user session. Fired on demand by the engine; AtLogon shows a not-yet-seen cycle (e.g. post-reboot). Self-gates on notify\latest-updates.json pendingShow.' | Out-Null
 Write-Host "Registered task '$NotifyTask' (interactive, on-demand + AtLogon) as $nUser."
 
+# ---- tray task: persistent system-tray presence in the interactive session ---
+# AtLogon, single-instance (IgnoreNew + the script's own mutex), never times out. RunLevel Highest
+# so its "Run now" can trigger the SYSTEM SunUp task and its "Auto-reboot" toggle can edit config.json.
+$TrayTask   = "$Name-Tray"
+$trAction   = New-ScheduledTaskAction -Execute $pwsh -Argument "-STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\SunUp-Tray.ps1`""
+$trPrincipal= New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Highest
+$trSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+$trLogon    = New-ScheduledTaskTrigger -AtLogOn -User $nUser
+Register-ScheduledTask -TaskName $TrayTask -Action $trAction -Principal $trPrincipal -Settings $trSettings -Trigger $trLogon -Force `
+  -Description 'SunUp system-tray presence (sun icon + menu: Run now / Show last summary / Open logs / Auto-reboot toggle). Logon-launched, single-instance, in the interactive user session.' | Out-Null
+Write-Host "Registered task '$TrayTask' (interactive, AtLogon) as $nUser."
+# (Re)start the tray now so it's present without waiting for the next logon. Stop any prior instance
+# first so the new build takes over (the mutex would otherwise make the new one exit immediately).
+try { Stop-ScheduledTask -TaskName $TrayTask -ErrorAction SilentlyContinue } catch {}
+Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+try { Start-ScheduledTask -TaskName $TrayTask -ErrorAction Stop; Write-Host "Started '$TrayTask'." } catch { Write-Host "(tray will start at next logon)" }
+
 # ---- remove the old AutoUpdate tasks/source now that SunUp's are live --------
 Remove-OldInstall
 
@@ -205,9 +225,10 @@ Remove-OldInstall
 $sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'
 if (Test-Path $sentry) {
   Write-Host 'Refreshing SysSentry baseline…'
-  & $pwsh -NoProfile -ExecutionPolicy Bypass -File $sentry -Mode Baseline
+  & $pwsh -NoProfile -ExecutionPolicy Bypass -File $sentry -Mode Baseline | Out-Null
 }
 
 Write-Host ''
 Write-Host 'SunUp installed. Verify:  pwsh -File C:\ProgramData\SunUp\bin\Status.ps1'
 Write-Host 'Dry run now (bypass day stamp): pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Run -Force'
+exit 0   # success — don't let a sub-step's native exit code (e.g. the baseline tool) become ours

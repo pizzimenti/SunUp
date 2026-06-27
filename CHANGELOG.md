@@ -2,6 +2,19 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-06-27
+
+### Added — system-tray presence (`SunUp-Tray.ps1`)
+- Windows has no service-manager face for a scheduled task, so SunUp now has a **tray icon** (a sun;
+  turns amber when a reboot is pending) with a right-click menu: a header (last run + next scheduled
+  run), **Run now** (triggers the SYSTEM task), **Show last summary** (re-opens the dialog), **Open
+  logs folder**, an **Auto-reboot when needed** toggle (flips `rebootPolicy` in config; the checkmark
+  reflects state), and **Exit**. Double-clicking the icon opens the last summary. The tip/icon refresh
+  on a 45s timer, and a **balloon** pops when a new run completes.
+- Launched at logon by a new **`SunUp-Tray`** task (interactive user, single-instance via a named
+  mutex + `MultipleInstances=IgnoreNew`, `RunLevel Highest` so its actions can drive the SYSTEM task
+  and edit config). `Install.ps1` registers and starts it; `Uninstall.ps1` stops and removes it.
+
 ## [0.6.0] - 2026-06-27
 
 ### Changed — capture every column the sources actually expose (no more avoidable blanks)
@@ -186,6 +199,7 @@ These are source limitations, not logging gaps — the data doesn't exist to cap
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.7.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.5.0
 [0.4.3]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.3
