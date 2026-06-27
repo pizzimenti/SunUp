@@ -26,7 +26,7 @@ if (-not (Test-Path $ConfigFile)) {
   "keepRuns": 30,
   "notify":        { "enabled": true },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
-  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic" },
+  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack" },
   "defender":      { "enabled": true },
   "psModules":     { "enabled": true },
   "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },

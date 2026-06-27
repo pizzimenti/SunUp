@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.3.1'
+$script:Version = '0.3.2'
 
 $Root        = 'C:\ProgramData\AutoUpdate'
 $LogDir      = Join-Path $Root 'logs'
@@ -60,7 +60,9 @@ $DefaultConfig = [ordered]@{
   keepRuns           = 30            # how many per-run log dirs to retain
   notify             = [ordered]@{ enabled = $true }   # pop the Win11 summary dialog after a run that changed something
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic' }
+  # Skip pinned drivers, self-updating Claude, and load-bearing per-user/Electron apps whose
+  # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
+  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack' }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true }
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }

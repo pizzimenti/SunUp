@@ -2,6 +2,16 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.2] - 2026-06-27
+
+### Changed
+- `winget.excludePattern` now also skips load-bearing per-user/Electron apps whose uninstaller
+  refuses to run while open: **LM Studio** (the `:1234` API), Spotify, Discord, Slack (added
+  `ElementLabs|LM ?Studio|Spotify|Discord|Slack`). Surfaced when a per-package winget upgrade tried
+  to update a *running* LM Studio and its uninstall step failed (harmless — winget aborted, install
+  left intact). Note: these are per-user (HKCU) installs, so the real SYSTEM task never sees them;
+  this guards manual/user-session runs and documents intent. Such apps self-update anyway.
+
 ## [0.3.1] - 2026-06-27
 
 ### Changed
@@ -71,6 +81,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.3.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.1
 [0.3.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.2.0
