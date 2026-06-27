@@ -78,6 +78,8 @@ Write-Host "Granted $nUser Modify on $Notify"
 Copy-Item (Join-Path $PSScriptRoot 'SunUp.ps1')            $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')          $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Show-UpdateDialog.ps1') $Bin -Force
+# Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
+Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
 # ---- config (seed only; never clobber local edits on reinstall) -------------
 $ConfigFile = Join-Path $Root 'config.json'
