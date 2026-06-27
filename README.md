@@ -36,13 +36,37 @@ After everything, a single **coordinated reboot** if anything left one pending
 (`rebootPolicy: always`, with a 120s `shutdown /a`-able countdown). The box's Automatic services
 (Tailscale, sshd) bring it back on the tailnet so mistral's reach is restored on boot.
 
-## Layout
+## Layout & logging
 
 - Source: `C:\Users\user\Code\AutoUpdate` (this repo)
 - Deployed: `C:\ProgramData\AutoUpdate\bin\{AutoUpdate.ps1,Status.ps1}`
-- Outputs: `logs\autoupdate.log`, `REPORT.md` (digests), `config.json`, `lastrun.json`,
-  `dell-bios-scan.log`. Application event log source `AutoUpdate`
-  (2000 start, 2001 clean, 2005 reboot, 2010 errors).
+
+Logging is three tiers so a failure is trivial to trace:
+
+```
+C:\ProgramData\AutoUpdate\
+  logs\autoupdate.log              curated rolling timeline (rotated at 5MB × 5)
+  logs\history.jsonl               one compact JSON line per run — the queryable trail
+  logs\runs\<yyyy-MM-dd_HHmmss>\   per-run dir (last `keepRuns`, default 30):
+      run.log            this run's curated timeline
+      transcript.log     full Start-Transcript capture (catches anything unexpected)
+      <component>.log    RAW output of each tool: defender / windowsupdate / winget /
+                         dell-apply / dell-bios-scan / psmodules
+      result.json        structured per-component result (status, detail, error, durationSec)
+```
+
+Plus `REPORT.md` (human digest), Application event log (source `AutoUpdate`: 2000 start, 2001 clean,
+2005 reboot, 2010 errors), and failures echoed into SysSentry `ALERTS.md`.
+
+**Find what went wrong, fast:**
+
+```powershell
+pwsh -File C:\ProgramData\AutoUpdate\bin\AutoUpdate.ps1 -Mode Errors   # last failed runs + error text + tail of the failing tool's log
+pwsh -File C:\ProgramData\AutoUpdate\bin\AutoUpdate.ps1 -Mode Tail     # tail of the most recent run.log
+# or query the trail directly, e.g. last 5 runs' component statuses:
+Get-Content C:\ProgramData\AutoUpdate\logs\history.jsonl | Select-Object -Last 5 |
+  ForEach-Object { $_ | ConvertFrom-Json } | ForEach-Object { "$($_.date): " + (($_.components | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', ') }
+```
 
 ## Manage
 
