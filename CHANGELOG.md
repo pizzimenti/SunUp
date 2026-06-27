@@ -2,6 +2,15 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.2] - 2026-06-27
+
+### Fixed
+- **Restart from the dialog silently did nothing.** Two stacked bugs: the `AutoUpdate-Notify` task
+  ran `RunLevel Limited`, so `shutdown.exe` was Access-Denied (the CLI needs an elevated token even
+  though the privilege is held); and `Invoke-Restart` used `Start-Process` with no `-Wait/-PassThru`,
+  discarding the error. Now the notify task runs `RunLevel Highest`, and `Invoke-Restart` captures
+  `shutdown.exe`'s exit code to `notify\reboot.log` and falls back to `Restart-Computer -Force`.
+
 ## [0.4.1] - 2026-06-27
 
 ### Fixed
@@ -109,6 +118,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.4.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.2
 [0.4.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.1
 [0.4.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.0
 [0.3.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.2

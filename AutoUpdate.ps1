@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.4.1'
+$script:Version = '0.4.2'
 
 $Root          = 'C:\ProgramData\AutoUpdate'
 $LogDir        = Join-Path $Root 'logs'
@@ -64,7 +64,7 @@ $DefaultConfig = [ordered]@{
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
   # Skip pinned drivers, self-updating Claude, and load-bearing per-user/Electron apps whose
   # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack' }
+  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams' }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true }
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }

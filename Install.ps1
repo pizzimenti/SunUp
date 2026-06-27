@@ -32,7 +32,7 @@ if (-not (Test-Path $ConfigFile)) {
   "keepRuns": 30,
   "notify":        { "enabled": true },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
-  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack" },
+  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams" },
   "defender":      { "enabled": true },
   "psModules":     { "enabled": true },
   "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },
@@ -127,7 +127,9 @@ Write-Host "Registered task 'AutoUpdate' (Daily 08:00, Boot+1h, Resume+1h)."
 # Interactive logon type = no stored password, runs in the user's desktop session;
 # if nobody's logged in it simply doesn't run (no one to show UI to).
 $nAction    = New-ScheduledTaskAction -Execute $pwsh -Argument "-STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\Show-UpdateDialog.ps1`""
-$nPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Limited
+# RunLevel Highest so the dialog can actually reboot (shutdown.exe is denied to a non-elevated
+# token). Elevated scheduled task = no UAC prompt; same pattern as the box's elevated-terminal task.
+$nPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Highest
 # Parallel (StopExisting isn't exposed by this cmdlet) + the dialog closes any other open
 # AutoUpdate dialog on startup => a newer cycle replaces an open one. AtLogon trigger => post-reboot
 # (and headless-run) summaries appear at sign-in (the dialog self-gates on the pendingShow flag).
