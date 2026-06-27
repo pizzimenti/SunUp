@@ -2,6 +2,27 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-06-27
+
+### Added
+- **Win11 summary dialog after each run that changed something** (`Show-UpdateDialog.ps1`): an
+  acrylic-backdrop WPF window with a gridlined table — package, source, old version, new version,
+  duration, download size — plus summary chips (count / total size / total time). Light/dark + accent
+  aware. Shown via a new on-demand **`AutoUpdate-Notify`** task that runs in the interactive user
+  session (SYSTEM can't show UI); engine fires it with `Start-ScheduledTask`.
+- **Per-item update capture**: winget now upgrades packages individually so each one's old→new
+  version, duration, and download size are recorded; Windows Update items carry KB + size; Dell
+  drivers and Defender signature bumps are recorded too. Written to `latest-updates.json` and into
+  `result.json` (`updates[]`).
+- **Reboot ownership split** (fixes the restart-race): when a user is logged in, the dialog owns a
+  visible, cancellable countdown (`rebootGraceInteractiveSec`, default 300s) with Restart now /
+  Postpone — the engine no longer reboots out from under an interactive user. Headless (no user),
+  the engine reboots itself after `rebootDelaySeconds` as before. `policy=never` never reboots.
+- `winget.excludePattern` (default `NVIDIA|GeForce|Claude|Anthropic`) — per-item skip of pinned/
+  self-updating packages now that winget upgrades one at a time. `notify.enabled` config toggle.
+- `Get-Config` merges the on-disk config over defaults, so a config written by an older version
+  still resolves keys added later.
+
 ## [0.2.0] - 2026-06-27
 
 ### Added
@@ -38,5 +59,6 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.3.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.1.0

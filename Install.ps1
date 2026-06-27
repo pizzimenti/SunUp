@@ -11,8 +11,9 @@ $ErrorActionPreference = 'Stop'
 $Root = 'C:\ProgramData\AutoUpdate'
 $Bin  = Join-Path $Root 'bin'
 New-Item -ItemType Directory -Force -Path $Bin, (Join-Path $Root 'logs') | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'AutoUpdate.ps1') $Bin -Force
-Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')     $Bin -Force
+Copy-Item (Join-Path $PSScriptRoot 'AutoUpdate.ps1')       $Bin -Force
+Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')          $Bin -Force
+Copy-Item (Join-Path $PSScriptRoot 'Show-UpdateDialog.ps1') $Bin -Force
 
 # ---- config (seed only; never clobber local edits on reinstall) -------------
 $ConfigFile = Join-Path $Root 'config.json'
@@ -21,8 +22,11 @@ if (-not (Test-Path $ConfigFile)) {
 {
   "rebootPolicy": "always",
   "rebootDelaySeconds": 120,
+  "rebootGraceInteractiveSec": 300,
+  "keepRuns": 30,
+  "notify":        { "enabled": true },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
-  "winget":        { "enabled": true, "pinIds": [] },
+  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic" },
   "defender":      { "enabled": true },
   "psModules":     { "enabled": true },
   "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },
@@ -111,6 +115,19 @@ Register-ScheduledTask -TaskName 'AutoUpdate' -Action $action -Principal $princi
   -Trigger @($tDaily, $tBoot, $tResume) -Force `
   -Description 'caldera daily update routine (WU/winget/Defender/Dell/PS modules). Daily 08:00 if awake; else +1h after boot/resume. Once per day via lastrun.json stamp.' | Out-Null
 Write-Host "Registered task 'AutoUpdate' (Daily 08:00, Boot+1h, Resume+1h)."
+
+# ---- notify task: runs in the INTERACTIVE USER session to show the dialog ----
+# On-demand only (no triggers) — the SYSTEM engine fires it via Start-ScheduledTask.
+# Interactive logon type = no stored password, runs in the user's desktop session;
+# if nobody's logged in it simply doesn't run (no one to show UI to).
+$nUser      = "$env:USERDOMAIN\$env:USERNAME"
+$nAction    = New-ScheduledTaskAction -Execute $pwsh -Argument "-STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\Show-UpdateDialog.ps1`""
+$nPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Limited
+$nSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'AutoUpdate-Notify' -Action $nAction -Principal $nPrincipal -Settings $nSettings -Force `
+  -Description 'Shows the AutoUpdate summary dialog (and owns the restart countdown) in the interactive user session. Started on demand by the AutoUpdate engine.' | Out-Null
+Write-Host "Registered task 'AutoUpdate-Notify' (interactive, on-demand) as $nUser."
 
 # ---- refresh SysSentry baseline so the new task isn't flagged as drift ------
 $sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'

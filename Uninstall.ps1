@@ -4,8 +4,9 @@
 param([switch]$Purge)
 $ErrorActionPreference = 'Continue'
 
-Unregister-ScheduledTask -TaskName 'AutoUpdate' -Confirm:$false -ErrorAction SilentlyContinue
-Write-Host "Unregistered task 'AutoUpdate'."
+Unregister-ScheduledTask -TaskName 'AutoUpdate'        -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'AutoUpdate-Notify' -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "Unregistered tasks 'AutoUpdate' + 'AutoUpdate-Notify'."
 
 if ($Purge) {
   Remove-Item 'C:\ProgramData\AutoUpdate' -Recurse -Force -ErrorAction SilentlyContinue

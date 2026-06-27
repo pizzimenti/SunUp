@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.2.0'
+$script:Version = '0.3.0'
 
 $Root        = 'C:\ProgramData\AutoUpdate'
 $LogDir      = Join-Path $Root 'logs'
@@ -55,10 +55,12 @@ $script:RunLog = $null
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
   rebootPolicy       = 'always'
-  rebootDelaySeconds = 120
+  rebootDelaySeconds = 120           # headless (no user logged in) restart grace
+  rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
   keepRuns           = 30            # how many per-run log dirs to retain
+  notify             = [ordered]@{ enabled = $true }   # pop the Win11 summary dialog after a run that changed something
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
-  winget             = [ordered]@{ enabled = $true; pinIds = @() }
+  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic' }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true }
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
@@ -67,10 +69,22 @@ $DefaultConfig = [ordered]@{
 }
 
 function Get-Config {
+  # Start from defaults, then overlay the file (2 levels deep) so a config written by an
+  # older version still resolves keys added later (notify, excludePattern, keepRuns, …).
+  $cfg = $DefaultConfig | ConvertTo-Json -Depth 6 | ConvertFrom-Json
   if (Test-Path $ConfigFile) {
-    try { return (Get-Content $ConfigFile -Raw | ConvertFrom-Json) } catch { Write-Log WARN "config.json unreadable ($_), using defaults" }
+    try {
+      $file = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+      foreach ($p in $file.PSObject.Properties) {
+        if ($p.Value -is [psobject] -and ($cfg.PSObject.Properties.Name -contains $p.Name) -and ($cfg.$($p.Name) -is [psobject])) {
+          foreach ($sp in $p.Value.PSObject.Properties) { $cfg.$($p.Name) | Add-Member -NotePropertyName $sp.Name -NotePropertyValue $sp.Value -Force }
+        } else {
+          $cfg | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force
+        }
+      }
+    } catch { Write-Log WARN "config.json unreadable ($_), using defaults" }
   }
-  return ($DefaultConfig | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+  $cfg
 }
 
 # ---- logging ----------------------------------------------------------------
@@ -103,6 +117,18 @@ function Write-CompLog { param($Name, $Lines)
 
 $script:Report = [System.Collections.Generic.List[string]]::new()
 function Add-Report { param($Msg) $script:Report.Add($Msg) }
+
+# Per-item updates that actually changed something — feeds the Win11 summary dialog.
+$script:Updates = [System.Collections.Generic.List[object]]::new()
+function Add-Update { param($Name, $Source, $Old, $New, $DurationSec, $SizeMB)
+  $script:Updates.Add([ordered]@{ name=$Name; source=$Source; old=$Old; new=$New; durationSec=$DurationSec; sizeMB=$SizeMB })
+}
+
+# Is a real user logged into an interactive desktop? Decides who owns the reboot
+# countdown: the interactive dialog (user present) vs. the headless engine (nobody to ask).
+function Test-InteractiveUser {
+  @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object SessionId -gt 0).Count -gt 0
+}
 function Flush-Report {
   if ($script:Report.Count -eq 0) { return }
   $header = "## Run $((Get-Date).ToString('yyyy-MM-dd HH:mm')) — AutoUpdate v$script:Version (log: $([IO.Path]::GetFileName($script:RunDir)))"
@@ -175,6 +201,7 @@ function Comp-Defender {
   Update-MpSignature -ErrorAction Stop
   $after = (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion
   Write-CompLog 'defender' "Signature after:  $after"
+  if ($before -ne $after) { Add-Update -Name 'Microsoft Defender signatures' -Source 'Defender' -Old "$before" -New "$after" -DurationSec $null -SizeMB $null }
   $detail = if ($before -eq $after) { "signatures current ($after)" } else { "signatures $before -> $after" }
   @{ status = 'ok'; detail = $detail }
 }
@@ -193,28 +220,76 @@ function Comp-WindowsUpdate { param($Cfg)
   $installed = @($items | Where-Object Result -eq 'Installed').Count
   $failed    = @($items | Where-Object Result -eq 'Failed').Count
   if ($items.Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
+  foreach ($u in ($items | Where-Object Result -eq 'Installed')) {
+    $mb = if ($u.Size) { try { [math]::Round(([double]$u.Size)/1MB,1) } catch { $null } } else { $null }
+    $kb = if ($u.KB) { "$($u.KB)" } else { 'installed' }
+    Add-Update -Name "$($u.Title)" -Source 'Windows Update' -Old '—' -New $kb -DurationSec $null -SizeMB $mb
+  }
   $detail = "$installed installed, $failed failed ($($items.Count) offered)"
   if ($failed -gt 0) { return @{ status = 'error'; detail = $detail; error = "$failed update(s) failed — see windowsupdate.log" } }
   @{ status = 'ok'; detail = $detail }
+}
+
+# Parse winget's fixed-width "upgrade" table into {name,id,old,new}. English headers
+# (Name/Id/Version/Available/Source) — fine on this box.
+function Parse-WingetUpgrades { param([string[]]$Lines)
+  $sep = -1
+  for ($i = 0; $i -lt $Lines.Count; $i++) { if ($Lines[$i] -match '^\s*-{6,}') { $sep = $i; break } }
+  if ($sep -lt 1) { return @() }
+  $h = $Lines[$sep - 1]
+  $iId = $h.IndexOf('Id'); $iVer = $h.IndexOf('Version'); $iAvail = $h.IndexOf('Available'); $iSrc = $h.IndexOf('Source')
+  if ($iId -lt 0 -or $iVer -lt 0 -or $iAvail -lt 0) { return @() }
+  $out = @()
+  for ($i = $sep + 1; $i -lt $Lines.Count; $i++) {
+    $ln = $Lines[$i]
+    if ([string]::IsNullOrWhiteSpace($ln) -or $ln -match 'upgrades? available|package\(s\)|pinned') { continue }
+    if ($ln.Length -lt $iAvail) { continue }
+    $name = $ln.Substring(0, $iId).Trim()
+    $id   = $ln.Substring($iId, $iVer - $iId).Trim()
+    $old  = $ln.Substring($iVer, $iAvail - $iVer).Trim()
+    $new  = if ($iSrc -gt $iAvail -and $ln.Length -ge $iSrc) { $ln.Substring($iAvail, $iSrc - $iAvail).Trim() } else { $ln.Substring($iAvail).Trim() }
+    if ($id -and $old) { $out += [pscustomobject]@{ name = $name; id = $id; old = $old; new = $new } }
+  }
+  $out
+}
+# Largest "/ N MB" total in winget's download chatter → download size in MB.
+function Get-WingetSizeMB { param([string]$Text)
+  $tot = 0.0
+  foreach ($m in [regex]::Matches($Text, '/\s*(\d+(?:\.\d+)?)\s*(KB|MB|GB)')) {
+    $v = [double]$m.Groups[1].Value
+    switch ($m.Groups[2].Value) { 'KB' { $v /= 1024 } 'GB' { $v *= 1024 } }
+    if ($v -gt $tot) { $tot = $v }
+  }
+  if ($tot -gt 0) { [math]::Round($tot, 1) } else { $null }
 }
 
 function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
   Write-CompLog 'winget' "winget: $winget"
-  foreach ($id in @($Cfg.winget.pinIds)) {
-    if ($id) { Write-CompLog 'winget' (& $winget pin add --id $id --accept-source-agreements 2>&1) }
+  $listRaw = & $winget upgrade --include-unknown --accept-source-agreements 2>&1
+  Write-CompLog 'winget' @('--- available ---') ; Write-CompLog 'winget' $listRaw
+  $pending = Parse-WingetUpgrades ([string[]]($listRaw -split "`r?`n"))
+  $excl = $Cfg.winget.excludePattern
+  if ($excl) { $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl }) }
+  if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
+
+  $ok = 0; $fail = 0
+  foreach ($p in $pending) {
+    Write-CompLog 'winget' "--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+    $sw.Stop(); $code = $LASTEXITCODE
+    $txt = $o | Out-String
+    Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
+    if ($code -eq 0) {
+      $ok++
+      Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetSizeMB $txt)
+    } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
-  Write-CompLog 'winget' '--- available upgrades ---'
-  Write-CompLog 'winget' (& $winget upgrade --include-unknown --accept-source-agreements 2>&1)
-  Write-CompLog 'winget' '--- applying --all ---'
-  $out  = & $winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
-  $code = $LASTEXITCODE
-  Write-CompLog 'winget' $out
-  Write-CompLog 'winget' "exit: 0x$($code.ToString('X8'))"
-  # winget returns non-zero for benign cases (e.g. 0x8A15002B = no applicable upgrades).
-  if ($code -eq 0) { return @{ status = 'ok'; detail = 'upgrades applied' } }
-  @{ status = 'warn'; detail = "completed (exit 0x$($code.ToString('X8')))" }
+  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))"
+  if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log" } }
+  @{ status = 'ok'; detail = $detail }
 }
 
 function Comp-Dell { param($Cfg)
@@ -226,6 +301,10 @@ function Comp-Dell { param($Cfg)
   $applyCode = $LASTEXITCODE
   Write-CompLog 'dell-apply' $apply
   Write-CompLog 'dell-apply' "exit: $applyCode"
+  # Record each installed driver by name (dcu doesn't expose per-driver version/size).
+  foreach ($m in [regex]::Matches(($apply | Out-String), 'Update Name:\s*(.+?)\s*$', 'Multiline')) {
+    Add-Update -Name ($m.Groups[1].Value.Trim()) -Source 'Dell' -Old '—' -New 'installed' -DurationSec $null -SizeMB $null
+  }
   # Report (don't apply) BIOS so a human can decide. Capture the scan's CONSOLE output
   # directly — dcu's -outputLog file isn't reliably created (v0.1.0 bug), but it always
   # prints "Number of applicable updates: N" to stdout.
@@ -367,9 +446,15 @@ $result = [ordered]@{
   rebootPending = $rebootPending
   rebootAction  = 'none'
   components    = $results
+  updates       = @($script:Updates)
 }
-# decide reboot action now so it's recorded in result.json
-if ($rebootPending) { $result.rebootAction = if ($cfg.rebootPolicy -eq 'always') { 'reboot' } else { 'suppressed' } }
+# Reboot ownership: with a user logged in, the interactive dialog owns a cancellable
+# countdown; headless (nobody to ask), the engine reboots itself. policy=never never reboots.
+$interactive      = Test-InteractiveUser
+$graceInteractive = if ($cfg.rebootGraceInteractiveSec) { [int]$cfg.rebootGraceInteractiveSec } else { 300 }
+$willReboot       = $rebootPending -and $cfg.rebootPolicy -eq 'always'
+if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
+elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
 $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
@@ -400,13 +485,28 @@ try {
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 } catch { Write-Log WARN "run-dir retention: $_" }
 
+# ---- notify dialog payload --------------------------------------------------
+$notifyEnabled = (-not ($cfg.PSObject.Properties.Name -contains 'notify')) -or $cfg.notify.enabled
+$totalSize = ($script:Updates | ForEach-Object { $_.sizeMB } | Where-Object { $_ } | Measure-Object -Sum).Sum
+$payload = [ordered]@{
+  title              = 'Updates installed'
+  runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+  totalDurationSec   = $durSec
+  totalSizeMB        = if ($totalSize) { [math]::Round($totalSize, 1) } else { $null }
+  rebootRequired     = $willReboot          # only true when we actually intend to reboot
+  rebootCountdownSec = $graceInteractive
+  items              = @($script:Updates)
+}
+try { $payload | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Root 'latest-updates.json') } catch { Write-Log WARN "latest-updates.json: $_" }
+
 # ---- coordinated reboot -----------------------------------------------------
-if ($rebootPending -and $cfg.rebootPolicy -eq 'always') {
-  $delay = [int]$cfg.rebootDelaySeconds
-  Write-Log INFO "Reboot pending — rebooting in $delay s (policy=always). Abort with: shutdown /a"
-  Write-Evt 2005 Warning "AutoUpdate applied updates; rebooting in $delay s."
-  try { Stop-Transcript | Out-Null } catch {}
-  & shutdown.exe /r /t $delay /c "AutoUpdate: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
+if ($willReboot -and $interactive) {
+  Write-Log INFO "Reboot pending; interactive user — the dialog owns a ${graceInteractive}s countdown (engine will NOT reboot out from under you)."
+  Write-Evt 2005 Warning "AutoUpdate: updates applied; ${graceInteractive}s restart countdown handed to the user dialog."
+}
+elseif ($willReboot) {
+  Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in)."
+  Write-Evt 2005 Warning "AutoUpdate applied updates; headless reboot in $($cfg.rebootDelaySeconds)s."
 }
 elseif ($rebootPending) {
   Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
@@ -415,8 +515,20 @@ elseif ($rebootPending) {
 }
 else { Write-Log INFO 'No reboot required.' }
 
+# Show the summary dialog if something changed, or a reboot needs the user's decision.
+if ($notifyEnabled -and (@($script:Updates).Count -gt 0 -or ($willReboot -and $interactive))) {
+  try { Start-ScheduledTask -TaskName 'AutoUpdate-Notify' -ErrorAction Stop; Write-Log INFO 'Launched AutoUpdate-Notify dialog.' }
+  catch { Write-Log WARN "could not start AutoUpdate-Notify: $_" }
+}
+
 Write-Log INFO "===== AutoUpdate run end ($runStamp) ====="
 try { Stop-Transcript | Out-Null } catch {}
+
+# Headless reboot LAST (after logs/transcript flushed). Interactive reboot is the dialog's job.
+if ($result.rebootAction -eq 'reboot') {
+  $delay = [int]$cfg.rebootDelaySeconds
+  & shutdown.exe /r /t $delay /c "AutoUpdate: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
+}
 
 # Explicit, meaningful exit code so Task Scheduler's LastTaskResult reflects the run —
 # not a native exit code (e.g. Update-Module's access-denied on an in-use module) leaking through.
