@@ -34,7 +34,7 @@ if (-not (Test-Path $ConfigFile)) {
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
   "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams" },
   "defender":      { "enabled": true },
-  "psModules":     { "enabled": true },
+  "psModules":     { "enabled": true, "everyDays": 7 },
   "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },
   "pip":           { "enabled": false },
   "npm":           { "enabled": false }

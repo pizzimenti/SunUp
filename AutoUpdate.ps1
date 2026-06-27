@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.4.2'
+$script:Version = '0.4.3'
 
 $Root          = 'C:\ProgramData\AutoUpdate'
 $LogDir        = Join-Path $Root 'logs'
@@ -46,6 +46,7 @@ $RunsDir       = Join-Path $LogDir 'runs'
 $ReportFile    = Join-Path $Root 'REPORT.md'
 $ConfigFile    = Join-Path $Root 'config.json'
 $StampFile     = Join-Path $Root 'lastrun.json'
+$PSModStamp    = Join-Path $Root 'psmodules-lastrun.json'       # psModules runs weekly, not daily
 $NotifyDir     = Join-Path $Root 'notify'                       # user-writable (Install grants Modify)
 $NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
 $EvtSource     = 'AutoUpdate'
@@ -66,7 +67,7 @@ $DefaultConfig = [ordered]@{
   # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
   winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams' }
   defender           = [ordered]@{ enabled = $true }
-  psModules          = [ordered]@{ enabled = $true }
+  psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
   pip                = [ordered]@{ enabled = $false }
   npm                = [ordered]@{ enabled = $false }
@@ -340,6 +341,22 @@ function Comp-PSModules {
   @{ status = 'ok'; detail = 'Update-Module run' }
 }
 
+# psModules is slow and PSGallery modules rarely change, so gate it to once every N days
+# (default 7) via its own stamp — the rest of the run still happens daily.
+function Test-PSModulesDue {
+  param([int]$EveryDays)
+  if ($EveryDays -le 1) { return $true }
+  try {
+    if (Test-Path $PSModStamp) {
+      $last     = (Get-Content $PSModStamp -Raw | ConvertFrom-Json).date
+      $lastDate = [datetime]::ParseExact($last, 'yyyy-MM-dd', $null)
+      if (((Get-Date).Date - $lastDate).TotalDays -lt $EveryDays) { return $false }
+    }
+  } catch { return $true }   # unreadable stamp → treat as due
+  $true
+}
+function Set-PSModulesStamp { @{ date = (Get-Date).ToString('yyyy-MM-dd') } | ConvertTo-Json | Set-Content $PSModStamp -Encoding UTF8 }
+
 # =====================  query modes  =========================================
 function Get-LatestRunDir { Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1 }
 function Get-LatestResult {
@@ -440,7 +457,16 @@ if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'    
 if ($cfg.windowsUpdate.enabled) { $results.Add( (Invoke-Component 'windowsUpdate' { Comp-WindowsUpdate $cfg }) ) }
 if ($cfg.winget.enabled)        { $results.Add( (Invoke-Component 'winget'        { Comp-Winget $cfg }) ) }
 if ($cfg.dell.enabled)          { $results.Add( (Invoke-Component 'dell'          { Comp-Dell $cfg }) ) }
-if ($cfg.psModules.enabled)     { $results.Add( (Invoke-Component 'psModules'     { Comp-PSModules }) ) }
+if ($cfg.psModules.enabled) {
+  $psEvery = [int]$cfg.psModules.everyDays; if ($psEvery -le 0) { $psEvery = 7 }
+  if (Test-PSModulesDue $psEvery) {
+    $r = Invoke-Component 'psModules' { Comp-PSModules }
+    $results.Add($r)
+    if ($r.status -ne 'error') { Set-PSModulesStamp }   # only stamp a clean run, so a failure retries tomorrow
+  } else {
+    Write-Log INFO "psModules: not due (runs every $psEvery days) — skipping this run."
+  }
+}
 
 $rebootPending       = Test-PendingReboot                                  # global state (info/Status only)
 $rebootRequiredByRun = @($results | Where-Object reboot).Count -gt 0        # did THIS run's updates ask for it?

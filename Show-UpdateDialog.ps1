@@ -184,15 +184,17 @@ function Invoke-Restart {
   if ($script:demo) { $script:countText.Text=''; $script:rebootLbl.Text='Demo — restart skipped.'; return }
   $script:rebooting = $true
   $rl = 'C:\ProgramData\AutoUpdate\notify\reboot.log'
-  # Capture shutdown.exe's result (it's denied for a non-elevated token); fall back to
-  # Restart-Computer. The notify task runs elevated (RunLevel Highest) so this succeeds.
+  # Restart-Computer -Force is the primary path: in this elevated interactive-task context
+  # shutdown.exe returns exit=1 even with the privilege held (observed 2026-06-27 — only the
+  # Restart-Computer fallback actually rebooted), so lead with the proven call and keep
+  # shutdown.exe as the fallback. The visible countdown already served as the warning.
   try {
-    $p = Start-Process shutdown.exe -ArgumentList '/r','/t','5','/c','Restarting to finish updates.' -PassThru -Wait -WindowStyle Hidden
-    "$(Get-Date -Format o) shutdown.exe exit=$($p.ExitCode)" | Add-Content $rl
-    if ($p.ExitCode -ne 0) { "$(Get-Date -Format o) shutdown failed -> Restart-Computer -Force" | Add-Content $rl; Restart-Computer -Force }
+    "$(Get-Date -Format o) Restart-Computer -Force" | Add-Content $rl
+    Restart-Computer -Force
   } catch {
-    "$(Get-Date -Format o) restart EXCEPTION: $_" | Add-Content $rl
-    try { Restart-Computer -Force } catch { "$(Get-Date -Format o) Restart-Computer also failed: $_" | Add-Content $rl }
+    "$(Get-Date -Format o) Restart-Computer failed: $_ -> shutdown.exe fallback" | Add-Content $rl
+    try { Start-Process shutdown.exe -ArgumentList '/r','/t','5','/c','Restarting to finish updates.' -WindowStyle Hidden }
+    catch { "$(Get-Date -Format o) shutdown.exe also failed: $_" | Add-Content $rl }
   }
   $script:win.Close()
 }
@@ -212,7 +214,7 @@ if ($showCountdown) {
   $closeBtn.Add_Click({ if ($script:timer){$script:timer.Stop()}; try { & shutdown.exe /a 2>$null } catch {}; $script:rebootLbl.Text='Restart postponed.'; $script:countText.Text=''; Clear-PendingShow; $script:win.Close() })
 }
 elseif ($postReboot) {
-  $rebootIcon.Text = "&#x2714;"; $rebootIcon.Foreground = $okGreen
+  $rebootIcon.Text = [char]0x2714; $rebootIcon.Foreground = $okGreen   # real ✔ glyph (not the XML entity — this is a runtime .Text assignment, not XAML)
   $script:rebootLbl.Text = 'Restarted to finish updates.'
   $restartBtn.Visibility = 'Collapsed'; $closeBtn.Content = 'Close'
   $closeBtn.Add_Click({ Clear-PendingShow; $script:win.Close() })

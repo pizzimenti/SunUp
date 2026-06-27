@@ -2,6 +2,25 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.3] - 2026-06-27
+
+### Fixed
+- **Post-reboot dialog showed the literal text `&#x2714;`** instead of a green ✔. The two
+  checkmarks in the *XAML string* render fine (XamlReader decodes XML entities), but the
+  post-reboot branch assigned `"&#x2714;"` directly to a `TextBlock.Text` property at runtime —
+  not XAML, so it displayed verbatim. Now assigns the real glyph via `[char]0x2714`.
+
+### Changed
+- **Dialog restart now leads with `Restart-Computer -Force`**, with `shutdown.exe` as the fallback
+  (was the reverse). In the elevated interactive-task context `shutdown.exe` returns **exit=1 even
+  with the privilege held** (observed during the 0.4.2 real-reboot test — only the
+  `Restart-Computer` fallback actually rebooted), so the proven call now goes first. The visible
+  countdown already serves as the user warning.
+- **PowerShell module updates moved to weekly** (`psModules.everyDays`, default 7), gated by their
+  own `psmodules-lastrun.json` stamp — the slowest component (~5–7 min) for the rarest payload now
+  runs ~once a week instead of daily, cutting the typical daily run to ~2–3 min. The rest of the
+  cycle still runs every day. A failed module run isn't stamped, so it retries the next day.
+
 ## [0.4.2] - 2026-06-27
 
 ### Fixed
@@ -118,6 +137,7 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.4.3]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.3
 [0.4.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.2
 [0.4.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.1
 [0.4.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.0
