@@ -1,94 +1,121 @@
-# AutoUpdate — caldera's own daily update routine
+# SunUp
 
-Windows Update's built-in scheduling on this box is unreliable, so AutoUpdate replaces it
-with a deterministic, logged, once-per-day routine that patches **everything** safe to patch
-unattended. Companion to [ProcWatch](../ProcWatch) (realtime CPU) and
-[SysSentry](../SysSentry) (security drift).
+**Your Windows box, updated by the time you sit down.** SunUp is a self-contained, unattended
+update routine for Windows — one scheduled run each morning that patches *everything safe to patch*
+and shows you a clean summary of what changed. It exists because Windows Update's built-in scheduling
+is unreliable: it drifts, defers, and reboots on its own clock instead of yours.
 
-## When it runs
+The name: it runs at **dawn (~08:00)** so you start the day with fresh updates — and it keeps the
+*"up"* of Update. (Renamed from `AutoUpdate` in v0.5.0.)
 
-One scheduled task (`AutoUpdate`, runs as **SYSTEM**) with three triggers, de-duplicated to
-**once per calendar day** by a stamp file (`lastrun.json`):
+![SunUp summary dialog](docs/sample-dialog.png)
 
-| Trigger | Fires | Purpose |
+The dialog shows the current run in full color and the **past 30 days** of updates greyed out beneath
+it, so you can see at a glance what's been changing.
+
+## What it updates
+
+All toggleable in `config.json`, run in one coordinated pass:
+
+| Component | What | Notes |
 |---|---|---|
-| Daily 08:00 | only if the box is **awake** (never wakes it) | the normal daily run |
-| Boot + 1h | 1h after a cold boot | catches a day missed while powered off |
-| Resume + 1h | 1h after wake-from-sleep (Power-Troubleshooter ID 1) | catches a day missed while asleep |
+| **Defender** | Antivirus signature definitions | Duration captured per run |
+| **Windows + Microsoft Update** | OS + Office/other MS products | via PSWindowsUpdate; can exclude by title (e.g. pinned `NVIDIA` drivers) |
+| **winget** | Desktop app upgrades | per-package, capturing old→new version, duration, and download size |
+| **Dell Command Update** | Drivers & firmware | **BIOS is reported only, never auto-flashed** |
+| **PowerShell modules** | PSGallery modules | weekly (`psModules.everyDays`), not daily |
 
-Whichever trigger fires first does the work and stamps the date; the others see the stamp and
-no-op. So: it updates at 8am if the box is up, otherwise ~1h after it next wakes/boots — exactly
-once a day. The +1h delay keeps updates from interrupting you the moment you sit down.
+`pip` / `npm` stubs are present but off by default.
 
-## What it updates (all toggleable in `config.json`)
+## How it's scheduled
 
-1. **Microsoft Defender** signatures (`Update-MpSignature`)
-2. **Windows + Microsoft Update** (PSWindowsUpdate, `-MicrosoftUpdate`) — **excludes any update
-   titled `NVIDIA`** so the pinned GTX 1060 driver (580.97, last Pascal branch) is never replaced
-3. **winget** packages (`winget upgrade --all`) — SYSTEM-scope packages; per-user apps
-   (Spotify/Discord/Slack) self-update on their own. Holds back any exact IDs in `winget.pinIds`
-4. **Dell Command Update** drivers/firmware/utilities — **BIOS is reported, never auto-flashed**
-   (unattended BIOS flash = brick risk on power loss); BIOS availability is logged + alerted
-5. **PowerShell modules** (`Update-Module`)
-6. (pip / npm global — present but **off by default**; global upgrades can break toolchains)
+One SYSTEM scheduled task (`SunUp`) with three triggers, de-duplicated to **once per calendar day**
+by a `lastrun.json` stamp (whichever fires first does the work; the rest no-op):
 
-After everything, a single **coordinated reboot** if anything left one pending
-(`rebootPolicy: always`, with a 120s `shutdown /a`-able countdown). The box's Automatic services
-(Tailscale, sshd) bring it back on the tailnet so mistral's reach is restored on boot.
+- **Daily 08:00** — only if the box is awake (the trigger never wakes it).
+- **Boot + 1h** — catches a day missed while powered off.
+- **Resume + 1h** — catches a day missed while asleep (Power-Troubleshooter event).
 
-## Layout & logging
+A missed 08:00 is picked up ~1h after the next boot/resume, so updates never ambush you the moment
+you sit down.
 
-- Source: `C:\Users\user\Code\AutoUpdate` (this repo)
-- Deployed: `C:\ProgramData\AutoUpdate\bin\{AutoUpdate.ps1,Status.ps1}`
+## The summary dialog
 
-Logging is three tiers so a failure is trivial to trace:
+After every cycle (even when nothing needed updating), an interactive task (`SunUp-Notify`) shows the
+Win11-styled dialog above in your desktop session. It lists the current run's updates in normal color
+and the past `notify.historyDays` (default **30**) greyed out below, with a **When** column. By default
+the history is collapsed to the latest occurrence per package (`notify.historyCollapse`) so daily
+Defender-signature bumps don't flood it.
 
-```
-C:\ProgramData\AutoUpdate\
-  logs\autoupdate.log              curated rolling timeline (rotated at 5MB × 5)
-  logs\history.jsonl               one compact JSON line per run — the queryable trail
-  logs\runs\<yyyy-MM-dd_HHmmss>\   per-run dir (last `keepRuns`, default 30):
-      run.log            this run's curated timeline
-      transcript.log     full Start-Transcript capture (catches anything unexpected)
-      <component>.log    RAW output of each tool: defender / windowsupdate / winget /
-                         dell-apply / dell-bios-scan / psmodules
-      result.json        structured per-component result (status, detail, error, durationSec)
-```
+### Reboots, on your terms
 
-Plus `REPORT.md` (human digest), Application event log (source `AutoUpdate`: 2000 start, 2001 clean,
-2005 reboot, 2010 errors), and failures echoed into SysSentry `ALERTS.md`.
+If — and only if — an update leaves a reboot **pending**, the dialog owns a cancellable countdown
+(**Restart now** / **Postpone**). A reboot that isn't actually needed never prompts you. If no one is
+logged in, the engine reboots headlessly after a grace period and shows the summary at next sign-in.
+Set `rebootPolicy: "never"` to never auto-reboot.
 
-**Find what went wrong, fast:**
+## Logging
 
-```powershell
-pwsh -File C:\ProgramData\AutoUpdate\bin\AutoUpdate.ps1 -Mode Errors   # last failed runs + error text + tail of the failing tool's log
-pwsh -File C:\ProgramData\AutoUpdate\bin\AutoUpdate.ps1 -Mode Tail     # tail of the most recent run.log
-# or query the trail directly, e.g. last 5 runs' component statuses:
-Get-Content C:\ProgramData\AutoUpdate\logs\history.jsonl | Select-Object -Last 5 |
-  ForEach-Object { $_ | ConvertFrom-Json } | ForEach-Object { "$($_.date): " + (($_.components | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', ') }
-```
+Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
 
-## Manage
+- `logs\sunup.log` — curated rolling timeline (rotated at 5 MB × 5).
+- `logs\history.jsonl` — one compact JSON line per run (queryable trail; also the source for the
+  dialog's 30-day history).
+- `logs\runs\<timestamp>\` — isolated per-run dir (kept for the last `keepRuns`, default 30) holding
+  `run.log`, a full `transcript.log`, the **raw output of every tool** in its own file, and a
+  structured `result.json`.
+
+Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
+2005 reboot, 2010 errors).
+
+## Install / uninstall
 
 ```powershell
-pwsh -File C:\ProgramData\AutoUpdate\bin\Status.ps1                       # last run, stamp, next run, pending reboot
-pwsh -File C:\ProgramData\AutoUpdate\bin\AutoUpdate.ps1 -Mode Run -Force  # run now, bypass the day stamp
+# from an elevated PowerShell, in the repo dir:
+pwsh -File .\Install.ps1      # deploys to C:\ProgramData\SunUp, registers the tasks
+pwsh -File .\Uninstall.ps1    # removes the tasks (add -Purge to also delete data + event source)
 ```
 
-Install / update / remove (elevated, from this repo):
+`Install.ps1` is idempotent and also **migrates a previous `AutoUpdate` install** in place (moves its
+data/logs/history/config to the SunUp name, swaps the tasks and event source) without losing history.
+
+## Manage / diagnose
 
 ```powershell
-pwsh -File .\Install.ps1      # deploy + register task + refresh SysSentry baseline
-pwsh -File .\Uninstall.ps1    # remove task (add -Purge to delete data + event source)
+pwsh -File C:\ProgramData\SunUp\bin\Status.ps1               # task state, last run, per-component status
+pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Errors   # last failed runs + error text + log tails
+pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Tail     # tail of the most recent run
+pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Run -Force   # run now, bypassing the day stamp
 ```
 
-Failures surface in **SysSentry `ALERTS.md`** (triaged at session start) and the event log, so a
-broken update run won't pass silently.
+> Heads-up: a forced run **will reboot** if an update leaves a reboot pending and `rebootPolicy` is
+> `always`. To test safely, set `rebootPolicy: "never"` first.
 
-## Notes / limitations
+## Configuration
 
-- Runs as SYSTEM → sees machine-scope winget packages, not per-user ones (those self-update).
-- The day stamp is set even if a component errors; errors are logged/alerted and you re-run with
-  `-Force`. It won't auto-retry the same day.
-- After changing the task or engine, follow the refresh-running-version flow: bump `VERSION` +
-  `$script:Version`, update CHANGELOG, commit + tag, re-run `Install.ps1`, refresh SysSentry baseline.
+`C:\ProgramData\SunUp\config.json` (reloaded each run; keys missing from an older file are merged from
+defaults):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rebootPolicy` | `"always"` | `always` reboots when one is pending; `never` never does |
+| `rebootDelaySeconds` | `120` | headless restart grace |
+| `rebootGraceInteractiveSec` | `300` | countdown the dialog shows when a user is logged in |
+| `keepRuns` | `30` | per-run log dirs to retain |
+| `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
+| `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |
+| `notify.historyMaxRows` | `500` | cap on history rows |
+| `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
+| `winget.excludePattern` | (regex) | skip pinned/self-updating/per-user apps |
+| `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
+| `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
+
+## Requirements
+
+- Windows 10/11, PowerShell 7 (`pwsh`).
+- [PSWindowsUpdate](https://www.powershellgallery.com/packages/PSWindowsUpdate) (installed by `Install.ps1`).
+- Optional: Dell Command Update (`dcu-cli`) for hardware updates — skipped cleanly if absent.
+
+## License
+
+MIT

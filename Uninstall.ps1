@@ -1,17 +1,22 @@
 #Requires -RunAsAdministrator
-# Removes the AutoUpdate scheduled task. Leaves C:\ProgramData\AutoUpdate (logs,
-# REPORT.md, config) in place unless -Purge is given. Refreshes SysSentry baseline.
+# Removes the SunUp scheduled tasks. Leaves C:\ProgramData\SunUp (logs, REPORT.md, config)
+# in place unless -Purge is given. Also best-effort removes any leftover legacy 'AutoUpdate'
+# task/dir/source (e.g. after a partial migration). Refreshes the SysSentry baseline.
 param([switch]$Purge)
 $ErrorActionPreference = 'Continue'
 
-Unregister-ScheduledTask -TaskName 'AutoUpdate'        -Confirm:$false -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName 'AutoUpdate-Notify' -Confirm:$false -ErrorAction SilentlyContinue
-Write-Host "Unregistered tasks 'AutoUpdate' + 'AutoUpdate-Notify'."
+$Name = 'SunUp'
+foreach ($t in @($Name, "$Name-Notify", 'AutoUpdate', 'AutoUpdate-Notify')) {
+  Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
+}
+Write-Host "Unregistered tasks '$Name' + '$Name-Notify' (and any legacy AutoUpdate tasks)."
 
 if ($Purge) {
-  Remove-Item 'C:\ProgramData\AutoUpdate' -Recurse -Force -ErrorAction SilentlyContinue
-  if ([System.Diagnostics.EventLog]::SourceExists('AutoUpdate')) { Remove-EventLog -Source 'AutoUpdate' -ErrorAction SilentlyContinue }
-  Write-Host 'Purged C:\ProgramData\AutoUpdate and event source.'
+  Remove-Item "C:\ProgramData\$Name" -Recurse -Force -ErrorAction SilentlyContinue
+  foreach ($src in @($Name, 'AutoUpdate')) {
+    if ([System.Diagnostics.EventLog]::SourceExists($src)) { Remove-EventLog -Source $src -ErrorAction SilentlyContinue }
+  }
+  Write-Host "Purged C:\ProgramData\$Name and event source(s)."
 }
 
 $sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'

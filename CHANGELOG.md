@@ -2,6 +2,34 @@
 
 All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-06-27
+
+### Changed
+- **Renamed `AutoUpdate` → `SunUp`** (it runs at dawn so you start the day with fresh updates, and
+  keeps the "up" of Update). Every path, scheduled-task name (`SunUp` / `SunUp-Notify`), event-log
+  source, and the dialog title now derive from a single `$Name` constant in each script. `Install.ps1`
+  performs an **idempotent live migration**: it quiesces the old tasks, `Move-Item`s
+  `C:\ProgramData\AutoUpdate` → `C:\ProgramData\SunUp` (preserving config, logs, history, notify
+  state, ACLs), registers the new-named tasks *before* removing the old ones, swaps the event source,
+  and refreshes the SysSentry baseline last. Re-running heals a partial migration.
+
+### Added
+- **30-day update history in the dialog.** Below the current run (normal color), the dialog lists the
+  past `notify.historyDays` (default 30) of updates **greyed out but legible**, with a new **When**
+  column. The engine (SYSTEM) assembles the list from `history.jsonl` and embeds it in the
+  user-readable notify payload, since the non-elevated dialog can't read `logs\`. `notify.historyCollapse`
+  (default **true**) keeps only the latest occurrence per package so daily Defender-signature bumps
+  don't flood the list; `notify.historyMaxRows` (default 500) caps it. Greying is a DataGridCell
+  `DataTrigger` on a per-row `IsPast` flag using the existing muted-grey theme color.
+
+### Fixed
+- **Per-update Duration column was empty for Defender.** The engine timed each component but discarded
+  it for the per-row record. Defender's `Update-MpSignature` is now wrapped in its own Stopwatch so its
+  Duration populates. Windows Update / Dell per-row Duration stays "—" on purpose: they install items as
+  a batch and expose no per-item timing, and stamping each row with the shared batch time would be a lie
+  (per-row durations are display-only, not summed into totals). Defender/Dell download **size** stays "—"
+  (those sources expose no size).
+
 ## [0.4.3] - 2026-06-27
 
 ### Fixed
@@ -137,12 +165,13 @@ All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachang
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
-[0.4.3]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.3
-[0.4.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.2
-[0.4.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.1
-[0.4.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.4.0
-[0.3.2]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.2
-[0.3.1]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.1
-[0.3.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.3.0
-[0.2.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.2.0
-[0.1.0]: https://github.com/pizzimenti/AutoUpdate/releases/tag/v0.1.0
+[0.5.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.5.0
+[0.4.3]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.3
+[0.4.2]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.2
+[0.4.1]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.1
+[0.4.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.4.0
+[0.3.2]: https://github.com/pizzimenti/SunUp/releases/tag/v0.3.2
+[0.3.1]: https://github.com/pizzimenti/SunUp/releases/tag/v0.3.1
+[0.3.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.3.0
+[0.2.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.2.0
+[0.1.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.1.0

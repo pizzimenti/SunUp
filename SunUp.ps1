@@ -1,8 +1,10 @@
 #Requires -RunAsAdministrator
 <#
-AutoUpdate — caldera's own daily update routine (replaces flaky Windows Update timing).
+SunUp — caldera's own daily update routine (replaces flaky Windows Update timing).
+"SunUp": it runs at dawn (~08:00) so you start the day with fresh updates — and keeps
+the "up" of Update/Upgrade. (Renamed from AutoUpdate in v0.5.0.)
 
-Runs as SYSTEM via three Task Scheduler triggers (all on the AutoUpdate task),
+Runs as SYSTEM via three Task Scheduler triggers (all on the SunUp task),
 de-duplicated by a per-day stamp so the box updates exactly once per calendar day:
   * Daily 08:00  (only if the box is awake — the trigger never wakes it)
   * Boot   + 1h  (covers a cold boot where yesterday's run was missed)
@@ -14,8 +16,8 @@ winget package upgrades, Dell Command Update drivers/firmware (BIOS reported onl
 and PowerShell modules. One coordinated reboot at the end if anything needs it.
 
 LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
-  C:\ProgramData\AutoUpdate\
-    logs\autoupdate.log              curated rolling timeline (rotated at 5MB x5)
+  C:\ProgramData\SunUp\
+    logs\sunup.log                   curated rolling timeline (rotated at 5MB x5)
     logs\history.jsonl               one compact JSON line per run (queryable trail)
     logs\runs\<yyyy-MM-dd_HHmmss>\   isolated per-run dir, kept for last 30 runs:
         run.log                        this run's curated timeline
@@ -23,9 +25,9 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         <component>.log                RAW output of each tool (defender/windowsupdate/
                                        winget/dell-apply/dell-bios-scan/psmodules)
         result.json                    structured per-component result for this run
-  Plus Application event log (source AutoUpdate) + SysSentry ALERTS.md on failure.
+  Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
 
-Query: Status.ps1, or  AutoUpdate.ps1 -Mode Errors  /  -Mode Tail.
+Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
 Companion to ProcWatch (realtime CPU) and SysSentry (security drift).
 #>
 param(
@@ -36,11 +38,16 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.4.3'
+$script:Version = '0.5.0'
 
-$Root          = 'C:\ProgramData\AutoUpdate'
+# One name to rule them all — every path, task name, event source, and the dialog title
+# derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
+$Name          = 'SunUp'
+$TaskName      = $Name                 # SYSTEM engine task
+$NotifyTask    = "$Name-Notify"        # interactive dialog task
+$Root          = "C:\ProgramData\$Name"
 $LogDir        = Join-Path $Root 'logs'
-$LogFile       = Join-Path $LogDir 'autoupdate.log'
+$LogFile       = Join-Path $LogDir ("{0}.log" -f $Name.ToLower())
 $HistoryFile   = Join-Path $LogDir 'history.jsonl'
 $RunsDir       = Join-Path $LogDir 'runs'
 $ReportFile    = Join-Path $Root 'REPORT.md'
@@ -49,7 +56,7 @@ $StampFile     = Join-Path $Root 'lastrun.json'
 $PSModStamp    = Join-Path $Root 'psmodules-lastrun.json'       # psModules runs weekly, not daily
 $NotifyDir     = Join-Path $Root 'notify'                       # user-writable (Install grants Modify)
 $NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
-$EvtSource     = 'AutoUpdate'
+$EvtSource     = $Name
 $SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
 
 $script:RunDir = $null   # set in Run mode once we create the per-run dir
@@ -61,7 +68,10 @@ $DefaultConfig = [ordered]@{
   rebootDelaySeconds = 120           # headless (no user logged in) restart grace
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
   keepRuns           = 30            # how many per-run log dirs to retain
-  notify             = [ordered]@{ enabled = $true }   # pop the Win11 summary dialog after a run that changed something
+  # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
+  # (greyed out, below the current run); historyCollapse keeps only the latest per package so
+  # daily Defender-signature bumps don't flood the list.
+  notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500 }
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
   # Skip pinned drivers, self-updating Claude, and load-bearing per-user/Electron apps whose
   # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
@@ -136,7 +146,7 @@ function Test-InteractiveUser {
 }
 function Flush-Report {
   if ($script:Report.Count -eq 0) { return }
-  $header = "## Run $((Get-Date).ToString('yyyy-MM-dd HH:mm')) — AutoUpdate v$script:Version (log: $([IO.Path]::GetFileName($script:RunDir)))"
+  $header = "## Run $((Get-Date).ToString('yyyy-MM-dd HH:mm')) — $Name v$script:Version (log: $([IO.Path]::GetFileName($script:RunDir)))"
   @('', $header) + $script:Report | Add-Content $ReportFile
   $all = @(Get-Content $ReportFile)
   if ($all.Count -gt 900) { ($all[0..4] + '_…older entries trimmed…_' + $all[-850..-1]) | Set-Content $ReportFile }
@@ -203,10 +213,15 @@ function Invoke-Component { param([string]$Name, [scriptblock]$Body)
 function Comp-Defender {
   $before = (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion
   Write-CompLog 'defender' "Signature before: $before"
+  # Time just the signature pull so the dialog's Duration column is populated (the component-level
+  # timer in Invoke-Component covers before/after status calls too, so capture this span directly).
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   Update-MpSignature -ErrorAction Stop
+  $sw.Stop()
   $after = (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion
   Write-CompLog 'defender' "Signature after:  $after"
-  if ($before -ne $after) { Add-Update -Name 'Microsoft Defender signatures' -Source 'Defender' -Old "$before" -New "$after" -DurationSec $null -SizeMB $null }
+  # Size stays null (the Defender API exposes no signature-package download size → dialog shows "—").
+  if ($before -ne $after) { Add-Update -Name 'Microsoft Defender signatures' -Source 'Defender' -Old "$before" -New "$after" -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB $null }
   $detail = if ($before -eq $after) { "signatures current ($after)" } else { "signatures $before -> $after" }
   @{ status = 'ok'; detail = $detail }
 }
@@ -228,6 +243,8 @@ function Comp-WindowsUpdate { param($Cfg)
   foreach ($u in ($items | Where-Object Result -eq 'Installed')) {
     $mb = if ($u.Size) { try { [math]::Round(([double]$u.Size)/1MB,1) } catch { $null } } else { $null }
     $kb = if ($u.KB) { "$($u.KB)" } else { 'installed' }
+    # DurationSec stays null: WU installs the batch together and exposes no per-update install time.
+    # Stamping each row with the shared component duration would falsely imply each took that long.
     Add-Update -Name "$($u.Title)" -Source 'Windows Update' -Old '—' -New $kb -DurationSec $null -SizeMB $mb
   }
   # Did any update we just installed ask for a reboot? Prefer the per-update flag; fall
@@ -313,7 +330,8 @@ function Comp-Dell { param($Cfg)
   $applyCode = $LASTEXITCODE
   Write-CompLog 'dell-apply' $apply
   Write-CompLog 'dell-apply' "exit: $applyCode"
-  # Record each installed driver by name (dcu doesn't expose per-driver version/size).
+  # Record each installed driver by name. old/new/duration/size stay null: dcu-cli exposes no
+  # per-driver prior version, install time, or download size in its stdout → those cells show "—".
   foreach ($m in [regex]::Matches(($apply | Out-String), 'Update Name:\s*(.+?)\s*$', 'Multiline')) {
     Add-Update -Name ($m.Groups[1].Value.Trim()) -Source 'Dell' -Old '—' -New 'installed' -DurationSec $null -SizeMB $null
   }
@@ -365,13 +383,40 @@ function Get-LatestResult {
   $null
 }
 
+# Past-N-day update history for the dialog. The dialog runs non-elevated and can't read logs\,
+# so the engine (SYSTEM) reads history.jsonl here and the result is embedded in the notify payload.
+# Each history.jsonl line is a full run object carrying date/runStamp/updates[]. Returns flat rows
+# {when,name,source,old,new,durationSec,sizeMB}, newest-first, capped at MaxRows. Collapse keeps only
+# the latest occurrence per name|source (so daily Defender-signature bumps don't flood the list).
+function Get-UpdateHistory {
+  param([int]$Days = 30, [bool]$Collapse = $true, [string]$ExcludeRunStamp, [int]$MaxRows = 500)
+  if (-not (Test-Path $HistoryFile)) { return @() }
+  $cutoff = (Get-Date).Date.AddDays(-$Days)
+  $rows = [System.Collections.Generic.List[object]]::new()
+  foreach ($line in (Get-Content $HistoryFile)) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $run = try { $line | ConvertFrom-Json } catch { $null }
+    if (-not $run) { continue }
+    if ($ExcludeRunStamp -and $run.runStamp -eq $ExcludeRunStamp) { continue }   # current run is already in items[]
+    $d = try { [datetime]::ParseExact("$($run.date)", 'yyyy-MM-dd', $null) } catch { continue }
+    if ($d -lt $cutoff) { continue }
+    foreach ($u in $run.updates) {
+      $rows.Add([ordered]@{ when = $run.date; name = $u.name; source = $u.source; old = $u.old; new = $u.new; durationSec = $u.durationSec; sizeMB = $u.sizeMB })
+    }
+  }
+  if ($Collapse) {
+    $rows = @($rows | Group-Object { "$($_.name)|$($_.source)" } | ForEach-Object { $_.Group | Sort-Object when | Select-Object -Last 1 })
+  }
+  @($rows | Sort-Object when -Descending | Select-Object -First $MaxRows)
+}
+
 if ($Mode -eq 'Status') {
   $stamp = Get-Stamp
-  $task  = Get-ScheduledTask -TaskName 'AutoUpdate' -ErrorAction SilentlyContinue
+  $task  = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   $info  = if ($task) { $task | Get-ScheduledTaskInfo } else { $null }
   $res   = Get-LatestResult
   Write-Host ""
-  Write-Host "AutoUpdate v$script:Version — caldera"
+  Write-Host "$Name v$script:Version — caldera"
   Write-Host ("  Task state    : {0}" -f ($(if ($task) { $task.State } else { 'NOT REGISTERED' })))
   if ($info) {
     Write-Host ("  Last task run : {0} (result 0x{1:X8})" -f $info.LastRunTime, $info.LastTaskResult)
@@ -389,7 +434,7 @@ if ($Mode -eq 'Status') {
     }
     Write-Host ("  Run logs      : {0}" -f $res.runDir)
     if (@($res.components | Where-Object status -eq 'error').Count -gt 0) {
-      Write-Host "  -> failures present. Drill in:  AutoUpdate.ps1 -Mode Errors" -ForegroundColor Yellow
+      Write-Host "  -> failures present. Drill in:  $Name.ps1 -Mode Errors" -ForegroundColor Yellow
     }
   }
   Write-Host ("  Main log      : {0}  (history: {1})" -f $LogFile, $HistoryFile)
@@ -449,8 +494,8 @@ $script:RunLog = Join-Path $script:RunDir 'run.log'
 try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force | Out-Null } catch {}
 
 $startUtc = (Get-Date).ToUniversalTime()
-Write-Log INFO "===== AutoUpdate v$script:Version run start ($today, forced=$([bool]$Force)) — $runStamp ====="
-Write-Evt 2000 Information "AutoUpdate run started ($today) — logs in $script:RunDir"
+Write-Log INFO "===== $Name v$script:Version run start ($today, forced=$([bool]$Force)) — $runStamp ====="
+Write-Evt 2000 Information "$Name run started ($today) — logs in $script:RunDir"
 
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }
@@ -512,11 +557,11 @@ Write-Log INFO "Components: $summary  (total ${durSec}s)"
 Add-Report "- Summary: $summary; rebootPending=$rebootPending; rebootAction=$($result.rebootAction); ${durSec}s"
 
 if ($errors.Count -gt 0) {
-  $msg = "AutoUpdate run $runStamp finished with errors: " + (($errors | ForEach-Object { $_.name }) -join ', ') + ". Drill in: AutoUpdate.ps1 -Mode Errors"
+  $msg = "$Name run $runStamp finished with errors: " + (($errors | ForEach-Object { $_.name }) -join ', ') + ". Drill in: $Name.ps1 -Mode Errors"
   Write-Evt 2010 Warning $msg
   Raise-SysSentryAlert $msg
 } else {
-  Write-Evt 2001 Information "AutoUpdate run $runStamp clean: $summary"
+  Write-Evt 2001 Information "$Name run $runStamp clean: $summary"
 }
 
 Flush-Report
@@ -531,6 +576,12 @@ try {
 # ---- notify dialog payload (shown after EVERY cycle; pendingShow gates display) ----
 $notifyEnabled = (-not ($cfg.PSObject.Properties.Name -contains 'notify')) -or $cfg.notify.enabled
 $totalSize = ($script:Updates | ForEach-Object { $_.sizeMB } | Where-Object { $_ } | Measure-Object -Sum).Sum
+# Past-Ndays history (greyed in the dialog). Built here — AFTER history.jsonl was appended/trimmed
+# above — and excludes the current run (already in items[]). Config-tunable; defaults: 30d, collapsed.
+$histDays     = if ($cfg.notify.historyDays)     { [int]$cfg.notify.historyDays }     else { 30 }
+$histCollapse = if ($cfg.notify.PSObject.Properties.Name -contains 'historyCollapse') { [bool]$cfg.notify.historyCollapse } else { $true }
+$histMaxRows  = if ($cfg.notify.historyMaxRows)  { [int]$cfg.notify.historyMaxRows }  else { 500 }
+$history = @(Get-UpdateHistory -Days $histDays -Collapse $histCollapse -ExcludeRunStamp $runStamp -MaxRows $histMaxRows)
 $payload = [ordered]@{
   title              = if (@($script:Updates).Count -gt 0) { 'Updates installed' } else { 'Update check complete' }
   runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
@@ -540,6 +591,7 @@ $payload = [ordered]@{
   rebootCountdownSec = $graceInteractive
   pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
+  history            = $history             # past-Ndays updates, greyed below the current run
 }
 try { New-Item -ItemType Directory -Force -Path $NotifyDir | Out-Null } catch {}
 try { $payload | ConvertTo-Json -Depth 6 | Set-Content $NotifyPayload } catch { Write-Log WARN "notify payload: $_" }
@@ -547,11 +599,11 @@ try { $payload | ConvertTo-Json -Depth 6 | Set-Content $NotifyPayload } catch { 
 # ---- coordinated reboot -----------------------------------------------------
 if ($willReboot -and $interactive) {
   Write-Log INFO "Reboot pending; interactive user — the dialog owns a ${graceInteractive}s countdown (engine will NOT reboot out from under you)."
-  Write-Evt 2005 Warning "AutoUpdate: ${graceInteractive}s restart countdown handed to the user dialog."
+  Write-Evt 2005 Warning "${Name}: ${graceInteractive}s restart countdown handed to the user dialog."
 }
 elseif ($willReboot) {
   Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in); summary shows at next logon."
-  Write-Evt 2005 Warning "AutoUpdate: headless reboot in $($cfg.rebootDelaySeconds)s."
+  Write-Evt 2005 Warning "${Name}: headless reboot in $($cfg.rebootDelaySeconds)s."
 }
 elseif ($rebootPending) {
   Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
@@ -560,20 +612,20 @@ elseif ($rebootPending) {
 else { Write-Log INFO 'No reboot required.' }
 
 # Show the dialog now if a user is logged in (covers every cycle, even 0 updates). Headless
-# runs leave pendingShow=true so the AutoUpdate-Notify logon trigger shows it at next sign-in
+# runs leave pendingShow=true so the SunUp-Notify logon trigger shows it at next sign-in
 # (also how the post-reboot summary appears). StopExisting makes a newer cycle replace it.
 if ($notifyEnabled -and $interactive) {
-  try { Start-ScheduledTask -TaskName 'AutoUpdate-Notify' -ErrorAction Stop; Write-Log INFO 'Launched AutoUpdate-Notify dialog.' }
-  catch { Write-Log WARN "could not start AutoUpdate-Notify: $_" }
+  try { Start-ScheduledTask -TaskName $NotifyTask -ErrorAction Stop; Write-Log INFO "Launched $NotifyTask dialog." }
+  catch { Write-Log WARN "could not start ${NotifyTask}: $_" }
 }
 
-Write-Log INFO "===== AutoUpdate run end ($runStamp) ====="
+Write-Log INFO "===== $Name run end ($runStamp) ====="
 try { Stop-Transcript | Out-Null } catch {}
 
 # Headless reboot LAST (after logs/transcript flushed). Interactive reboot is the dialog's job.
 if ($result.rebootAction -eq 'reboot') {
   $delay = [int]$cfg.rebootDelaySeconds
-  & shutdown.exe /r /t $delay /c "AutoUpdate: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
+  & shutdown.exe /r /t $delay /c "${Name}: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
 }
 
 # Explicit, meaningful exit code so Task Scheduler's LastTaskResult reflects the run —

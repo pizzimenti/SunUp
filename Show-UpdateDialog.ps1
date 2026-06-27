@@ -1,8 +1,9 @@
 <#
-Show-UpdateDialog.ps1 — Win11 (acrylic) WPF dialog for an AutoUpdate cycle.
+Show-UpdateDialog.ps1 — Win11 (acrylic) WPF dialog for a SunUp cycle.
 
 Shown after EVERY cycle (even with no updates). Reads notify\latest-updates.json.
-The dialog re-checks the live pending-reboot state to pick its face:
+Lists the current run's updates (normal) plus the past N days of updates (greyed,
+from the payload's history[]). The dialog re-checks the live pending-reboot state:
   * reboot pending now  -> table + cancellable countdown (Restart now / Postpone)
   * reboot was required but already done (post-reboot) -> table + "Restarted to finish"
   * otherwise           -> table (or "up to date" empty state) + Close
@@ -18,11 +19,12 @@ Runs as the interactive user (non-elevated). Must run STA.
   -Validate          build the window but don't show it, exit 0
 #>
 param(
-  [string]$DataPath = 'C:\ProgramData\AutoUpdate\notify\latest-updates.json',
+  [string]$DataPath = 'C:\ProgramData\SunUp\notify\latest-updates.json',
   [switch]$Demo,
   [switch]$Validate
 )
 $ErrorActionPreference = 'Stop'
+$Name = 'SunUp'   # window title + self-close key + reboot.log path all derive from this
 try { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml } catch {}
 
 # ---- payload ----------------------------------------------------------------
@@ -49,11 +51,19 @@ function Format-Size { param($mb) if ($null -eq $mb -or $mb -le 0) { '—' } els
 function Format-Dur  { param($s) if ($null -eq $s -or $s -le 0) { '—' } elseif ($s -lt 60) { "$([int]$s)s" } else { '{0}m {1:00}s' -f [math]::Floor($s/60), ([int]$s % 60) } }
 function NZ { param($v) if ([string]::IsNullOrWhiteSpace("$v")) { '—' } else { "$v" } }
 
-$rows = @(foreach ($it in $data.items) {
-  [pscustomobject]@{ Package=NZ $it.name; Source=NZ $it.source; OldVer=NZ $it.old; NewVer=NZ $it.new; Duration=Format-Dur $it.durationSec; Size=Format-Size $it.sizeMB }
-})
-$count     = $rows.Count
-$hasItems  = $count -gt 0
+# Current run first (normal), then the past-Ndays history (greyed via IsPast). The When column
+# distinguishes them: 'Today' for this run, the run date for history.
+$rows = [System.Collections.Generic.List[object]]::new()
+foreach ($it in $data.items) {
+  $rows.Add([pscustomobject]@{ When='Today'; Package=NZ $it.name; Source=NZ $it.source; OldVer=NZ $it.old; NewVer=NZ $it.new; Duration=Format-Dur $it.durationSec; Size=Format-Size $it.sizeMB; IsPast=$false })
+}
+foreach ($it in $data.history) {
+  $rows.Add([pscustomobject]@{ When=NZ $it.when; Package=NZ $it.name; Source=NZ $it.source; OldVer=NZ $it.old; NewVer=NZ $it.new; Duration=Format-Dur $it.durationSec; Size=Format-Size $it.sizeMB; IsPast=$true })
+}
+$rows = @($rows)
+$count     = @($data.items).Count    # current-run count drives the "N updates" chip
+$hasItems  = $count -gt 0            # chips reflect THIS run
+$hasRows   = $rows.Count -gt 0       # table shows if there's a current OR past row
 $totalDur  = Format-Dur $data.totalDurationSec
 $totalSize = Format-Size $data.totalSizeMB
 $countdown = if ($data.rebootCountdownSec -and $data.rebootCountdownSec -gt 0) { [int]$data.rebootCountdownSec } else { 300 }
@@ -69,15 +79,16 @@ if ($light) { $card='#E6FBFBFB'; $fg='#1A1A1A'; $sub='#5A5A5A'; $grid='#22000000
 else        { $card='#D9262626'; $fg='#F2F2F2'; $sub='#B7B7B7'; $grid='#28FFFFFF'; $head='#33000000'; $alt='#14FFFFFF'; $chip='#1FFFFFFF' }
 $okGreen = if ($light) { '#107C10' } else { '#6CCB5F' }
 
-$tableVis  = if ($hasItems) { 'Visible' } else { 'Collapsed' }
-$emptyVis  = if ($hasItems) { 'Collapsed' } else { 'Visible' }
+$chipsVis  = if ($hasItems) { 'Visible' } else { 'Collapsed' }   # chips summarize THIS run only
+$tableVis  = if ($hasRows)  { 'Visible' } else { 'Collapsed' }   # table = current + greyed history
+$emptyVis  = if ($hasRows)  { 'Collapsed' } else { 'Visible' }   # "up to date" only when nothing at all
 $headGlyph = if ($hasItems) { "&#x2913;" } else { "&#x2714;" }   # down-arrow vs check
 
 # ---- XAML -------------------------------------------------------------------
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="AutoUpdate" Width="800" SizeToContent="Height" ResizeMode="CanResizeWithGrip"
+        Title="$Name" Width="860" SizeToContent="Height" ResizeMode="CanResizeWithGrip"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI"
         Background="Transparent" MinHeight="300">
   <Window.Resources>
@@ -89,6 +100,15 @@ $headGlyph = if ($hasItems) { "&#x2913;" } else { "&#x2714;" }   # down-arrow vs
     <Style TargetType="DataGridCell">
       <Setter Property="BorderBrush" Value="Transparent"/><Setter Property="Foreground" Value="$fg"/>
       <Setter Property="Padding" Value="12,9"/><Setter Property="FontSize" Value="13"/>
+      <Style.Triggers>
+        <!-- Past (history) rows render greyed but legible. A RowStyle Foreground can't win here:
+             this cell style sets Foreground explicitly, so overriding the same property on the
+             cell style via a trigger is what takes effect. {Binding IsPast} resolves per row
+             because each cell's DataContext is its row data item. -->
+        <DataTrigger Binding="{Binding IsPast}" Value="True">
+          <Setter Property="Foreground" Value="$sub"/>
+        </DataTrigger>
+      </Style.Triggers>
     </Style>
   </Window.Resources>
   <Border Background="$card">
@@ -107,7 +127,7 @@ $headGlyph = if ($hasItems) { "&#x2913;" } else { "&#x2714;" }   # down-arrow vs
         </StackPanel>
       </StackPanel>
 
-      <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,14" Visibility="$tableVis">
+      <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,14" Visibility="$chipsVis">
         <Border Background="$chip" CornerRadius="14" Padding="12,5" Margin="0,0,8,0">
           <TextBlock Foreground="$fg" FontSize="12.5"><Run FontWeight="SemiBold" Text="$count"/><Run Text=" updates"/></TextBlock></Border>
         <Border Background="$chip" CornerRadius="14" Padding="12,5" Margin="0,0,8,0">
@@ -124,10 +144,11 @@ $headGlyph = if ($hasItems) { "&#x2913;" } else { "&#x2714;" }   # down-arrow vs
                   ColumnHeaderHeight="38" RowHeight="40" SelectionMode="Single" Foreground="$fg"
                   ScrollViewer.HorizontalScrollBarVisibility="Disabled" MaxHeight="340">
           <DataGrid.Columns>
-            <DataGridTextColumn Header="Package"     Binding="{Binding Package}"  Width="2.2*"/>
+            <DataGridTextColumn Header="When"        Binding="{Binding When}"     Width="1.1*"/>
+            <DataGridTextColumn Header="Package"     Binding="{Binding Package}"  Width="2.0*"/>
             <DataGridTextColumn Header="Source"      Binding="{Binding Source}"   Width="1*"/>
-            <DataGridTextColumn Header="Old version" Binding="{Binding OldVer}"   Width="1.5*"/>
-            <DataGridTextColumn Header="New version" Binding="{Binding NewVer}"   Width="1.5*"/>
+            <DataGridTextColumn Header="Old version" Binding="{Binding OldVer}"   Width="1.4*"/>
+            <DataGridTextColumn Header="New version" Binding="{Binding NewVer}"   Width="1.4*"/>
             <DataGridTextColumn Header="Duration"    Binding="{Binding Duration}" Width="1*"/>
             <DataGridTextColumn Header="Size"        Binding="{Binding Size}"     Width="1*"/>
           </DataGrid.Columns>
@@ -183,7 +204,7 @@ function Clear-PendingShow {
 function Invoke-Restart {
   if ($script:demo) { $script:countText.Text=''; $script:rebootLbl.Text='Demo — restart skipped.'; return }
   $script:rebooting = $true
-  $rl = 'C:\ProgramData\AutoUpdate\notify\reboot.log'
+  $rl = "C:\ProgramData\$Name\notify\reboot.log"
   # Restart-Computer -Force is the primary path: in this elevated interactive-task context
   # shutdown.exe returns exit=1 even with the privilege held (observed 2026-06-27 — only the
   # Restart-Computer fallback actually rebooted), so lead with the proven call and keep
@@ -240,8 +261,8 @@ $script:win.Add_SourceInitialized({
   if ($showCountdown) { $script:timer.Start() }
 })
 
-if ($Validate) { Write-Host "validate OK: $count rows, countdown=$showCountdown, postReboot=$postReboot"; exit 0 }
-# Replace any already-open AutoUpdate dialog (a newer cycle supersedes the old one). Mine isn't
-# shown yet, so its title isn't 'AutoUpdate' — only prior dialogs match.
-try { Get-Process pwsh -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq 'AutoUpdate' } | ForEach-Object { $_.CloseMainWindow() | Out-Null } } catch {}
+if ($Validate) { Write-Host "validate OK: $($rows.Count) rows ($count current + $(@($data.history).Count) history), countdown=$showCountdown, postReboot=$postReboot"; exit 0 }
+# Replace any already-open SunUp dialog (a newer cycle supersedes the old one). Mine isn't
+# shown yet, so its title isn't "$Name" yet — only prior dialogs match.
+try { Get-Process pwsh -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq $Name } | ForEach-Object { $_.CloseMainWindow() | Out-Null } } catch {}
 $script:win.ShowDialog() | Out-Null
