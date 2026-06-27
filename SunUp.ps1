@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.5.0'
+$script:Version = '0.6.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -232,20 +232,34 @@ function Comp-WindowsUpdate { param($Cfg)
     return @{ status = 'error'; detail = 'PSWindowsUpdate module missing'; error = 'module not installed' }
   }
   Import-Module PSWindowsUpdate -ErrorAction Stop
+  # Snapshot the OS build (CurrentBuild.UBR) before/after so a Cumulative/Feature update can show a
+  # real old->new (e.g. 26200.8737 -> 26200.9xxx) instead of a blank "old" column.
+  $buildKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+  $beforeBuild = try { $b = Get-ItemProperty $buildKey -ErrorAction Stop; "$($b.CurrentBuildNumber).$($b.UBR)" } catch { $null }
   $params = @{ MicrosoftUpdate = $true; AcceptAll = $true; Install = $true; IgnoreReboot = $true }
   if ($Cfg.windowsUpdate.notTitle) { $params.NotTitle = $Cfg.windowsUpdate.notTitle }
+  $sw  = [System.Diagnostics.Stopwatch]::StartNew()
   $res = @(Get-WindowsUpdate @params -Verbose -ErrorAction Stop 4>&1)
+  $sw.Stop(); $instDur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
   Write-CompLog 'windowsupdate' $res
+  $afterBuild = try { $b = Get-ItemProperty $buildKey -ErrorAction Stop; "$($b.CurrentBuildNumber).$($b.UBR)" } catch { $null }
   $items     = @($res | Where-Object { $_ -is [psobject] -and $_.PSObject.Properties.Name -contains 'Result' })
   $installed = @($items | Where-Object Result -eq 'Installed').Count
   $failed    = @($items | Where-Object Result -eq 'Failed').Count
   if ($items.Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
+  # Duration is the batch install span (WU installs together; no per-update timing). For a single
+  # installed update that's exact; for several it's the shared batch total — labeled as such in docs.
+  $buildMoved = $beforeBuild -and $afterBuild -and ($beforeBuild -ne $afterBuild)
   foreach ($u in ($items | Where-Object Result -eq 'Installed')) {
     $mb = if ($u.Size) { try { [math]::Round(([double]$u.Size)/1MB,1) } catch { $null } } else { $null }
     $kb = if ($u.KB) { "$($u.KB)" } else { 'installed' }
-    # DurationSec stays null: WU installs the batch together and exposes no per-update install time.
-    # Stamping each row with the shared component duration would falsely imply each took that long.
-    Add-Update -Name "$($u.Title)" -Source 'Windows Update' -Old '—' -New $kb -DurationSec $null -SizeMB $mb
+    $title = "$($u.Title)"
+    # OS-level updates carry the build transition; everything else shows its KB.
+    if ($buildMoved -and $title -match 'Cumulative Update|Feature Update|Windows 1[01]|Servicing Stack') {
+      Add-Update -Name $title -Source 'Windows Update' -Old $beforeBuild -New $afterBuild -DurationSec $instDur -SizeMB $mb
+    } else {
+      Add-Update -Name $title -Source 'Windows Update' -Old '—' -New $kb -DurationSec $instDur -SizeMB $mb
+    }
   }
   # Did any update we just installed ask for a reboot? Prefer the per-update flag; fall
   # back to WU's post-install reboot status (the box's WU flag was clear before this run).
@@ -321,36 +335,82 @@ function Comp-Winget { param($Cfg)
   @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
 
+# Parse dcu-cli's `/scan -report` XML into per-update records. The report lists every APPLICABLE
+# update with its name, AVAILABLE version, size (bytes), and type — everything we need for the table
+# EXCEPT the currently-installed (old) version, which dcu-cli does not expose anywhere.
+function Parse-DcuReport { param([string]$XmlPath)
+  if (-not (Test-Path $XmlPath)) { return @() }
+  try { [xml]$r = Get-Content $XmlPath -Raw } catch { return @() }
+  $out = @()
+  foreach ($u in $r.SelectNodes('//*[local-name()="update"]')) {
+    $g = { param($n) ($u.ChildNodes | Where-Object { $_.LocalName -eq $n } | Select-Object -First 1).InnerText }
+    $bytes = 0L; [void][long]::TryParse("$(& $g 'bytes')", [ref]$bytes)
+    $out += [pscustomobject]@{
+      release = "$(& $g 'release')"; name = "$(& $g 'name')"; version = "$(& $g 'version')"
+      type    = "$(& $g 'type')";    category = "$(& $g 'category')"; urgency = "$(& $g 'urgency')"; bytes = $bytes
+    }
+  }
+  $out
+}
+
 function Comp-Dell { param($Cfg)
   $dcu = @('C:\Program Files\Dell\CommandUpdate\dcu-cli.exe','C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe') |
          Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $dcu) { return @{ status = 'skip'; detail = 'dcu-cli not installed (hardware updates skipped)' } }
-  Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded)"
-  $apply = & $dcu /applyUpdates -updateType="$($Cfg.dell.applyTypes)" -autoSuspendBitLocker=enable -reboot=disable 2>&1
-  $applyCode = $LASTEXITCODE
-  Write-CompLog 'dell-apply' $apply
-  Write-CompLog 'dell-apply' "exit: $applyCode"
-  # Record each installed driver by name. old/new/duration/size stay null: dcu-cli exposes no
-  # per-driver prior version, install time, or download size in its stdout → those cells show "—".
-  foreach ($m in [regex]::Matches(($apply | Out-String), 'Update Name:\s*(.+?)\s*$', 'Multiline')) {
-    Add-Update -Name ($m.Groups[1].Value.Trim()) -Source 'Dell' -Old '—' -New 'installed' -DurationSec $null -SizeMB $null
-  }
-  # Report (don't apply) BIOS so a human can decide. Capture the scan's CONSOLE output
-  # directly — dcu's -outputLog file isn't reliably created (v0.1.0 bug), but it always
-  # prints "Number of applicable updates: N" to stdout.
-  $scanOut = & $dcu /scan -updateType="$($Cfg.dell.reportTypes)" 2>&1
+
+  # 1. Scan to an XML report FIRST — this is the only source of each update's name, available version
+  #    and size (the apply output carries none of it). One scan covers all types; we partition into
+  #    what we apply (driver/firmware/utility) vs BIOS (report-only).
+  $reportDir = $script:RunDir
+  $scanOut = & $dcu /scan -report="$reportDir" -silent 2>&1
   Write-CompLog 'dell-bios-scan' $scanOut
-  $m = [regex]::Match(($scanOut | Out-String), 'applicable updates?\D*(\d+)')
-  $biosCount = if ($m.Success) { [int]$m.Groups[1].Value } else { -1 }
-  # dcu exit 1 = reboot required by THIS apply (count it). exit 5 = reboot pending from a
-  # PRIOR op / nothing applied now (do NOT count — that's not this run's doing).
-  $reboot = ($applyCode -eq 1)
-  if ($biosCount -gt 0) {
-    Raise-SysSentryAlert "Dell BIOS update available ($biosCount, not auto-applied) — review the run dir dell-bios-scan.log"
-    return @{ status = 'ok'; reboot = $reboot; detail = "drivers/firmware applied (exit $applyCode); BIOS update AVAILABLE ($biosCount, not flashed)" }
+  $avail   = Parse-DcuReport (Join-Path $reportDir 'DCUApplicableUpdates.xml')
+  $bios    = @($avail | Where-Object { "$($_.type)" -match 'BIOS' })
+  $nonBios = @($avail | Where-Object { "$($_.type)" -notmatch 'BIOS' })   # driver/firmware/application = what we apply
+  Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded). Scan found $($nonBios.Count) non-BIOS + $($bios.Count) BIOS applicable."
+
+  # 2. Apply driver/firmware/utility (BIOS excluded), timing the batch.
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $apply = & $dcu /applyUpdates -updateType="$($Cfg.dell.applyTypes)" -autoSuspendBitLocker=enable -reboot=disable 2>&1
+  $sw.Stop(); $applyCode = $LASTEXITCODE
+  $applyDur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+  Write-CompLog 'dell-apply' $apply
+  Write-CompLog 'dell-apply' "exit: $applyCode (${applyDur}s)"
+
+  # 3. Interpret dcu-cli's exit code. 0 = applied (no reboot); 1 = applied (reboot required);
+  #    5 = reboot pending from a PRIOR op (nothing applied now); 500 = no applicable updates;
+  #    anything else = surface as a warning (see dell-apply.log).
+  $applied = $applyCode -in 0, 1
+  $reboot  = ($applyCode -eq 1)
+
+  # 4. Record each applied update from the scan report: real name + available (new) version + size.
+  #    When the apply installed our non-BIOS set (exit 0/1), those report entries ARE what installed.
+  #    old stays "—" (dcu exposes no installed version); duration is the batch time (no per-driver timing).
+  if ($applied) {
+    foreach ($u in $nonBios) {
+      $mb = if ($u.bytes -gt 0) { [math]::Round($u.bytes / 1MB, 1) } else { $null }
+      Add-Update -Name $u.name -Source 'Dell' -Old '—' -New $u.version -DurationSec $applyDur -SizeMB $mb
+    }
   }
-  $biosDetail = if ($biosCount -eq 0) { 'no BIOS update' } else { 'BIOS scan inconclusive (see dell-bios-scan.log)' }
-  @{ status = 'ok'; reboot = $reboot; detail = "drivers/firmware applied (exit $applyCode); $biosDetail" }
+
+  # 5. BIOS: report only — a human decides (unattended flash = brick risk on power loss).
+  if ($bios.Count -gt 0) {
+    Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
+  }
+
+  # 6. Build the status line from the exit code.
+  $applyDetail = switch ($applyCode) {
+    0       { "applied $($nonBios.Count) driver/firmware update(s)" }
+    1       { "applied $($nonBios.Count) driver/firmware update(s); reboot required" }
+    5       { 'nothing applied (reboot pending from a prior op)' }
+    500     { 'no applicable driver/firmware updates' }
+    default { "dcu exit $applyCode (see dell-apply.log)" }
+  }
+  $biosDetail = if ($bios.Count -gt 0) { "; BIOS update AVAILABLE ($($bios.Count), not flashed)" } else { '; no BIOS update' }
+  $status = if ($applyCode -in 0, 1, 5, 500) { 'ok' } else { 'warn' }
+  $out = @{ status = $status; reboot = $reboot; detail = "$applyDetail$biosDetail" }
+  if ($status -eq 'warn') { $out.error = "dcu-cli exit $applyCode — see dell-apply.log" }
+  $out
 }
 
 function Comp-PSModules {
