@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to AutoUpdate. Format: [Keep a Changelog](https://keepachangelog.com/).
+All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.7.0] - 2026-06-27
 
