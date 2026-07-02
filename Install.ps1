@@ -90,6 +90,7 @@ if (-not (Test-Path $ConfigFile)) {
   "rebootPolicy": "ifRequired",
   "rebootDelaySeconds": 120,
   "rebootGraceInteractiveSec": 300,
+  "pendingRebootAlertDays": 3,
   "keepRuns": 30,
   "notify":        { "enabled": true, "historyDays": 30, "historyCollapse": true, "historyMaxRows": 500 },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },

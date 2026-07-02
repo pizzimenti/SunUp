@@ -34,18 +34,21 @@ else { if ($Validate) { Write-Host 'validate OK: no payload'; exit 0 } else { ex
 # Gate: nothing new to show (e.g. a logon when the last cycle was already seen).
 if (-not $Demo -and -not $Validate -and -not $data.pendingShow) { exit 0 }
 
-# Live reboot state decides pre- vs post-reboot face.
-function Test-PendingReboot {
+# Pre- vs post-reboot: the box has restarted iff it has BOOTED since the run finished. This is robust
+# even for a run-signal reboot (winget/MSI 3010) that sets no OS pending flag — the old Test-PendingReboot
+# proxy would misread that as "already rebooted" and silently skip the countdown. On any uncertainty we
+# default to pre-reboot (show the cancellable countdown) so a needed reboot is never silently skipped.
+$needsReboot = [bool]$data.rebootRequired
+$rebootedSinceRun = $false
+if (-not $Demo -and $needsReboot -and $data.runEndUtc) {
   try {
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { return $true }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { return $true }
-    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations) { return $true }
-  } catch {}
-  return $false
+    $runEnd = [datetime]::Parse($data.runEndUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    $boot   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime()
+    $rebootedSinceRun = $boot -gt $runEnd
+  } catch { $rebootedSinceRun = $false }   # can't tell → assume not yet rebooted → show countdown
 }
-$pendingNow   = if ($Demo) { [bool]$data.rebootRequired } else { Test-PendingReboot }
-$showCountdown = [bool]$data.rebootRequired -and $pendingNow
-$postReboot    = [bool]$data.rebootRequired -and -not $pendingNow   # was required, now cleared
+$showCountdown = if ($Demo) { [bool]$data.rebootRequired } else { $needsReboot -and -not $rebootedSinceRun }
+$postReboot    = $needsReboot -and $rebootedSinceRun   # required, and the box has since restarted
 
 function Format-Size { param($mb) if ($null -eq $mb -or $mb -le 0) { '—' } elseif ($mb -ge 1024) { '{0:N1} GB' -f ($mb/1024) } else { '{0:N0} MB' -f $mb } }
 function Format-Dur  { param($s) if ($null -eq $s -or $s -le 0) { '—' } elseif ($s -lt 60) { "$([int]$s)s" } else { '{0}m {1:00}s' -f [math]::Floor($s/60), ([int]$s % 60) } }

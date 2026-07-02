@@ -337,7 +337,14 @@ function Comp-Winget { param($Cfg)
     }
   }
   $skipNote = if ($skipCount -gt 0) { ", $skipCount skipped" } else { '' }
-  if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = "up to date$skipNote" } }
+  if (@($pending).Count -eq 0) {
+    # Distinguish a genuine "nothing to upgrade" (list exit 0) from an empty result caused by a failed
+    # list (non-zero exit) — the latter must not masquerade as up-to-date in result.json/Status.
+    if ($listCode -ne 0) {
+      return @{ status = 'warn'; detail = "upgrade list incomplete (exit 0x$(([int]$listCode).ToString('X8')))$skipNote"; error = 'winget upgrade list exited non-zero' }
+    }
+    return @{ status = 'ok'; detail = "up to date$skipNote" }
+  }
 
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
@@ -698,8 +705,10 @@ $payload = [ordered]@{
   runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
   totalDurationSec   = $durSec
   totalSizeMB        = if ($totalSize) { [math]::Round($totalSize, 1) } else { $null }
-  rebootRequired     = $willReboot          # dialog re-checks live pending state to flip pre/post
-  rebootCountdownSec = $graceInteractive
+  rebootRequired      = $willReboot         # engine's authoritative "a reboot is intended" signal
+  rebootRequiredByRun = $rebootRequiredByRun # true = run-signal reboot (may set no OS pending flag)
+  runEndUtc           = $endUtc.ToString('o') # dialog compares to LastBootUpTime to flip pre/post
+  rebootCountdownSec  = $graceInteractive
   pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
   history            = $history             # past-Ndays updates, greyed below the current run

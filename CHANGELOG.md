@@ -32,6 +32,15 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
   emitted) so an incomplete scan is visible.
 - **Skipped packages surfaced.** Excluded winget packages now show as a count in the component detail
   (`up to date, 2 skipped` / `1 upgraded, 0 failed (of 1), 2 skipped`), not just buried in the raw log.
+- **Dialog honors run-signal reboots (PR review, Codex P1).** Under `ifRequired` a reboot can be
+  required by the run (e.g. a winget/MSI `3010` exit) while no OS pending flag is set. The dialog now
+  decides pre- vs post-reboot by whether the box has **booted since the run finished** (`runEndUtc`
+  vs `LastBootUpTime`) instead of the OS pending flag — which previously misread a flag-less reboot as
+  "already rebooted" and silently skipped the interactive countdown. Defaults to showing the countdown
+  on any uncertainty. Headless reboots were unaffected.
+- **A failed winget upgrade-list no longer reports "up to date" (PR review).** A non-zero list exit
+  with zero parsed rows now returns `warn` ("upgrade list incomplete") so `result.json`/`Status`
+  reflect the partial run, not just the log.
 
 ### Fixed — winget no longer warns every run on unupgradable UWP framework packages
 - `Microsoft.VCLibs.140.00` / `.UWPDesktop` are UWP **framework** packages that winget can't deploy
