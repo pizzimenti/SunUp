@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.7.0'
+$script:Version = '0.8.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -64,7 +64,10 @@ $script:RunLog = $null
 
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
-  rebootPolicy       = 'always'
+  # ifRequired = reboot only when a component THIS run actually reported reboot=true (the smart default);
+  # always = reboot on any OS-level pending flag (blunt — a PnP/driver PendingFileRename trips it);
+  # never = never auto-reboot, just flag a genuine pending state for a human.
+  rebootPolicy       = 'ifRequired'
   rebootDelaySeconds = 120           # headless (no user logged in) restart grace
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
   keepRuns           = 30            # how many per-run log dirs to retain
@@ -73,9 +76,11 @@ $DefaultConfig = [ordered]@{
   # daily Defender-signature bumps don't flood the list.
   notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500 }
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
-  # Skip pinned drivers, self-updating Claude, and load-bearing per-user/Electron apps whose
-  # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams' }
+  # Skip pinned drivers, self-updating Claude, load-bearing per-user/Electron apps whose uninstaller
+  # refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.), and UWP *framework*
+  # packages (VCLibs) that winget can't deploy — they fail 0x8A15005C "extract" every run and are
+  # serviced by the Store/dependent apps, not winget, so attempting them is pure noise.
+  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs' }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
@@ -311,7 +316,16 @@ function Comp-Winget { param($Cfg)
   Write-CompLog 'winget' @('--- available ---') ; Write-CompLog 'winget' $listRaw
   $pending = Parse-WingetUpgrades ([string[]]($listRaw -split "`r?`n"))
   $excl = $Cfg.winget.excludePattern
-  if ($excl) { $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl }) }
+  if ($excl) {
+    $skipped = @($pending | Where-Object { $_.name -match $excl -or $_.id -match $excl })
+    $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl })
+    # Honest about what we drop: an excluded package is a deliberate skip, not a silent no-op.
+    if ($skipped.Count -gt 0) {
+      $ids = ($skipped | ForEach-Object { $_.id }) -join ', '
+      Write-CompLog 'winget' "--- skipped $($skipped.Count) excluded package(s): $ids ---"
+      Write-Log INFO "winget: skipped $($skipped.Count) excluded package(s): $ids"
+    }
+  }
   if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
 
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
@@ -595,12 +609,19 @@ $result = [ordered]@{
   components          = $results
   updates             = @($script:Updates)
 }
-# Reboot when one is actually PENDING when checked — Chrome sets no pending flag (no prompt),
-# Dell/WU drivers do (countdown). Ownership: user logged in → the dialog owns a cancellable
-# countdown; headless → the engine reboots itself. policy=never never reboots.
+# What triggers the reboot depends on rebootPolicy (see $DefaultConfig for the three values):
+#   always     — any OS-level pending flag ($rebootPending); blunt, catches PnP/driver flags too
+#   ifRequired — only when THIS run's components reported reboot=true ($rebootRequiredByRun)
+#   never      — never auto-reboot
+# Ownership: user logged in → the dialog owns a cancellable countdown; headless → the engine
+# reboots itself. An unrecognized policy is treated as 'never' (fail safe: never surprise-reboot).
 $interactive      = Test-InteractiveUser
 $graceInteractive = if ($cfg.rebootGraceInteractiveSec) { [int]$cfg.rebootGraceInteractiveSec } else { 300 }
-$willReboot       = $rebootPending -and $cfg.rebootPolicy -eq 'always'
+$willReboot       = switch ("$($cfg.rebootPolicy)") {
+  'always'     { $rebootPending }
+  'ifRequired' { $rebootRequiredByRun }
+  default      { $false }
+}
 if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
 elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
@@ -666,8 +687,16 @@ elseif ($willReboot) {
   Write-Evt 2005 Warning "${Name}: headless reboot in $($cfg.rebootDelaySeconds)s."
 }
 elseif ($rebootPending) {
-  Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
-  Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+  # An OS pending flag is set but we're not rebooting. Two very different cases:
+  if ("$($cfg.rebootPolicy)" -eq 'never') {
+    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge.
+    Write-Log INFO 'Reboot pending but rebootPolicy=never — leaving box up.'
+    Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+  } else {
+    # ifRequired: the flag is set (e.g. a PnP driver's PendingFileRename) but no component this run
+    # demanded a reboot. That's benign background state — note it, don't nag SysSentry every day.
+    Write-Log INFO 'OS reboot-pending flag set, but no component this run required a reboot (rebootPolicy=ifRequired) — not rebooting.'
+  }
 }
 else { Write-Log INFO 'No reboot required.' }
 

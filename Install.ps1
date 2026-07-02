@@ -87,13 +87,13 @@ $ConfigFile = Join-Path $Root 'config.json'
 if (-not (Test-Path $ConfigFile)) {
 @'
 {
-  "rebootPolicy": "always",
+  "rebootPolicy": "ifRequired",
   "rebootDelaySeconds": 120,
   "rebootGraceInteractiveSec": 300,
   "keepRuns": 30,
   "notify":        { "enabled": true, "historyDays": 30, "historyCollapse": true, "historyMaxRows": 500 },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
-  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams" },
+  "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs" },
   "defender":      { "enabled": true },
   "psModules":     { "enabled": true, "everyDays": 7 },
   "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },

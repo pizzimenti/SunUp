@@ -42,7 +42,7 @@ function Test-PendingReboot {
   $false
 }
 function Get-RebootPolicy {
-  try { (Get-Content $Cfg -Raw | ConvertFrom-Json).rebootPolicy } catch { 'always' }
+  try { (Get-Content $Cfg -Raw | ConvertFrom-Json).rebootPolicy } catch { 'ifRequired' }
 }
 function Get-LastRun {
   try { Get-Content $Stamp -Raw | ConvertFrom-Json } catch { $null }
@@ -101,7 +101,7 @@ function Update-Tray {
   $lastTxt = if ($lr) { "Last run: $($lr.date)" } else { 'Last run: (never)' }
   $miHeader.Text = "SunUp — $lastTxt"
   $miNext.Text   = if ($nr) { "Next run: $($nr.ToString('ddd HH:mm'))" } else { 'Next run: (unscheduled)' }
-  $miReboot.Checked = ((Get-RebootPolicy) -eq 'always')
+  $miReboot.Checked = ((Get-RebootPolicy) -ne 'never')   # checked = auto-reboot enabled (ifRequired or always)
   $script:notify.Icon = if ($pending) { $script:iconAlert } else { $script:iconNormal }
   $tip = "SunUp`n$lastTxt" + $(if ($pending) { "`nReboot pending" } else { '' })
   if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 127) }   # NotifyIcon tooltip hard limit
@@ -141,11 +141,14 @@ $miLogs.Add_Click({ try { Start-Process explorer.exe $Logs } catch {} })
 $miReboot.Add_Click({
   try {
     $c = Get-Content $Cfg -Raw | ConvertFrom-Json
-    $c.rebootPolicy = if ($c.rebootPolicy -eq 'always') { 'never' } else { 'always' }
+    # Toggle enabled/off. "On" turns on the smart default (ifRequired = only when a run needs it),
+    # not the blunt 'always'. A power user who wants 'always' edits config.json directly; toggling
+    # off then on from there lands on ifRequired.
+    $c.rebootPolicy = if ($c.rebootPolicy -eq 'never') { 'ifRequired' } else { 'never' }
     $c | ConvertTo-Json -Depth 6 | Set-Content $Cfg -Encoding UTF8
     Update-Tray
     $script:notify.BalloonTipTitle = 'SunUp'
-    $script:notify.BalloonTipText  = "Auto-reboot is now $(if ($c.rebootPolicy -eq 'always') { 'ON' } else { 'OFF' })"
+    $script:notify.BalloonTipText  = if ($c.rebootPolicy -eq 'never') { 'Auto-reboot is now OFF' } else { 'Auto-reboot is now ON (only when required)' }
     $script:notify.ShowBalloonTip(3000)
   } catch { [System.Windows.Forms.MessageBox]::Show("Couldn't update config: $_", 'SunUp', 'OK', 'Warning') | Out-Null }
 })
