@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.7.0'
+$script:Version = '0.8.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -64,8 +64,15 @@ $script:RunLog = $null
 
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
-  rebootPolicy       = 'always'
+  # ifRequired = reboot only when a component THIS run actually reported reboot=true (the smart default);
+  # always = reboot on any OS-level pending flag (blunt — a PnP/driver PendingFileRename trips it);
+  # never = never auto-reboot, just flag a genuine pending state for a human.
+  rebootPolicy       = 'ifRequired'
   rebootDelaySeconds = 120           # headless (no user logged in) restart grace
+  # Watchdog for the ifRequired blind spot: if an OS reboot flag stays pending across runs without
+  # any run requiring it, alert once after this many days so a genuinely-needed reboot can't sit
+  # forever unnoticed. 0 disables. (Under rebootPolicy=always this never triggers — the flag clears.)
+  pendingRebootAlertDays = 3
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
   keepRuns           = 30            # how many per-run log dirs to retain
   # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
@@ -73,9 +80,11 @@ $DefaultConfig = [ordered]@{
   # daily Defender-signature bumps don't flood the list.
   notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500 }
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
-  # Skip pinned drivers, self-updating Claude, and load-bearing per-user/Electron apps whose
-  # uninstaller refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.).
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams' }
+  # Skip pinned drivers, self-updating Claude, load-bearing per-user/Electron apps whose uninstaller
+  # refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.), and UWP *framework*
+  # packages (VCLibs) that winget can't deploy — they fail 0x8A15005C "extract" every run and are
+  # serviced by the Store/dependent apps, not winget, so attempting them is pure noise.
+  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs' }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
@@ -307,12 +316,35 @@ function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
   Write-CompLog 'winget' "winget: $winget"
-  $listRaw = & $winget upgrade --include-unknown --accept-source-agreements 2>&1
+  $listRaw  = & $winget upgrade --include-unknown --accept-source-agreements 2>&1
+  $listCode = $LASTEXITCODE      # capture immediately — a non-zero list exit means a network/source
+                                 # hiccup, which otherwise parses to zero rows and masquerades as "up to date".
   Write-CompLog 'winget' @('--- available ---') ; Write-CompLog 'winget' $listRaw
+  Write-CompLog 'winget' ("list exit: 0x{0:X8}" -f ([int]$listCode))
+  if ($listCode -ne 0) { Write-Log WARN "winget: upgrade-list exited 0x$(([int]$listCode).ToString('X8')) — result may be incomplete" }
   $pending = Parse-WingetUpgrades ([string[]]($listRaw -split "`r?`n"))
   $excl = $Cfg.winget.excludePattern
-  if ($excl) { $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl }) }
-  if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
+  $skipCount = 0
+  if ($excl) {
+    $skipped = @($pending | Where-Object { $_.name -match $excl -or $_.id -match $excl })
+    $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl })
+    $skipCount = $skipped.Count
+    # Honest about what we drop: an excluded package is a deliberate skip, not a silent no-op.
+    if ($skipCount -gt 0) {
+      $ids = ($skipped | ForEach-Object { $_.id }) -join ', '
+      Write-CompLog 'winget' "--- skipped $skipCount excluded package(s): $ids ---"
+      Write-Log INFO "winget: skipped $skipCount excluded package(s): $ids"
+    }
+  }
+  $skipNote = if ($skipCount -gt 0) { ", $skipCount skipped" } else { '' }
+  if (@($pending).Count -eq 0) {
+    # Distinguish a genuine "nothing to upgrade" (list exit 0) from an empty result caused by a failed
+    # list (non-zero exit) — the latter must not masquerade as up-to-date in result.json/Status.
+    if ($listCode -ne 0) {
+      return @{ status = 'warn'; detail = "upgrade list incomplete (exit 0x$(([int]$listCode).ToString('X8')))$skipNote"; error = 'winget upgrade list exited non-zero' }
+    }
+    return @{ status = 'ok'; detail = "up to date$skipNote" }
+  }
 
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
@@ -330,7 +362,7 @@ function Comp-Winget { param($Cfg)
       Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetSizeMB $txt)
     } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
-  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))" + $(if ($reboot) { '; reboot required' } else { '' })
+  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))$skipNote" + $(if ($reboot) { '; reboot required' } else { '' })
   if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log"; reboot = $reboot } }
   @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
@@ -595,12 +627,19 @@ $result = [ordered]@{
   components          = $results
   updates             = @($script:Updates)
 }
-# Reboot when one is actually PENDING when checked — Chrome sets no pending flag (no prompt),
-# Dell/WU drivers do (countdown). Ownership: user logged in → the dialog owns a cancellable
-# countdown; headless → the engine reboots itself. policy=never never reboots.
+# What triggers the reboot depends on rebootPolicy (see $DefaultConfig for the three values):
+#   always     — any OS-level pending flag ($rebootPending); blunt, catches PnP/driver flags too
+#   ifRequired — only when THIS run's components reported reboot=true ($rebootRequiredByRun)
+#   never      — never auto-reboot
+# Ownership: user logged in → the dialog owns a cancellable countdown; headless → the engine
+# reboots itself. An unrecognized policy is treated as 'never' (fail safe: never surprise-reboot).
 $interactive      = Test-InteractiveUser
 $graceInteractive = if ($cfg.rebootGraceInteractiveSec) { [int]$cfg.rebootGraceInteractiveSec } else { 300 }
-$willReboot       = $rebootPending -and $cfg.rebootPolicy -eq 'always'
+$willReboot       = switch ("$($cfg.rebootPolicy)") {
+  'always'     { $rebootPending }
+  'ifRequired' { $rebootRequiredByRun }
+  default      { $false }
+}
 if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
 elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
@@ -609,8 +648,27 @@ $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 # trim history to last 365 runs
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }
 
-# day stamp (marks today done so the other triggers no-op)
-Save-Stamp ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending })
+# ---- stale pending-reboot watchdog (guards the ifRequired blind spot) --------
+# When we leave a pending flag that no run required, track how long it has persisted (carried in the
+# stamp) and alert ONCE past pendingRebootAlertDays — so a genuinely-needed reboot can't sit forever
+# unnoticed. Rebooting now, or the flag clearing on its own, resets the tracker (pendingSince=null).
+$pendingSince = $null; $pendingAlerted = $false
+if ($rebootPending -and -not $willReboot) {
+  $pendingSince   = if ($stamp -and $stamp.pendingSince) { "$($stamp.pendingSince)" } else { (Get-Date).ToString('o') }
+  $pendingAlerted = [bool]($stamp -and $stamp.pendingAlerted)
+  $alertDays = if ($cfg.PSObject.Properties.Name -contains 'pendingRebootAlertDays') { [double]$cfg.pendingRebootAlertDays } else { 3 }
+  if ($alertDays -gt 0 -and -not $pendingAlerted) {
+    $ageDays = try { ((Get-Date) - [datetime]::Parse($pendingSince, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).TotalDays } catch { 0 }
+    if ($ageDays -ge $alertDays) {
+      $m = "Reboot has been pending {0:N1} days but no run required it (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient." -f $ageDays
+      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-SysSentryAlert $m
+      $pendingAlerted = $true
+    }
+  }
+}
+
+# day stamp (marks today done so the other triggers no-op; carries the pending-reboot watchdog state)
+Save-Stamp ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted })
 
 $summary = ($results | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
 Write-Log INFO "Components: $summary  (total ${durSec}s)"
@@ -647,8 +705,10 @@ $payload = [ordered]@{
   runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
   totalDurationSec   = $durSec
   totalSizeMB        = if ($totalSize) { [math]::Round($totalSize, 1) } else { $null }
-  rebootRequired     = $willReboot          # dialog re-checks live pending state to flip pre/post
-  rebootCountdownSec = $graceInteractive
+  rebootRequired      = $willReboot         # engine's authoritative "a reboot is intended" signal
+  rebootRequiredByRun = $rebootRequiredByRun # true = run-signal reboot (may set no OS pending flag)
+  runEndUtc           = $endUtc.ToString('o') # dialog compares to LastBootUpTime to flip pre/post
+  rebootCountdownSec  = $graceInteractive
   pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
   history            = $history             # past-Ndays updates, greyed below the current run
@@ -666,8 +726,16 @@ elseif ($willReboot) {
   Write-Evt 2005 Warning "${Name}: headless reboot in $($cfg.rebootDelaySeconds)s."
 }
 elseif ($rebootPending) {
-  Write-Log INFO 'Reboot pending but rebootPolicy != always — leaving box up.'
-  Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+  # An OS pending flag is set but we're not rebooting. Two very different cases:
+  if ("$($cfg.rebootPolicy)" -eq 'never') {
+    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge.
+    Write-Log INFO 'Reboot pending but rebootPolicy=never — leaving box up.'
+    Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+  } else {
+    # ifRequired: the flag is set (e.g. a PnP driver's PendingFileRename) but no component this run
+    # demanded a reboot. That's benign background state — note it, don't nag SysSentry every day.
+    Write-Log INFO 'OS reboot-pending flag set, but no component this run required a reboot (rebootPolicy=ifRequired) — not rebooting.'
+  }
 }
 else { Write-Log INFO 'No reboot required.' }
 

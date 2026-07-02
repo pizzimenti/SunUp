@@ -52,7 +52,10 @@ Defender-signature bumps don't flood it.
 If — and only if — an update leaves a reboot **pending**, the dialog owns a cancellable countdown
 (**Restart now** / **Postpone**). A reboot that isn't actually needed never prompts you. If no one is
 logged in, the engine reboots headlessly after a grace period and shows the summary at next sign-in.
-Set `rebootPolicy: "never"` to never auto-reboot.
+
+The default `rebootPolicy: "ifRequired"` reboots only when a component **this run** actually reported
+a reboot as required — a stray OS "pending" flag (e.g. a PnP/audio driver) no longer forces a restart.
+Set `"always"` to reboot on any pending flag (the old behavior), or `"never"` to never auto-reboot.
 
 ## System tray
 
@@ -81,7 +84,7 @@ Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
   structured `result.json`.
 
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
-2005 reboot, 2010 errors).
+2005 reboot, 2006 stale-reboot-pending, 2010 errors).
 
 ## Install / uninstall
 
@@ -103,8 +106,9 @@ pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Tail     # tail of the most 
 pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Run -Force   # run now, bypassing the day stamp
 ```
 
-> Heads-up: a forced run **will reboot** if an update leaves a reboot pending and `rebootPolicy` is
-> `always`. To test safely, set `rebootPolicy: "never"` first.
+> Heads-up: a forced run **will reboot** if an update this run installs requires it (`rebootPolicy`
+> `ifRequired`, the default), or if any reboot is pending under `rebootPolicy: "always"`. To test
+> safely, set `rebootPolicy: "never"` first.
 
 ## Configuration
 
@@ -113,9 +117,10 @@ defaults):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rebootPolicy` | `"always"` | `always` reboots when one is pending; `never` never does |
+| `rebootPolicy` | `"ifRequired"` | `ifRequired` reboots only when a component this run required it; `always` reboots on any OS pending flag; `never` never does |
 | `rebootDelaySeconds` | `120` | headless restart grace |
 | `rebootGraceInteractiveSec` | `300` | countdown the dialog shows when a user is logged in |
+| `pendingRebootAlertDays` | `3` | under `ifRequired`, alert once if a reboot stays pending this many days without a run requiring it (`0` disables) |
 | `keepRuns` | `30` | per-run log dirs to retain |
 | `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |

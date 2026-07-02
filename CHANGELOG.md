@@ -2,6 +2,54 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.0] - 2026-07-02
+
+### Changed — `rebootPolicy: "ifRequired"` is the new default (no more reboots you didn't need)
+- SunUp already computed two reboot signals but decided on the wrong one: `rebootPending` (a blunt
+  OS-level flag that a PnP/driver install trips even when nothing needs a restart) drove the reboot,
+  while `rebootRequiredByRun` (whether a component **this run** actually reported `reboot=true`) was
+  only recorded. The reboot decision is now a `rebootPolicy` switch:
+  - **`ifRequired`** (new default) — reboot only when a component this run required it.
+  - **`always`** — reboot on any OS pending flag (the old 0.1.0–0.7.0 behavior; still available).
+  - **`never`** — never auto-reboot.
+  - Motivating case: a 2026-07-02 run installed only a Defender signature + a Microsoft
+    AudioProcessingObject **driver**; the driver set the OS pending flag, so `always` rebooted the box
+    even though `rebootRequiredByRun` was `false`. Under `ifRequired` that morning would not reboot.
+- When an OS pending flag is set but no component this run required a reboot, `ifRequired` logs it
+  quietly (INFO) instead of raising a daily SysSentry "reboot pending" alert. `never` still nudges.
+- Tray **Auto-reboot when needed** toggle is now three-state aware: the checkmark means *enabled*
+  (`ifRequired` **or** `always`); toggling on sets the smart `ifRequired` default, toggling off sets
+  `never`. Balloon reads "Auto-reboot is now ON (only when required)".
+
+### Added — hardening for the `ifRequired` blind spot + winget observability
+- **Stale pending-reboot watchdog.** `ifRequired` deliberately leaves an OS pending flag that no run
+  required — but a *genuinely* needed reboot (missed detection, or a flag set outside SunUp) could
+  then sit forever. The engine now tracks how long a flag has persisted (via `pendingSince` in
+  `lastrun.json`) and raises a **one-time** WARN + event `2006` + SysSentry alert once it exceeds
+  `pendingRebootAlertDays` (default `3`, `0` disables). Rebooting or the flag clearing resets it.
+- **winget list-exit logging.** A non-zero exit from `winget upgrade` (network/source hiccup) parses
+  to zero rows and used to masquerade as "up to date"; the list exit code is now logged (and a WARN
+  emitted) so an incomplete scan is visible.
+- **Skipped packages surfaced.** Excluded winget packages now show as a count in the component detail
+  (`up to date, 2 skipped` / `1 upgraded, 0 failed (of 1), 2 skipped`), not just buried in the raw log.
+- **Dialog honors run-signal reboots (PR review, Codex P1).** Under `ifRequired` a reboot can be
+  required by the run (e.g. a winget/MSI `3010` exit) while no OS pending flag is set. The dialog now
+  decides pre- vs post-reboot by whether the box has **booted since the run finished** (`runEndUtc`
+  vs `LastBootUpTime`) instead of the OS pending flag — which previously misread a flag-less reboot as
+  "already rebooted" and silently skipped the interactive countdown. Defaults to showing the countdown
+  on any uncertainty. Headless reboots were unaffected.
+- **A failed winget upgrade-list no longer reports "up to date" (PR review).** A non-zero list exit
+  with zero parsed rows now returns `warn` ("upgrade list incomplete") so `result.json`/`Status`
+  reflect the partial run, not just the log.
+
+### Fixed — winget no longer warns every run on unupgradable UWP framework packages
+- `Microsoft.VCLibs.140.00` / `.UWPDesktop` are UWP **framework** packages that winget can't deploy
+  (they fail `0x8A15005C` "Failed to extract the contents of the archive" every run) and are serviced
+  by the Store / dependent apps, not winget. They're now in the default `winget.excludePattern`, so a
+  clean run stops flipping to **warn** over an unactionable, perennial failure.
+- Excluded winget packages are now logged (count + ids) to `winget.log` and the run log — a skip is a
+  deliberate decision, not a silent no-op.
+
 ## [0.7.0] - 2026-06-27
 
 ### Added — system-tray presence (`SunUp-Tray.ps1`)
@@ -199,6 +247,7 @@ These are source limitations, not logging gaps — the data doesn't exist to cap
 - `Install.ps1` installs PSWindowsUpdate + registers Microsoft Update service, best-effort installs
   Dell Command Update, registers the task, and refreshes the SysSentry baseline.
 
+[0.8.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.8.0
 [0.7.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.7.0
 [0.6.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.5.0
