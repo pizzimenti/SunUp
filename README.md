@@ -84,7 +84,7 @@ Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
   structured `result.json`.
 
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
-2005 reboot, 2010 errors).
+2005 reboot, 2006 stale-reboot-pending, 2010 errors).
 
 ## Install / uninstall
 
@@ -120,6 +120,7 @@ defaults):
 | `rebootPolicy` | `"ifRequired"` | `ifRequired` reboots only when a component this run required it; `always` reboots on any OS pending flag; `never` never does |
 | `rebootDelaySeconds` | `120` | headless restart grace |
 | `rebootGraceInteractiveSec` | `300` | countdown the dialog shows when a user is logged in |
+| `pendingRebootAlertDays` | `3` | under `ifRequired`, alert once if a reboot stays pending this many days without a run requiring it (`0` disables) |
 | `keepRuns` | `30` | per-run log dirs to retain |
 | `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |

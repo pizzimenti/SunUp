@@ -21,6 +21,18 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
   (`ifRequired` **or** `always`); toggling on sets the smart `ifRequired` default, toggling off sets
   `never`. Balloon reads "Auto-reboot is now ON (only when required)".
 
+### Added — hardening for the `ifRequired` blind spot + winget observability
+- **Stale pending-reboot watchdog.** `ifRequired` deliberately leaves an OS pending flag that no run
+  required — but a *genuinely* needed reboot (missed detection, or a flag set outside SunUp) could
+  then sit forever. The engine now tracks how long a flag has persisted (via `pendingSince` in
+  `lastrun.json`) and raises a **one-time** WARN + event `2006` + SysSentry alert once it exceeds
+  `pendingRebootAlertDays` (default `3`, `0` disables). Rebooting or the flag clearing resets it.
+- **winget list-exit logging.** A non-zero exit from `winget upgrade` (network/source hiccup) parses
+  to zero rows and used to masquerade as "up to date"; the list exit code is now logged (and a WARN
+  emitted) so an incomplete scan is visible.
+- **Skipped packages surfaced.** Excluded winget packages now show as a count in the component detail
+  (`up to date, 2 skipped` / `1 upgraded, 0 failed (of 1), 2 skipped`), not just buried in the raw log.
+
 ### Fixed — winget no longer warns every run on unupgradable UWP framework packages
 - `Microsoft.VCLibs.140.00` / `.UWPDesktop` are UWP **framework** packages that winget can't deploy
   (they fail `0x8A15005C` "Failed to extract the contents of the archive" every run) and are serviced

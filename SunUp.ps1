@@ -69,6 +69,10 @@ $DefaultConfig = [ordered]@{
   # never = never auto-reboot, just flag a genuine pending state for a human.
   rebootPolicy       = 'ifRequired'
   rebootDelaySeconds = 120           # headless (no user logged in) restart grace
+  # Watchdog for the ifRequired blind spot: if an OS reboot flag stays pending across runs without
+  # any run requiring it, alert once after this many days so a genuinely-needed reboot can't sit
+  # forever unnoticed. 0 disables. (Under rebootPolicy=always this never triggers — the flag clears.)
+  pendingRebootAlertDays = 3
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
   keepRuns           = 30            # how many per-run log dirs to retain
   # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
@@ -312,21 +316,28 @@ function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
   Write-CompLog 'winget' "winget: $winget"
-  $listRaw = & $winget upgrade --include-unknown --accept-source-agreements 2>&1
+  $listRaw  = & $winget upgrade --include-unknown --accept-source-agreements 2>&1
+  $listCode = $LASTEXITCODE      # capture immediately — a non-zero list exit means a network/source
+                                 # hiccup, which otherwise parses to zero rows and masquerades as "up to date".
   Write-CompLog 'winget' @('--- available ---') ; Write-CompLog 'winget' $listRaw
+  Write-CompLog 'winget' ("list exit: 0x{0:X8}" -f ([int]$listCode))
+  if ($listCode -ne 0) { Write-Log WARN "winget: upgrade-list exited 0x$(([int]$listCode).ToString('X8')) — result may be incomplete" }
   $pending = Parse-WingetUpgrades ([string[]]($listRaw -split "`r?`n"))
   $excl = $Cfg.winget.excludePattern
+  $skipCount = 0
   if ($excl) {
     $skipped = @($pending | Where-Object { $_.name -match $excl -or $_.id -match $excl })
     $pending = @($pending | Where-Object { $_.name -notmatch $excl -and $_.id -notmatch $excl })
+    $skipCount = $skipped.Count
     # Honest about what we drop: an excluded package is a deliberate skip, not a silent no-op.
-    if ($skipped.Count -gt 0) {
+    if ($skipCount -gt 0) {
       $ids = ($skipped | ForEach-Object { $_.id }) -join ', '
-      Write-CompLog 'winget' "--- skipped $($skipped.Count) excluded package(s): $ids ---"
-      Write-Log INFO "winget: skipped $($skipped.Count) excluded package(s): $ids"
+      Write-CompLog 'winget' "--- skipped $skipCount excluded package(s): $ids ---"
+      Write-Log INFO "winget: skipped $skipCount excluded package(s): $ids"
     }
   }
-  if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = 'up to date' } }
+  $skipNote = if ($skipCount -gt 0) { ", $skipCount skipped" } else { '' }
+  if (@($pending).Count -eq 0) { return @{ status = 'ok'; detail = "up to date$skipNote" } }
 
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
@@ -344,7 +355,7 @@ function Comp-Winget { param($Cfg)
       Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetSizeMB $txt)
     } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
-  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))" + $(if ($reboot) { '; reboot required' } else { '' })
+  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))$skipNote" + $(if ($reboot) { '; reboot required' } else { '' })
   if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log"; reboot = $reboot } }
   @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
@@ -630,8 +641,27 @@ $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 # trim history to last 365 runs
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }
 
-# day stamp (marks today done so the other triggers no-op)
-Save-Stamp ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending })
+# ---- stale pending-reboot watchdog (guards the ifRequired blind spot) --------
+# When we leave a pending flag that no run required, track how long it has persisted (carried in the
+# stamp) and alert ONCE past pendingRebootAlertDays — so a genuinely-needed reboot can't sit forever
+# unnoticed. Rebooting now, or the flag clearing on its own, resets the tracker (pendingSince=null).
+$pendingSince = $null; $pendingAlerted = $false
+if ($rebootPending -and -not $willReboot) {
+  $pendingSince   = if ($stamp -and $stamp.pendingSince) { "$($stamp.pendingSince)" } else { (Get-Date).ToString('o') }
+  $pendingAlerted = [bool]($stamp -and $stamp.pendingAlerted)
+  $alertDays = if ($cfg.PSObject.Properties.Name -contains 'pendingRebootAlertDays') { [double]$cfg.pendingRebootAlertDays } else { 3 }
+  if ($alertDays -gt 0 -and -not $pendingAlerted) {
+    $ageDays = try { ((Get-Date) - [datetime]::Parse($pendingSince, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).TotalDays } catch { 0 }
+    if ($ageDays -ge $alertDays) {
+      $m = "Reboot has been pending {0:N1} days but no run required it (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient." -f $ageDays
+      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-SysSentryAlert $m
+      $pendingAlerted = $true
+    }
+  }
+}
+
+# day stamp (marks today done so the other triggers no-op; carries the pending-reboot watchdog state)
+Save-Stamp ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted })
 
 $summary = ($results | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
 Write-Log INFO "Components: $summary  (total ${durSec}s)"
