@@ -2,6 +2,20 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.1] - 2026-07-03
+
+### Fixed — duplicate update rows no longer triple-count sizes
+- A single run could record the **same logical update multiple times**. Windows Update offers an
+  Audio Processing Object (APO) driver package **once per matching audio endpoint**, so the
+  2026-07-02 run stored three byte-identical `AudioProcessingObject Driver Update (1.0.4.7057)`
+  rows (same `name|source|old|new|sizeMB`). This bloated `updates[]` in `history.jsonl` and, worse,
+  tripled the dialog's `totalSizeMB` — **87 MB reported for 29 MB of actual bytes** (WU downloads
+  the package once regardless of how many endpoints claim it).
+- The engine now collapses rows identical in `name|source|old|new|sizeMB` into a single row before
+  the result is persisted, annotating the count as `×N` (e.g. `AudioProcessingObject Driver Update
+  (1.0.4.7057) ×3`) and keeping **one representative size** so totals reflect reality. Rows that
+  merely share a name but differ in version or size stay separate — size is part of the collapse key.
+
 ## [0.8.0] - 2026-07-02
 
 ### Changed — `rebootPolicy: "ifRequired"` is the new default (no more reboots you didn't need)

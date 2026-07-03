@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.8.0'
+$script:Version = '0.8.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -610,6 +610,36 @@ $rebootRequiredByRun = @($results | Where-Object reboot).Count -gt 0        # di
 $errors  = @($results | Where-Object status -eq 'error')
 $endUtc  = (Get-Date).ToUniversalTime()
 $durSec  = [math]::Round(($endUtc - $startUtc).TotalSeconds, 1)
+
+# ---- collapse exact-duplicate update rows within THIS run -------------------
+# Some sources legitimately emit the SAME logical update more than once in one run: Windows
+# Update offers an APO/driver package once per matching audio endpoint, so a single run showed
+# three byte-identical "AudioProcessingObject Driver Update (1.0.4.7057)" rows (same
+# name|source|old|new|size). That tripled updates[] in history.jsonl AND tripled the dialog's
+# totalSizeMB (87 MB reported for 29 MB of actual bytes — WU downloads the package once).
+# Collapse rows identical in name|source|old|new|sizeMB into one, annotate the count (×N), and
+# keep a SINGLE representative size so the total reflects reality. Rows that merely share a name
+# but differ in version or size stay separate (size is part of the key).
+if ($script:Updates.Count -gt 1) {
+  # Accumulate by composite key while preserving first-seen order (Group-Object would re-sort the
+  # rows alphabetically, needlessly shuffling the dialog).
+  $order  = [System.Collections.Generic.List[string]]::new()
+  $groups = @{}
+  foreach ($u in $script:Updates) {
+    $key = "$($u.name)|$($u.source)|$($u.old)|$($u.new)|$($u.sizeMB)"
+    if (-not $groups.ContainsKey($key)) { $groups[$key] = [System.Collections.Generic.List[object]]::new(); $order.Add($key) }
+    $groups[$key].Add($u)
+  }
+  $deduped = [System.Collections.Generic.List[object]]::new()
+  foreach ($key in $order) {
+    $grp   = $groups[$key]
+    $first = $grp[0]
+    $name  = if ($grp.Count -gt 1) { "$($first.name) $([char]0x00D7)$($grp.Count)" } else { "$($first.name)" }
+    $dur   = ($grp | ForEach-Object { $_.durationSec } | Where-Object { $_ -ne $null } | Measure-Object -Maximum).Maximum
+    $deduped.Add([ordered]@{ name=$name; source=$first.source; old=$first.old; new=$first.new; durationSec=$dur; sizeMB=$first.sizeMB })
+  }
+  $script:Updates = $deduped
+}
 
 # ---- structured result + history trail --------------------------------------
 $result = [ordered]@{
