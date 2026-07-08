@@ -2,6 +2,26 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.0] - 2026-07-08
+
+### Fixed — winget rows now show a real download size instead of "—"
+- winget updates always displayed `—` in the dialog's **size** column. Root cause: `Get-WingetSizeMB`
+  scraped the size from winget's animated `/ N MB` download progress, but SunUp installs with
+  `--silent --disable-interactivity`, which suppresses that progress entirely — winget's captured
+  output logs only a bare `Downloading <url>` line with no byte count, so the regex never matched and
+  size was always `$null`. This was a source-text problem, not a parsing bug: the number simply wasn't
+  in the text.
+- Replaced `Get-WingetSizeMB` with **`Get-WingetDownloadSizeMB`**, which reads the true installer size
+  over HTTP. It extracts every `Downloading <url>` line from the install output and issues a `HEAD`
+  request per artifact with **`Accept-Encoding: identity`** — identity is load-bearing: it forces the
+  server off on-the-fly gzip, which otherwise omits `Content-Length` (Google's CDN does exactly this,
+  the reason a naive HEAD returned nothing). Sizes are summed across artifacts so installs that pull
+  dependencies count them all. Verified live: Google Chrome now reports **466.5 MB**.
+- The lookup runs **after** the package has already upgraded, so a network hiccup, chunked-transfer
+  server, or expired signed URL only blanks the size cell — never the update or its status. Returns
+  `$null` (→ `—`) honestly when there is no URL (msstore packages install via the Store) or no
+  `Content-Length`. Runs under `pwsh` (PS7+), whose default TLS needs no pinning.
+
 ## [0.8.1] - 2026-07-03
 
 ### Fixed — duplicate update rows no longer triple-count sizes

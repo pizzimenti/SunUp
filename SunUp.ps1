@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.8.1'
+$script:Version = '0.9.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -301,15 +301,38 @@ function Parse-WingetUpgrades { param([string[]]$Lines)
   }
   $out
 }
-# Largest "/ N MB" total in winget's download chatter → download size in MB.
-function Get-WingetSizeMB { param([string]$Text)
-  $tot = 0.0
-  foreach ($m in [regex]::Matches($Text, '/\s*(\d+(?:\.\d+)?)\s*(KB|MB|GB)')) {
-    $v = [double]$m.Groups[1].Value
-    switch ($m.Groups[2].Value) { 'KB' { $v /= 1024 } 'GB' { $v *= 1024 } }
-    if ($v -gt $tot) { $tot = $v }
+# winget download size in MB. Under `--silent --disable-interactivity` winget prints NO "/ N MB"
+# progress chatter (that only renders on an interactive console), so size can't be scraped from the
+# install output — the reason winget rows showed "—" for size. But winget still logs a bare
+# "Downloading <url>" line per artifact, and the real installer size is one HEAD away: we request
+# each URL with Accept-Encoding: identity (identity forces the server off on-the-fly gzip, which
+# otherwise omits Content-Length entirely — e.g. Google's CDN) and read Content-Length. Sum all
+# artifacts, since an install may also pull dependencies. Runs AFTER the package already upgraded,
+# so any failure here only blanks the size cell — never the update. Returns $null (→ "—") when there
+# is no URL (msstore packages install via the Store), the server sends no length (chunked transfer),
+# or a signed URL has expired: an honest "—" beats a fabricated number.
+function Get-WingetDownloadSizeMB { param([string]$Text)
+  $urls = @([regex]::Matches($Text, '(?im)^\s*Downloading\s+(https?://\S+)') |
+           ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+  if ($urls.Count -eq 0) { return $null }
+  $totalBytes = 0.0; $got = $false
+  foreach ($u in $urls) {
+    try {
+      $req = [System.Net.HttpWebRequest]::Create($u)
+      $req.Method            = 'HEAD'
+      $req.AllowAutoRedirect = $true
+      $req.Timeout           = 20000
+      $req.Headers['Accept-Encoding'] = 'identity'
+      $resp = $req.GetResponse()
+      $len  = $resp.ContentLength
+      $resp.Close()
+      if ($len -gt 0) { $totalBytes += [double]$len; $got = $true }
+      else { Write-CompLog 'winget' "size: no Content-Length for $u" }
+    } catch {
+      Write-CompLog 'winget' "size: HEAD failed for $u — $($_.Exception.Message)"
+    }
   }
-  if ($tot -gt 0) { [math]::Round($tot, 1) } else { $null }
+  if ($got) { [math]::Round($totalBytes / 1MB, 1) } else { $null }
 }
 
 function Comp-Winget { param($Cfg)
@@ -359,7 +382,7 @@ function Comp-Winget { param($Cfg)
     if ($code -eq 0 -or $code -in $rebootCodes) {
       $ok++
       if ($code -in $rebootCodes) { $reboot = $true; Write-Log INFO "winget: $($p.id) installed — reboot required" }
-      Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetSizeMB $txt)
+      Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetDownloadSizeMB $txt)
     } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
   $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))$skipNote" + $(if ($reboot) { '; reboot required' } else { '' })
