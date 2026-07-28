@@ -1,8 +1,11 @@
-# Tests for the v0.10.0 crash-reporting and self-hosting-package logic. Safe to run anywhere:
+# Tests for the crash-reporting, self-hosting-handoff and Dell-exclusion logic. Safe to run anywhere:
 # no live update run, no installs, no reboots, nothing touched outside this folder.
 #   1. the engine parses;
 #   2. Report-CrashedRuns (lifted from source via AST) flags exactly the dead run dirs, once;
-#   3. the self-hosting partition orders deferred packages last and only tags those with --custom.
+#   3. self-hosting packages leave the engine's upgrade list, and SelfHost.ps1 really is runnable
+#      by Windows PowerShell 5.1 (parsed by the real 5.1 parser, not pwsh's);
+#   4. the Dell exclusions fail closed;
+#   5. the engine never upgrades a self-hosting package in-process again.
 # Run:  pwsh -File .\tests\Test-SunUp.ps1
 $src = Join-Path (Split-Path $PSScriptRoot -Parent) 'SunUp.ps1'
 $fail = 0
@@ -34,7 +37,7 @@ function Raise-SysSentryAlert { param($Msg)
 }
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Test-WingetHasMsiInstaller','Test-WingetArgsRejected','Split-DcuUpdates') {
+foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Split-DcuUpdates') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -155,12 +158,11 @@ $script:events = @(); $script:alerts = @()
 Report-CrashedRuns
 Check 'second pass is silent (alert fires once)' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
 
-Write-Host "`n[3] self-hosting partition + --custom tagging"
-$selfPat  = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
-$selfArgs = 'MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress'
-$isSelfHost = { param($Pkg) $selfPat -and ($Pkg.id -match $selfPat -or $Pkg.name -match $selfPat) }
+Write-Host "`n[3] self-hosting handoff (v0.12.0)"
+$selfPat = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
+$isSelfHost = { param($Pkg) $Pkg.id -match $selfPat -or $Pkg.name -match $selfPat }
 # the real 2026-07-22 list (minus the excluded VCLibs pair) plus App Installer, the OTHER half of the
-# default selfHostPattern — and an MSIX, so it must be deferred but must NOT receive MSI properties
+# default selfHostPattern
 $pending = @(
   [pscustomobject]@{ name='Google Chrome';    id='Google.Chrome.EXE';            old='150.0.7871.129'; new='150.0.7871.182' }
   [pscustomobject]@{ name='PowerShell 7-x64'; id='Microsoft.PowerShell';         old='7.6.3.0';        new='7.6.4.0' }
@@ -168,61 +170,43 @@ $pending = @(
   [pscustomobject]@{ name='Tailscale';        id='tailscale.tailscale';          old='1.98.9';         new='1.99.0' }
 )
 $deferred = @($pending | Where-Object { & $isSelfHost $_ })
+$remaining = @($pending | Where-Object { -not (& $isSelfHost $_) })
 Check 'both self-hosting packages are detected' ($deferred.Count -eq 2) (($deferred | ForEach-Object id) -join ',')
-$pending = @(@($pending | Where-Object { -not (& $isSelfHost $_) }) + $deferred)
-Check 'no package is lost by the partition' ($pending.Count -eq 4)
-Check 'self-hosting packages are upgraded last' ((& $isSelfHost $pending[-1]) -and (& $isSelfHost $pending[-2])) (($pending | ForEach-Object id) -join ' -> ')
-Check 'ordinary packages keep their original order' ((($pending[0..1] | ForEach-Object id) -join ',') -eq 'Google.Chrome.EXE,tailscale.tailscale')
+# THE v0.12.0 CONTRACT: self-hosting packages leave the engine's upgrade list entirely. If one is
+# still in $pending the engine will upgrade it in-process and Restart Manager will kill the run.
+Check 'self-hosting packages are REMOVED from the engine list' (@($remaining | Where-Object { & $isSelfHost $_ }).Count -eq 0) (($remaining | ForEach-Object id) -join ',')
+Check 'nothing else is dropped' ((($remaining | ForEach-Object id) -join ',') -eq 'Google.Chrome.EXE,tailscale.tailscale')
+Check 'no package is lost overall' (($remaining.Count + $deferred.Count) -eq 4)
 
-# REGRESSION (v0.10.1): the probe must ask "does an MSI-family installer EXIST for this package",
-# not "what is the default installer type". Microsoft.PowerShell really does publish both, plain
-# `winget show` really does answer msix, and the upgrade that killed the engine on 2026-07-22 really
-# did run the WiX .msi — so the old question would have withheld the Restart Manager args from the
-# one package this entire feature exists to protect. $realPwsh reproduces winget's actual answers.
-# No param() block: the engine calls these positionally with winget's real flags ("-e", "--id", ...),
-# and only a scriptblock without declared parameters takes them into $args verbatim instead of
-# trying to bind "-e" as a parameter name.
-$typeArg = { param($a) for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -eq '--installer-type') { return "$($a[$i+1])" } }; $null }
-$noInstaller = "Installer:`n    No applicable installer found; see logs for more details."
-$realPwsh = {
-  # Mirrors winget 1.29 for Microsoft.PowerShell: the default block names the msix, and only
-  # --installer-type wix is applicable — the .msi that an upgrade of an MSI-installed copy runs.
-  $t = & $typeArg $args
-  if ($t) {
-    if ($t -eq 'wix') { return "Installer:`n  Installer Type: wix`n  Installer Url: https://example.invalid/PowerShell-7.6.4-win-x64.msi" }
-    return $noInstaller
-  }
-  "Installer:`n  Installer Type: msix`n  Installer Url: https://example.invalid/PowerShell-7.6.4.msixbundle"
-}.GetNewClosure()
-$realMsixOnly = {
-  if (& $typeArg $args) { return $noInstaller }
-  "Installer:`n  Installer Type: msix"
-}.GetNewClosure()
-$fakeDead = { throw 'winget exploded' }
-Check 'a package publishing a WiX .msi is detected despite an msix default' (Test-WingetHasMsiInstaller $realPwsh 'Microsoft.PowerShell')
-Check 'an msix-only package is not' (-not (Test-WingetHasMsiInstaller $realMsixOnly 'Microsoft.DesktopAppInstaller'))
-Check 'a failing winget show yields false, not a crash' (-not (Test-WingetHasMsiInstaller $fakeDead 'whatever'))
+# The handoff must survive the "only self-hosting packages are pending" case: $pending goes empty,
+# and the run must still report the handoff rather than claiming it upgraded nothing of note.
+$onlySelf  = @($pending | Where-Object { & $isSelfHost $_ })
+$afterOnly = @($onlySelf | Where-Object { -not (& $isSelfHost $_) })
+Check 'an all-self-host list empties the engine queue' ($afterOnly.Count -eq 0)
+Check 'and still hands off both packages' (@($onlySelf | Where-Object { & $isSelfHost $_ }).Count -eq 2)
 
-# Retrying without the Restart Manager args is only safe BEFORE anything installs. A failure that
-# happens after the download/install started must NOT be retried: the retry would rerun an installer
-# against partially changed state with RM re-enabled — the original kill, re-armed.
-$rc = 3010, 0x8A150077, 0x8A150078, 0x8A150079
-$rejected = "winget: unrecognized argument`nAn unexpected error occurred."
-$downloadFailed = @'
-Found PowerShell [Microsoft.PowerShell]
-Downloading https://example.invalid/PowerShell-7.6.4-win-x64.msi
-Network error
-'@
-$installFailed = @'
-Successfully verified installer hash
-Starting package install...
-Installer failed with exit code: 1603
-'@
-Check 'an argument rejection is retried'            (Test-WingetArgsRejected $rejected 1 $rc)
-Check 'a failed download is NOT retried'            (-not (Test-WingetArgsRejected $downloadFailed 1 $rc))
-Check 'a failure after install began is NOT retried' (-not (Test-WingetArgsRejected $installFailed 1603 $rc))
-Check 'success is never retried'                     (-not (Test-WingetArgsRejected $rejected 0 $rc))
-Check 'a reboot-required exit is never retried'      (-not (Test-WingetArgsRejected $rejected 3010 $rc))
+Write-Host "`n[3b] SelfHost.ps1 must be runnable by Windows PowerShell 5.1"
+$selfSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'SelfHost.ps1'
+Check 'SelfHost.ps1 exists' (Test-Path $selfSrc)
+$selfText = Get-Content $selfSrc -Raw
+
+# 5.1 reads a BOM-less file as ANSI, so a single non-ASCII character (an em dash in a comment was
+# enough) corrupts the parse and the helper never runs — silently, since it is launched by a task.
+$nonAscii = @($selfText.ToCharArray() | Where-Object { [int]$_ -gt 127 })
+Check 'SelfHost.ps1 is pure ASCII' ($nonAscii.Count -eq 0) ("$($nonAscii.Count) non-ASCII char(s)")
+
+# Parse it with the REAL 5.1 parser, not pwsh's. This is the check that would have caught the above.
+$parse51 = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "
+  `$e = `$null
+  [void][System.Management.Automation.Language.Parser]::ParseFile('$selfSrc', [ref]`$null, [ref]`$e)
+  if (`$e) { 'FAIL: ' + (`$e[0].Message) } else { 'OK' }"
+Check 'SelfHost.ps1 parses under Windows PowerShell 5.1' ("$parse51" -eq 'OK') "$parse51"
+
+# The whole point is that the helper does not run in the runtime being replaced.
+Check 'the engine launches the helper with powershell.exe, not pwsh' ($src -and ((Get-Content $src -Raw) -match 'WindowsPowerShell\\v1\.0\\powershell\.exe'))
+Check 'the helper waits for the engine PID before upgrading' ($selfText -match '\$WaitForPid' -and $selfText -match 'Get-Process -Id \$WaitForPid')
+Check 'the helper never reboots the box' ($selfText -notmatch 'shutdown\.exe|Restart-Computer')
+Check 'the helper cleans up its own one-shot task' ($selfText -match 'schtasks.*\/delete')
 
 Write-Host "`n[4] Dell exclusions (the NVIDIA pin, third path)"
 $mk = { param($n, $c) [pscustomobject]@{ name = $n; category = $c; version = '1.0'; bytes = 0 } }
@@ -274,23 +258,18 @@ Check 'it is reported as deferred instead' (($orphan.collateral | ForEach-Object
 Check 'and the categorized survivor still applies' ((($orphan.apply | ForEach-Object name) -join ',') -eq 'Realtek Audio Driver')
 Check 'every applied update has a category to select it by' (@($orphan.apply | Where-Object { -not "$($_.category)".Trim() }).Count -eq 0)
 
-# End-to-end arg decision, using the real probe against each package's real winget behaviour.
-$probeFor = @{ 'Microsoft.PowerShell' = $realPwsh; 'Microsoft.DesktopAppInstaller' = $realMsixOnly }
-$argsFor = $pending | ForEach-Object {
-  $extra = @()
-  if ((& $isSelfHost $_) -and $selfArgs -and (Test-WingetHasMsiInstaller $probeFor[$_.id] $_.id)) { $extra = @('--custom', $selfArgs) }
-  [pscustomobject]@{ id = $_.id; extra = ($extra -join ' ') }
-}
-$tagged = @($argsFor | Where-Object extra)
-Check 'only the MSI self-hosting package gets --custom' ($tagged.Count -eq 1 -and $tagged[0].id -eq 'Microsoft.PowerShell') (($tagged | ForEach-Object id) -join ',')
-Check 'the MSIX self-hosting package is deferred but NOT given MSI properties' (-not ($argsFor | Where-Object { $_.id -eq 'Microsoft.DesktopAppInstaller' }).extra)
-Check 'RM is disabled in those args' ($tagged[0].extra -match 'MSIRESTARTMANAGERCONTROL=Disable')
-Check 'not --override (would drop winget''s silent defaults)' ($tagged[0].extra -notmatch '--override')
-# Splatting an array into a native command must expand to separate argv entries, with the
-# space-containing value kept as ONE argument (quoted by PowerShell) — otherwise winget would see
-# REBOOT=ReallySuppress as a stray positional and reject the command.
-$echoed = & cmd /c echo @('--custom', $selfArgs)
-Check 'array splat expands to --custom + one quoted value' ($echoed -match '^--custom "MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress"$') $echoed
+Write-Host "`n[5] the engine no longer upgrades self-hosting packages in-process"
+# REGRESSION GUARD for the v0.12.0 fix. Three runs died because the engine ran the PowerShell
+# upgrade itself; if that ever comes back, this catches it in source rather than in production
+# eight days later.
+$engineText = Get-Content $src -Raw
+# Comments explaining WHY the old approach was dropped legitimately name --custom, so test the
+# actual code: strip full-line comments and the trailing part of inline ones before matching.
+$engineCode = (Get-Content $src | ForEach-Object { ($_ -replace '(?<!`)#.*$', '').TrimEnd() } | Where-Object { $_ }) -join "`n"
+$offenders = @(Get-Content $src | Where-Object { ($_ -replace '(?<!`)#.*$', '') -match '--custom' })
+Check 'the engine passes no --custom installer args any more' ($engineCode -notmatch '--custom') ($offenders -join ' | ')
+Check 'the engine registers the one-shot handoff task' ($engineText -match 'Register-ScheduledTask -TaskName \$SelfHostTask')
+Check 'the handoff is skipped when a reboot is imminent' ($engineText -match 'if \(\$willReboot\)[\s\S]{0,200}NOT starting')
 
 } finally {
   if (Test-Path $RunsDir) { Remove-Item $RunsDir -Recurse -Force -ErrorAction SilentlyContinue }
