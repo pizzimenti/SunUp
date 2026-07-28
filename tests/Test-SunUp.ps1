@@ -34,7 +34,7 @@ function Raise-SysSentryAlert { param($Msg)
 }
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Test-WingetHasMsiInstaller','Test-WingetArgsRejected') {
+foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Test-WingetHasMsiInstaller','Test-WingetArgsRejected','Split-DcuUpdates') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -223,6 +223,31 @@ Check 'a failed download is NOT retried'            (-not (Test-WingetArgsReject
 Check 'a failure after install began is NOT retried' (-not (Test-WingetArgsRejected $installFailed 1603 $rc))
 Check 'success is never retried'                     (-not (Test-WingetArgsRejected $rejected 0 $rc))
 Check 'a reboot-required exit is never retried'      (-not (Test-WingetArgsRejected $rejected 3010 $rc))
+
+Write-Host "`n[4] Dell exclusions (the NVIDIA pin, third path)"
+$mk = { param($n, $c) [pscustomobject]@{ name = $n; category = $c; version = '1.0'; bytes = 0 } }
+$dellScan = @(
+  & $mk 'NVIDIA GeForce GTX 1060 Graphics Driver' 'Video'
+  & $mk 'Intel HD Graphics Driver'                'Video'
+  & $mk 'Realtek Audio Driver'                    'Audio'
+  & $mk 'Intel Chipset Device Software'           'Chipset'
+)
+$s = Split-DcuUpdates $dellScan 'NVIDIA|GeForce'
+Check 'the pinned GPU driver is excluded' (($s.excluded | ForEach-Object name) -join ',' -match 'NVIDIA')
+Check 'its device category is dropped from the apply' ($s.categories -notcontains 'video') ($s.categories -join ',')
+Check 'a same-category update is reported as collateral, not silently dropped' (($s.collateral | ForEach-Object name) -join ',' -eq 'Intel HD Graphics Driver')
+Check 'unrelated categories still apply' ((($s.apply | ForEach-Object name) -join ',') -eq 'Realtek Audio Driver,Intel Chipset Device Software')
+Check 'the pinned driver never appears in the apply set' (-not (($s.apply | ForEach-Object name) -match 'NVIDIA'))
+
+$none = Split-DcuUpdates $dellScan 'ThisMatchesNothing'
+Check 'no match means no filtering at all' ($none.apply.Count -eq 4 -and $none.categories.Count -eq 0 -and $none.excluded.Count -eq 0)
+
+# An excluded update with no category gives dcu-cli nothing to filter on — apply nothing rather than
+# risk installing the very thing we promised to skip.
+$uncat = Split-DcuUpdates @((& $mk 'NVIDIA GeForce Driver' ''), (& $mk 'Realtek Audio Driver' 'Audio')) 'NVIDIA'
+Check 'an uncategorized exclusion blocks the whole apply' ($uncat.apply.Count -eq 0)
+Check 'and it is still reported as excluded' ($uncat.excluded.Count -eq 1)
+Check 'empty scan is handled' ((Split-DcuUpdates @() 'NVIDIA').apply.Count -eq 0)
 
 # End-to-end arg decision, using the real probe against each package's real winget behaviour.
 $probeFor = @{ 'Microsoft.PowerShell' = $realPwsh; 'Microsoft.DesktopAppInstaller' = $realMsixOnly }

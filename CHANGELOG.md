@@ -2,6 +2,30 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.0] - 2026-07-27
+
+### Fixed — the NVIDIA pin was enforced on two of three update paths, not three
+
+- Prompted by a Dell Command Update notification appearing on the box while SunUp had
+  `dell.enabled: false`. Reviewing what enabling it would do exposed the gap: the pinned GPU driver
+  (GTX 1060 held at 580.97, Pascal EOL) is protected on the **Windows Update** path by
+  `windowsUpdate.notTitle` and on the **winget** path by `winget.excludePattern` — but `Comp-Dell`
+  ran `dcu-cli /applyUpdates -updateType="driver,firmware,utility"` with **no filter at all**. A
+  Dell-packaged GeForce driver would have installed straight over the pin.
+- New **`dell.excludePattern`** (default `NVIDIA|GeForce`), matched against each update's name in the
+  dcu-cli scan report, so the same policy now holds on all three paths.
+- `dcu-cli` can filter by update **type** and **device category**, never by name — so an excluded
+  update is avoided by dropping its whole device category from that apply. `Split-DcuUpdates` works
+  this out and the run **says what it cost**: an unrelated update deferred only because it shares a
+  category with an excluded one is logged as such (WARN) and counted separately in the status line,
+  rather than silently disappearing. A silently skipped driver is indistinguishable from a missing one.
+- Two fail-safe cases apply **nothing** rather than risk installing what was excluded: an excluded
+  update carrying no device category (nothing to filter on), and a remaining set with no categories
+  at all. A deferred driver costs a day; an overwritten pinned GPU driver costs a manual rollback.
+- Tests: 68 checks — the pinned driver never reaches the apply set, its category is dropped, a
+  same-category update is reported as collateral, unrelated categories still apply, a non-matching
+  pattern filters nothing, and an uncategorized exclusion blocks the apply.
+
 ## [0.10.1] - 2026-07-27
 
 ### Fixed — the v0.10.0 installer-type gate would have disabled the fix on the one package it exists for
