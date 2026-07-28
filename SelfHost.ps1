@@ -42,7 +42,11 @@ runs the engine has already made it. A reboot requirement discovered here is rec
 selfhost.json and surfaced by the next run's stale-pending-reboot watchdog.
 #>
 param(
-  [Parameter(Mandatory = $true)][string[]]$Ids,
+  # COMMA-SEPARATED, and a plain [string] on purpose. The engine launches this with powershell.exe
+  # -File, and -File passes every argument as a literal string: it cannot bind an array at all.
+  # "-Ids a,b" arrives as the single string "a,b", and "-Ids a b" binds only "a" and silently drops
+  # the rest. Both were measured. So take one string and split it here.
+  [Parameter(Mandatory = $true)][string]$Ids,
   [Parameter(Mandatory = $true)][string]$RunDir,
   [string]$MainLog    = 'C:\ProgramData\SunUp\logs\sunup.log',
   [string]$EvtSource  = 'SunUp',
@@ -56,6 +60,8 @@ $ErrorActionPreference = 'Continue'
 
 $SelfLog = Join-Path $RunDir 'selfhost.log'
 $SelfJson = Join-Path $RunDir 'selfhost.json'
+
+$IdList = @($Ids -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
 function Write-Both {
   param([string]$Level, [string]$Msg)
@@ -89,7 +95,7 @@ function Resolve-Winget {
 
 try { New-Item -ItemType Directory -Force -Path $RunDir | Out-Null } catch {}
 
-Write-Both 'INFO' ("starting for: {0}" -f ($Ids -join ', '))
+Write-Both 'INFO' ("starting for: {0}" -f ($IdList -join ', '))
 
 # ---- wait for the engine to finish -----------------------------------------
 # The engine must complete its reboot decision, dialog and stamp BEFORE Restart Manager gets a
@@ -122,7 +128,7 @@ if (-not $winget) {
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = @(3010, 0x8A150077, 0x8A150078, 0x8A150079)
 
-  foreach ($id in $Ids) {
+  foreach ($id in $IdList) {
     Write-Raw ("--- upgrading {0} ---" -f $id)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -167,7 +173,7 @@ if (-not $winget) {
 
 $payload = [ordered]@{
   finishedLocal  = (Get-Date).ToString('o')
-  ids            = $Ids
+  ids            = $IdList
   ok             = $ok
   failed         = $fail
   rebootRequired = $rebootRequired
@@ -178,11 +184,11 @@ try { $payload | ConvertTo-Json -Depth 6 | Set-Content -Path $SelfJson -Encoding
 }
 
 if ($fail -gt 0) {
-  $m = "SunUp self-host upgrade: $ok ok, $fail failed ($($Ids -join ', ')). See $SelfLog"
+  $m = "SunUp self-host upgrade: $ok ok, $fail failed ($($IdList -join ', ')). See $SelfLog"
   Write-Evt 2021 'Warning' $m
   Raise-SysSentryAlert $m
 } else {
-  Write-Evt 2020 'Information' "SunUp self-host upgrade: $ok upgraded ($($Ids -join ', '))."
+  Write-Evt 2020 'Information' "SunUp self-host upgrade: $ok upgraded ($($IdList -join ', '))."
 }
 if ($rebootRequired) {
   # Recorded, not acted on. The next run's pending-reboot watchdog escalates it if it lingers.

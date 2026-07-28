@@ -208,6 +208,26 @@ Check 'the helper waits for the engine PID before upgrading' ($selfText -match '
 Check 'the helper never reboots the box' ($selfText -notmatch 'shutdown\.exe|Restart-Computer')
 Check 'the helper cleans up its own one-shot task' ($selfText -match 'schtasks.*\/delete')
 
+# REGRESSION (found by the first live handoff test): powershell.exe -File passes every argument as
+# a literal string and CANNOT bind an array parameter. "-Ids a,b" arrives as the one string "a,b";
+# "-Ids a b" binds only "a" and silently drops the rest. Both measured below. The first version
+# declared [string[]]$Ids and got a single glued-together package name, so winget answered
+# "No installed package found matching input criteria" and upgraded nothing -- while every other
+# part of the handoff reported success. Hence: one delimited string, split inside the helper.
+$argProbe = Join-Path $PSScriptRoot 'argprobe.ps1'
+Set-Content -Path $argProbe -Value 'param([string[]]$Ids); "$($Ids.Count)"' -Encoding Ascii
+$ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$commaBound = (& $ps51 -NoProfile -ExecutionPolicy Bypass -File $argProbe -Ids 'aaa,bbb') -join ''
+$spaceBound = (& $ps51 -NoProfile -ExecutionPolicy Bypass -File $argProbe -Ids 'aaa' 'bbb') -join ''
+Remove-Item $argProbe -Force -ErrorAction SilentlyContinue
+Check '-File cannot bind a comma list to an array (so we must split ourselves)' ($commaBound -eq '1') "got $commaBound"
+Check '-File silently drops extra space-separated values too'                   ($spaceBound -eq '1') "got $spaceBound"
+
+Check 'SelfHost.ps1 declares Ids as a single string, not an array' ($selfText -match '\[Parameter\(Mandatory = \$true\)\]\[string\]\$Ids')
+Check 'SelfHost.ps1 splits Ids on commas itself' ($selfText -match [regex]::Escape('$IdList = @($Ids -split '','''))
+Check 'SelfHost.ps1 upgrades from the SPLIT list, not the raw string' ($selfText -match 'foreach \(\$id in \$IdList\)')
+Check 'the engine passes the ids comma-joined to match' ((Get-Content $src -Raw) -match "\`$shIds -join ','")
+
 Write-Host "`n[4] Dell exclusions (the NVIDIA pin, third path)"
 $mk = { param($n, $c) [pscustomobject]@{ name = $n; category = $c; version = '1.0'; bytes = 0 } }
 $dellScan = @(
@@ -271,8 +291,18 @@ Check 'the engine passes no --custom installer args any more' ($engineCode -notm
 Check 'the engine registers the one-shot handoff task' ($engineText -match 'Register-ScheduledTask -TaskName \$SelfHostTask')
 Check 'the handoff is skipped when a reboot is imminent' ($engineText -match 'if \(\$willReboot\)[\s\S]{0,200}NOT starting')
 
+} catch {
+  # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
+  # unwound straight past the counter to the summary, which then printed ALL TESTS PASSED -- while
+  # every remaining check went unrun. A test suite that reports success when it did not finish is
+  # worse than one that fails, so an unhandled error is now itself a failure.
+  Write-Host "  FAIL  unhandled error: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "        at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+  Write-Host "        REMAINING CHECKS DID NOT RUN" -ForegroundColor Red
+  $script:fail++
 } finally {
   if (Test-Path $RunsDir) { Remove-Item $RunsDir -Recurse -Force -ErrorAction SilentlyContinue }
+  Remove-Item (Join-Path $PSScriptRoot 'argprobe.ps1') -Force -ErrorAction SilentlyContinue
 }
 Write-Host ""
 if ($fail -eq 0) { Write-Host "ALL TESTS PASSED" -ForegroundColor Green } else { Write-Host "$fail TEST(S) FAILED" -ForegroundColor Red; exit 1 }

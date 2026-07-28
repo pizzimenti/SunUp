@@ -37,6 +37,16 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
 - `SelfHost.ps1` is kept strictly ASCII and 5.1-compatible: 5.1 reads a BOM-less file as ANSI, so
   em dashes in comments broke the parse outright during development. Both constraints are asserted
   in its header.
+- **Found by the first live handoff test:** `powershell.exe -File` passes every argument as a
+  literal string and cannot bind an array parameter. `-Ids a,b` arrives as the single string
+  `"a,b"`; `-Ids a b` binds only `a` and silently drops the rest. The helper originally declared
+  `[string[]]$Ids`, so winget was handed one glued-together package name and answered *"No installed
+  package found matching input criteria"* — upgrading nothing while every other part of the handoff
+  reported success. It now takes one comma-delimited string and splits it itself, and both binding
+  behaviours are pinned by tests.
+- **Test harness fix:** a terminating error inside a check's *condition* (an invalid regex) unwound
+  past the failure counter to the summary, which printed `ALL TESTS PASSED` while the remaining
+  checks never ran. Unhandled errors now count as failures and say so. Suite is 79 checks.
 
 ## [0.11.0] - 2026-07-27
 
