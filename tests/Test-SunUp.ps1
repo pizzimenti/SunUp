@@ -34,7 +34,7 @@ function Raise-SysSentryAlert { param($Msg)
 }
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Save-RunResult','Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
+foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -77,11 +77,11 @@ $claims | ForEach-Object { Remove-Item $_ -Recurse -Force }
 $okDir = Join-Path $RunsDir 'save-ok'; New-Item -ItemType Directory -Force $okDir | Out-Null
 $okPath = Join-Path $okDir 'result.json'
 $sample = [ordered]@{ date = '2026-07-27'; components = @(@{ name = 'winget'; status = 'ok' }); updates = @() }
-Check 'Save-RunResult reports success' (Save-RunResult $sample $okPath)
+Check 'Publish-JsonFile reports success' (Publish-JsonFile $sample $okPath)
 Check 'the published result parses as JSON' ((Get-Content $okPath -Raw | ConvertFrom-Json).components[0].name -eq 'winget')
 Check 'no .tmp file is left behind' (-not (Test-Path "$okPath.tmp"))
 $badPath = Join-Path $RunsDir 'no-such-dir\deeper\result.json'
-Check 'an unwritable destination returns false' (-not (Save-RunResult $sample $badPath))
+Check 'an unwritable destination returns false' (-not (Publish-JsonFile $sample $badPath))
 Check 'and leaves no result.json behind' (-not (Test-Path $badPath))
 
 Check 'a live peer is detected as alive' (Test-RunAlive (Join-Path $RunsDir 'peer'))
@@ -106,7 +106,22 @@ New-Item -ItemType Directory -Force (Join-Path $RunsDir 'claimed') | Out-Null
 New-Item -ItemType File -Force (Join-Path $RunsDir 'claimed\incomplete.json') | Out-Null
 $script:events = @(); $script:alerts = @()
 Report-CrashedRuns
-Check 'a dead run already claimed by a peer is not re-reported' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
+Check 'a fresh claim (peer mid-report) is left alone' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
+
+# ...but a claim whose owner died before reporting must NOT silence the crash forever.
+$abandoned = Join-Path $RunsDir 'claimed\incomplete.json'
+(Get-Item $abandoned).LastWriteTime = (Get-Date).AddHours(-1)
+$script:events = @(); $script:alerts = @()
+Report-CrashedRuns
+Check 'an abandoned claim is retaken and reported' ($script:events.Count -eq 1 -and ($script:alerts -match 'claimed').Count -eq 1) "events=$($script:events -join ',')"
+Check 'retaking is logged' (($script:logged -match 're-taking an abandoned crash-report claim').Count -ge 1)
+Check 'the retaken claim is now marked reported' ([bool]((Get-Content $abandoned -Raw | ConvertFrom-Json).reported))
+
+# A completed report (reported=true) is never re-emitted, however old it gets.
+(Get-Item $abandoned).LastWriteTime = (Get-Date).AddDays(-30)
+$script:events = @(); $script:alerts = @()
+Report-CrashedRuns
+Check 'a completed report is never re-emitted, however stale' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
 
 $script:events = @(); $script:alerts = @()
 Report-CrashedRuns

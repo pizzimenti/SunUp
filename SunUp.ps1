@@ -197,20 +197,23 @@ function Flush-Report {
 # would never be reported. So claim the dir by CREATING it: New-Item without -Force fails when it
 # already exists, which makes the claim atomic against a peer racing us, and we fall back to a
 # PID-qualified name (unique by definition) and then to a counter.
-# Publish result.json ATOMICALLY. Set-Content creates/truncates the destination first, so a kill or
-# I/O error partway through would leave a truncated file that still satisfies "result.json exists" —
-# and Report-CrashedRuns would read that interrupted run as a normal finish and never report it.
-# Serialize and PARSE-VERIFY into a temp file, then rename over the destination: the run is declared
-# complete only by a file that was already whole. Returns $true only if the destination now exists.
-function Save-RunResult { param($Result, [string]$Path)
+# Publish a JSON file so readers only ever see it WHOLE: serialize and parse-verify into a temp file,
+# then rename over the destination. Every JSON file this engine writes carries meaning by its mere
+# presence — result.json says "this run finished", running.json says "this process owns this run" —
+# and Set-Content truncates its destination before writing, so a kill or I/O error partway through
+# would leave a half-file that still satisfies Test-Path and lies to whoever reads it next. The
+# rename is the publish. -ErrorAction Stop throughout, because $ErrorActionPreference is 'Continue'
+# and a quiet non-terminating failure here would be reported as success.
+# Returns $true only when the destination really exists afterwards.
+function Publish-JsonFile { param($Object, [string]$Path)
   $tmp = "$Path.tmp"
   try {
-    ($Result | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -ErrorAction Stop
+    ($Object | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -ErrorAction Stop
     $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json    # prove it is complete and parseable
     Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
     return (Test-Path $Path)
   } catch {
-    Write-Log ERROR "could not write result.json: $($_.Exception.Message)"
+    Write-Log ERROR "could not publish $([IO.Path]::GetFileName($Path)): $($_.Exception.Message)"
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     return $false
   }
@@ -252,7 +255,22 @@ function Report-CrashedRuns {
   foreach ($d in $dirs) {
     if (Test-Path (Join-Path $d.FullName 'result.json')) { continue }   # finished normally
     $marker = Join-Path $d.FullName 'incomplete.json'
-    if (Test-Path $marker) { continue }                                 # already reported
+    # A marker means one of three things, and they must not be conflated: a COMPLETED report
+    # (reported=true — nothing more to do), a report a peer is making RIGHT NOW (recent claim, leave
+    # it alone), or an ABANDONED claim from a scanner that was itself killed between claiming and
+    # reporting. The last one used to suppress the crash forever — the very failure mode this feature
+    # exists to prevent, applied to itself — so a stale unreported claim is retaken after
+    # $ClaimStaleMinutes. Worst case that re-reports a crash whose first report died in a millisecond
+    # window: at-least-once beats never.
+    $ClaimStaleMinutes = 15
+    if (Test-Path $marker) {
+      $reported = $false
+      try { $reported = [bool]((Get-Content $marker -Raw -ErrorAction Stop | ConvertFrom-Json).reported) } catch { }
+      if ($reported) { continue }
+      $ageMin = try { ((Get-Date) - (Get-Item $marker).LastWriteTime).TotalMinutes } catch { 0 }
+      if ($ageMin -lt $ClaimStaleMinutes) { continue }                  # a peer is mid-report; let it finish
+      Write-Log WARN "re-taking an abandoned crash-report claim on $($d.Name) ($([int]$ageMin)m old, never reported)"
+    }
     $rl = Join-Path $d.FullName 'run.log'
     if (-not (Test-Path $rl)) { continue }                              # dir made, nothing logged — nothing to say
     if (Test-RunAlive $d.FullName) {                                    # a concurrent manual run, still working
@@ -260,19 +278,22 @@ function Report-CrashedRuns {
       continue
     }
     $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
-    # CLAIM the report before making it. Two concurrent runs can both pass the Test-Path above before
+    # CLAIM the report before making it. Two concurrent runs can both pass the checks above before
     # either writes the marker, and would then both fire event 2011 and both append to ALERTS.md,
     # breaking the report-once promise. Creating the file without -Force fails if a peer got there
-    # first, so exactly one scanner reports each dead run.
-    try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop } catch { continue }
-    try {
-      [ordered]@{ runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version; lastLogLine = "$last" } |
-        ConvertTo-Json -Depth 4 | Set-Content $marker
-    } catch { Write-Log WARN "could not mark $($d.Name) incomplete: $_" }
+    # first, so exactly one scanner reports each dead run. (-Force only when retaking a stale claim,
+    # where the file already exists and its owner is provably gone.)
+    if (Test-Path $marker) { try { $null = New-Item -ItemType File -Path $marker -Force -ErrorAction Stop } catch { continue } }
+    else                   { try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop }        catch { continue } }
     $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
     Write-Log WARN $m
     Write-Evt 2011 Warning $m
     Raise-SysSentryAlert $m
+    # reported=true is what turns a claim into a finished report; without it the claim is retryable.
+    [void](Publish-JsonFile ([ordered]@{
+      runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version
+      lastLogLine = "$last"; reported = $true
+    }) $marker)
   }
 }
 
@@ -781,14 +802,21 @@ $script:RunLog = Join-Path $script:RunDir 'run.log'
 # Start time goes in alongside the PID because PIDs are recycled, and a recycled PID would otherwise
 # make a genuinely dead run look alive forever.
 $script:RunMarker = Join-Path $script:RunDir 'running.json'
+$markerOk = $false
 try {
   $me = Get-Process -Id $PID -ErrorAction Stop
-  [ordered]@{
+  $markerOk = Publish-JsonFile ([ordered]@{
     pid = $PID; processName = $me.ProcessName
     processStartUtc = $me.StartTime.ToUniversalTime().ToString('o')
     host = $env:COMPUTERNAME; startedLocal = (Get-Date).ToString('o')
-  } | ConvertTo-Json -Depth 4 | Set-Content $script:RunMarker
-} catch { $script:RunMarker = $null }
+  }) $script:RunMarker
+} catch { }
+if (-not $markerOk) {
+  # Publish-JsonFile already logged why. Without a marker this run is indistinguishable from a dead
+  # one, so say so plainly rather than leaving a path that points at nothing.
+  $script:RunMarker = $null
+  Write-Log WARN 'running.json could not be written — a concurrent run could mistake this live run for a crashed one.'
+}
 try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force | Out-Null } catch {}
 
 $startUtc = (Get-Date).ToUniversalTime()
@@ -888,7 +916,7 @@ elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 # or the next run could call a completed run killed. If the write fails the marker stays, and the run
 # is reported as never-finished — which is the truth: its result was never persisted.
 $resultPath    = Join-Path $script:RunDir 'result.json'
-$resultWritten = Save-RunResult $result $resultPath
+$resultWritten = Publish-JsonFile $result $resultPath
 if (-not $resultWritten) { Write-Log WARN "result.json missing — keeping running.json so this run is reported as unfinished." }
 elseif ($script:RunMarker)   { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile

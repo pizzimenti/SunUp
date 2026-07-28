@@ -74,6 +74,17 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
     "no `incomplete.json`" check before either wrote one, and both would fire event 2011 and append
     to `ALERTS.md`. The marker is now created first (`New-Item` without `-Force`, so a peer that got
     there first makes this scanner skip the dir), and only the winner reports.
+  - **An abandoned claim no longer suppresses the report forever.** A scanner killed *between*
+    claiming and reporting used to leave a marker that silenced every later scan — this feature's own
+    failure mode, turned on itself. A marker now means one of three distinct things: a completed
+    report (`reported: true`, never re-emitted), a report a peer is making right now (claim newer
+    than 15 min, left alone), or an abandoned claim (older, unreported — retaken and reported, with a
+    WARN saying so). At-least-once beats never for a crash notification.
+  - **`running.json` is written the same atomic, verified way.** It was still using a plain
+    `Set-Content`, which under `$ErrorActionPreference = 'Continue'` could fail without entering the
+    `catch` — leaving a live run with no marker, which a peer would then read as crashed. All three
+    JSON files now go through one `Publish-JsonFile` helper; a failure to write it is logged
+    explicitly as "a concurrent run could mistake this live run for a crashed one".
 
 ### Added — `tests\Test-SunUp.ps1`
 - First tests in the repo, covering both changes above without performing a real update run: the
