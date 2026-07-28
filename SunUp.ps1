@@ -29,6 +29,9 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
                                        flight; deleted once result.json is written
         incomplete.json                ONLY if the run was killed before writing result.json —
                                        written by the NEXT run when it reports the crash (evt 2011)
+        selfhost.log / selfhost.json   ONLY if self-hosting packages (PowerShell, winget itself)
+                                       were upgraded — written AFTER this run ends, by SelfHost.ps1
+                                       under Windows PowerShell 5.1; see its header for why
   Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
 
 Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
@@ -42,13 +45,14 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.11.0'
+$script:Version = '0.12.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
 $Name          = 'SunUp'
 $TaskName      = $Name                 # SYSTEM engine task
 $NotifyTask    = "$Name-Notify"        # interactive dialog task
+$SelfHostTask  = "$Name-SelfHost"      # one-shot task for packages that own the engine's own runtime
 $Root          = "C:\ProgramData\$Name"
 $LogDir        = Join-Path $Root 'logs'
 $LogFile       = Join-Path $LogDir ("{0}.log" -f $Name.ToLower())
@@ -65,6 +69,7 @@ $SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
 
 $script:RunDir = $null   # set in Run mode once we create the per-run dir
 $script:RunLog = $null
+$script:SelfHostPending = @()   # self-hosting packages Comp-Winget handed off (see the end of Run mode)
 
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
@@ -89,8 +94,12 @@ $DefaultConfig = [ordered]@{
   # packages (VCLibs) that winget can't deploy — they fail 0x8A15005C "extract" every run and are
   # serviced by the Store/dependent apps, not winget, so attempting them is pure noise.
   # selfHostPattern: packages that own the process SunUp itself is running in. Upgrading one of these
-  # normally has Windows Installer's Restart Manager terminate the engine mid-run (see selfHostInstallerArgs).
-  # They are upgraded LAST and with RM disabled, so a surprise kill can't also cost the rest of the run.
+  # has Windows Installer's Restart Manager terminate the engine mid-run. Since v0.12.0 they are not
+  # upgraded by the engine at all — they are handed to SelfHost.ps1, run by a one-shot task under
+  # Windows PowerShell 5.1 after the engine exits. See Comp-Winget and SelfHost.ps1's header.
+  # selfHostInstallerArgs is RETAINED but UNUSED: v0.11.0 passed it via winget's --custom to disable
+  # Restart Manager and it demonstrably did not work (2026-07-28: RM ran and killed the engine
+  # anyway). Kept only so an existing config.json carrying it still loads.
   winget             = [ordered]@{
     enabled = $true; pinIds = @()
     excludePattern        = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
@@ -504,47 +513,13 @@ function Get-WingetDownloadSizeMB { param([string]$Text)
   if ($got) { [math]::Round($totalBytes / 1MB, 1) } else { $null }
 }
 
-# MSIRESTARTMANAGERCONTROL / REBOOT are Windows Installer PROPERTIES. They mean something to an MSI,
-# and to WiX/Burn packages (WiX builds MSIs; Burn bundles forward properties to the MSIs they wrap) —
-# and nothing at all to an MSIX/appx such as Microsoft.DesktopAppInstaller, or to an Inno/NSIS .exe
-# that would receive them as junk on its command line. So only attach them where they can apply.
-#
-# The obvious probe — read "Installer Type" from `winget show` — answers the WRONG QUESTION, which
-# live data caught right after v0.10.0 shipped. Microsoft.PowerShell publishes BOTH an msix and a
-# WiX-built .msi; plain `winget show` names the **msix**, because it reports the DEFAULT installer for
-# the calling context. But the 2026-07-22 upgrade that killed the engine ran
-# `PowerShell-7.6.4-win-x64.msi`: an UPGRADE matches the installed package's installer technology,
-# not the manifest default. Gating on that answer would have withheld the Restart Manager args from
-# the exact package this whole fix exists for — the fix silently disabling itself.
-# Ask instead whether the package offers an MSI-family installer AT ALL. If winget then picks a
-# different variant and rejects the args, Comp-Winget retries the upgrade without them.
-function Test-WingetHasMsiInstaller { param($Winget, [string]$Id)
-  foreach ($t in @('wix', 'msi', 'burn')) {
-    try {
-      $out = & $Winget show --id $Id -e --installer-type $t --accept-source-agreements 2>&1 | Out-String
-      if ($out -match '(?im)^\s*Installer Type:\s*(wix|msi|burn)\s*$') { return $true }
-    } catch {
-      # A non-match above already means "no such installer" without throwing, so reaching here means
-      # the PROBE failed (winget unreachable, bad path, timeout) — a different fact entirely, and one
-      # that must not masquerade in the log as "this package has no MSI installer".
-      Write-Log WARN "winget show --installer-type $t probe failed for ${Id}: $($_.Exception.Message)"
-    }
-  }
-  $false
-}
-
-# Was the failure the INSTALLER ARGUMENTS being rejected, or something that happened after the
-# install was already under way? The distinction is load-bearing: retrying without the Restart
-# Manager args is safe only if nothing has run yet. A download failure or a mid-install error would
-# otherwise trigger a second attempt that both reruns an installer against partially changed state
-# AND (for a self-hosting package) re-enables Restart Manager — reintroducing the very kill this
-# release exists to prevent. So verify the claim "argument rejection happens before any install
-# work" instead of assuming it: if winget reached a download, a verified hash, or the installer
-# launch, the arguments were accepted and the failure is something else entirely.
-function Test-WingetArgsRejected { param([string]$Output, [int]$ExitCode, [int[]]$RebootCodes)
-  if ($ExitCode -eq 0 -or $ExitCode -in $RebootCodes) { return $false }
-  -not ($Output -match '(?im)^\s*(Downloading\s+\S+|Starting package install|Successfully verified installer hash)')
-}
+# v0.10.x/v0.11.0 lived here: Test-WingetHasMsiInstaller (does this package publish an MSI-family
+# installer, so Restart Manager properties can apply?) and Test-WingetArgsRejected (was the failure
+# the args being rejected, so a retry without them is safe?). Both existed to pass
+# MSIRESTARTMANAGERCONTROL=Disable as safely as possible. v0.12.0 removed them along with the whole
+# approach: RM ran regardless of the property (measured 2026-07-28) and the engine no longer upgrades
+# self-hosting packages at all. SelfHost.ps1 keeps a small inline version of the retry gate, for
+# REBOOT=ReallySuppress only.
 
 function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
@@ -580,71 +555,49 @@ function Comp-Winget { param($Cfg)
     return @{ status = 'ok'; detail = "up to date$skipNote" }
   }
 
-  # ---- self-hosting packages: upgrade LAST, with Restart Manager disabled -----
-  # SunUp runs under pwsh, so upgrading Microsoft.PowerShell means the MSI's Restart Manager
-  # enumerates processes holding files under the install target and shuts them down — including the
-  # engine that asked for the install. That is exactly what killed the 2026-07-22 run: RM terminated
-  # pwsh mid-winget, the MSI then failed to restart it ("Application SID does not match Conductor
-  # SID") and rolled back, and the run died before reaching its reboot decision, its summary dialog,
-  # or any alert path. Two mitigations, both needed:
-  #   * order  — these go last, so a surprise kill can't cost the packages that hadn't run yet;
-  #   * args   — MSIRESTARTMANAGERCONTROL=Disable tells Windows Installer not to use RM at all. Files
-  #              in use fall back to PendingFileRename, so the install completes, the engine SURVIVES,
-  #              and the MSI returns 3010 → $rebootCodes → a proper coordinated reboot at end of run.
-  #              REBOOT=ReallySuppress stops the MSI restarting the box behind SunUp's back.
-  # Passed with --custom (appends to winget's defaults) and NOT --override (which would REPLACE
-  # them, dropping the /qn that keeps the install silent).
-  $selfPat  = "$($Cfg.winget.selfHostPattern)"
-  $selfArgs = "$($Cfg.winget.selfHostInstallerArgs)"
-  $isSelfHost = { param($Pkg) $selfPat -and ($Pkg.id -match $selfPat -or $Pkg.name -match $selfPat) }
+  # ---- self-hosting packages: NOT upgraded here --------------------------------
+  # SunUp's engine runs under pwsh, so upgrading Microsoft.PowerShell has Windows Installer's
+  # Restart Manager enumerate every process holding files under the install target and shut them
+  # down — including the engine that asked for the install. That killed the runs of 2026-07-22 and
+  # 2026-07-27 outright: no result.json, no reboot decision, no summary dialog, no day stamp.
+  #
+  # v0.11.0 tried to prevent that in place, by passing MSIRESTARTMANAGERCONTROL=Disable through
+  # winget's --custom. It did not work. The 2026-07-28 run proved it: the args were applied (the
+  # winget log shows them) and RM ran anyway, logging 10002 "Shutting down application or service
+  # 'PowerShell 7'" and killing all five pwsh processes on the box while the MSI itself returned
+  # success. Whether winget dropped the property or Windows Installer ignored it across the
+  # major-upgrade transaction was never established — and doesn't matter: the mitigation had no
+  # feedback loop, so a silent no-op looked exactly like success until the engine died.
+  #
+  # So the engine no longer tries to survive RM — it gets out of the blast radius. Self-hosting
+  # packages are handed to SelfHost.ps1, run by a one-shot scheduled task under WINDOWS POWERSHELL
+  # 5.1 (a separate install RM's "shut down PowerShell 7" cannot reach), which waits for this
+  # process to exit first. The engine therefore always completes; the upgrade lands just after.
+  $selfPat = "$($Cfg.winget.selfHostPattern)"
+  $handoffNote = ''
   if ($selfPat) {
+    $isSelfHost = { param($Pkg) $Pkg.id -match $selfPat -or $Pkg.name -match $selfPat }
     $deferred = @($pending | Where-Object { & $isSelfHost $_ })
     if ($deferred.Count -gt 0) {
-      $pending = @(@($pending | Where-Object { -not (& $isSelfHost $_) }) + $deferred)
+      $pending = @($pending | Where-Object { -not (& $isSelfHost $_) })
+      $script:SelfHostPending = $deferred
       $ids = ($deferred | ForEach-Object { $_.id }) -join ', '
-      Write-CompLog 'winget' "--- deferring $($deferred.Count) self-hosting package(s) to the end of the run: $ids ---"
-      Write-Log INFO "winget: deferring $($deferred.Count) self-hosting package(s) to last: $ids"
+      Write-CompLog 'winget' "--- handing $($deferred.Count) self-hosting package(s) to $SelfHostTask, which runs after this engine exits: $ids ---"
+      Write-Log INFO "winget: handing $($deferred.Count) self-hosting package(s) to the detached helper: $ids"
+      $handoffNote = "; $($deferred.Count) handed to the self-host helper"
     }
   }
 
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
   $ok = 0; $fail = 0; $reboot = $false
+  # Nothing here is self-hosting any more (those were split out above), so no --custom, no
+  # Restart-Manager games and no retry-without-args dance: a plain silent upgrade per package.
   foreach ($p in $pending) {
-    $extra = @(); $selfNote = ''
-    if ((& $isSelfHost $p) -and $selfArgs) {
-      if (Test-WingetHasMsiInstaller $winget $p.id) {
-        $extra    = @('--custom', $selfArgs)
-        $selfNote = " [self-hosting, MSI-family installer available: --custom $selfArgs]"
-      } else {
-        $selfNote = ' [self-hosting, no MSI-family installer — MSI properties cannot apply, upgrading without --custom]'
-        Write-Log INFO "winget: $($p.id) is self-hosting but publishes no MSI/WiX/Burn installer — deferred to last, but Restart Manager cannot be disabled for it."
-      }
-    }
-    Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $selfNote)
-    $upgrade = {
-      param($ExtraArgs)
-      & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @ExtraArgs 2>&1
-    }
+    Write-CompLog 'winget' "--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $o  = & $upgrade $extra
+    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
     $code = $LASTEXITCODE
-    # If the installer args are what was rejected, the upgrade must still happen: a package left
-    # un-upgraded is worse than one upgraded without Restart Manager disabled, and the probe above
-    # can only tell us an MSI-family installer EXISTS, not that winget chose it for this upgrade.
-    # Retry once without them — but ONLY when nothing has installed yet (see Test-WingetArgsRejected).
-    if ($extra.Count -gt 0 -and (Test-WingetArgsRejected ($o | Out-String) $code $rebootCodes)) {
-      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) before installing anything — retrying without the Restart Manager args (RM may then terminate this run; a kill is now reported as event 2011)."
-      Write-CompLog 'winget' "--- retrying $($p.id) WITHOUT --custom (first attempt exit 0x$($code.ToString('X8')), nothing installed yet) ---"
-      $o    = @($o) + @('--- retry without installer args ---') + @(& $upgrade @())
-      $code = $LASTEXITCODE
-      $extra = @()
-    } elseif ($extra.Count -gt 0 -and $code -ne 0 -and $code -notin $rebootCodes) {
-      # Failed AFTER the install began: re-running would touch partially changed state, and would do
-      # it with Restart Manager re-enabled. Leave it for the next run and say so.
-      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) after the install had begun — NOT retrying (a retry would re-enable Restart Manager and rerun a partial install)."
-      Write-CompLog 'winget' "--- not retrying $($p.id): failure came after install work started ---"
-    }
     $sw.Stop()
     $txt = $o | Out-String
     Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
@@ -654,7 +607,7 @@ function Comp-Winget { param($Cfg)
       Add-Update -Name $p.name -Source 'winget' -Old $p.old -New $p.new -DurationSec ([math]::Round($sw.Elapsed.TotalSeconds,1)) -SizeMB (Get-WingetDownloadSizeMB $txt)
     } else { $fail++; Write-Log WARN "winget: $($p.id) exit 0x$($code.ToString('X8'))" }
   }
-  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))$skipNote" + $(if ($reboot) { '; reboot required' } else { '' })
+  $detail = "$ok upgraded, $fail failed (of $(@($pending).Count))$skipNote$handoffNote" + $(if ($reboot) { '; reboot required' } else { '' })
   if ($fail -gt 0) { return @{ status = 'warn'; detail = $detail; error = "see winget.log"; reboot = $reboot } }
   @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
@@ -1192,6 +1145,41 @@ if ($notifyEnabled -and $interactive) {
 
 Write-Log INFO "===== $Name run end ($runStamp) ====="
 try { Stop-Transcript | Out-Null } catch {}
+
+# ---- self-host handoff ------------------------------------------------------
+# Registered and started only now: everything above (reboot decision, day stamp, history, dialog,
+# transcript) is already committed, so when Restart Manager kills this pwsh — and it will — the run
+# is already complete. The helper waits for THIS process id to exit before touching winget.
+# Skipped when a reboot is imminent: the helper would race the shutdown mid-install. The packages
+# simply stay on the upgrade list and the next run hands them off again.
+if (@($script:SelfHostPending).Count -gt 0) {
+  $shIds = @($script:SelfHostPending | ForEach-Object { $_.id })
+  if ($willReboot) {
+    Write-Log INFO "self-host: reboot imminent — NOT starting $SelfHostTask this run (would race the shutdown). Deferred to the next run: $($shIds -join ', ')"
+  } else {
+    try {
+      $shScript = Join-Path $PSScriptRoot 'SelfHost.ps1'
+      if (-not (Test-Path $shScript)) { throw "helper not found at $shScript" }
+      # Windows PowerShell 5.1 on purpose — a separate installation, so Restart Manager shutting
+      # down 'PowerShell 7' cannot reach it. Never change this to pwsh.exe.
+      $shExe  = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+      $shArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Ids {1} -RunDir "{2}" -MainLog "{3}" -EvtSource "{4}" -TaskName "{5}" -WaitForPid {6}' -f `
+                $shScript, ($shIds -join ','), $script:RunDir, $LogFile, $EvtSource, $SelfHostTask, $PID
+      $shAction    = New-ScheduledTaskAction -Execute $shExe -Argument $shArgs
+      $shPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+      $shSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                       -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1) -MultipleInstances IgnoreNew
+      Register-ScheduledTask -TaskName $SelfHostTask -Action $shAction -Principal $shPrincipal -Settings $shSettings -Force `
+        -Description "$Name one-shot: upgrade packages that own the engine's own runtime, after the engine has exited. Self-deletes." | Out-Null
+      Start-ScheduledTask -TaskName $SelfHostTask -ErrorAction Stop
+      Write-Log INFO "self-host: started $SelfHostTask (Windows PowerShell 5.1, waits for pid $PID) for: $($shIds -join ', ')"
+      Write-Evt 2020 Information "${Name}: handed $(@($shIds).Count) self-hosting package(s) to ${SelfHostTask}: $($shIds -join ', ')"
+    } catch {
+      $m = "self-host: could not start ${SelfHostTask}: $_ — $($shIds -join ', ') left for the next run."
+      Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+    }
+  }
+}
 
 # Headless reboot LAST (after logs/transcript flushed). Interactive reboot is the dialog's job.
 if ($result.rebootAction -eq 'reboot') {
