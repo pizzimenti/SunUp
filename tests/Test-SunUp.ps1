@@ -136,12 +136,20 @@ Report-CrashedRuns
 Check 'a peer that completes mid-scan is not reported as crashed' (-not ($script:alerts -match 'racer')) ($script:alerts -join ' | ')
 Check 'and its claim is not left behind' (-not (Test-Path (Join-Path $RunsDir 'racer\incomplete.json')))
 
-# The invariant the stale retake rests on: a rename CONSUMES its source, so of two scanners taking
-# the same abandoned claim exactly one can win — unlike New-Item -Force, which would let both.
-$src = Join-Path $RunsDir 'lease-src'; 'x' | Set-Content $src
-$won = 0
-foreach ($i in 1..2) { try { Move-Item -Path $src -Destination "$src.claim-$i" -Force -ErrorAction Stop; $won++ } catch { } }
-Check 'a rename-based retake can only be won once' ($won -eq 1) "won=$won"
+# The invariant the whole claim protocol now rests on: an exclusive handle can be held by exactly one
+# process, and the file stays present and recognizable throughout — no window in which a scanner
+# arriving mid-take could read the state as unclaimed.
+$lockPath = Join-Path $RunsDir 'lock-probe'
+$held = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+$secondTakeFailed = $false
+try { [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose() }
+catch { $secondTakeFailed = $true }
+Check 'an exclusive claim handle can be held by only one scanner' $secondTakeFailed
+Check 'the marker stays present while it is held' (Test-Path $lockPath)
+$held.Dispose()
+$reTake = $false
+try { [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose(); $reTake = $true } catch { }
+Check 'the lock is released when its holder goes away' $reTake
 
 $script:events = @(); $script:alerts = @()
 Report-CrashedRuns

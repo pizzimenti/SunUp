@@ -281,35 +281,48 @@ function Report-CrashedRuns {
       continue
     }
     $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
-    # CLAIM the report before making it — exclusively, in BOTH paths. Two concurrent scanners can
-    # pass every check above together, and would then each fire event 2011 and each append to
-    # ALERTS.md, breaking the report-once promise.
-    #   * fresh claim  — New-Item without -Force fails if a peer created the marker first;
-    #   * stale retake — RENAME the marker to a per-PID lease. A rename is atomic and consumes its
-    #     source, so of two scanners retaking the same abandoned claim exactly one succeeds and the
-    #     other finds nothing to move. (-Force here only overwrites OUR own leftover lease; it never
-    #     makes the take non-exclusive, because the exclusivity comes from the source disappearing.)
-    $lease = "$marker.claim-$PID"
-    if ($stale) { try { Move-Item -Path $marker -Destination $lease -Force -ErrorAction Stop } catch { continue } }
-    else        { try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop }      catch { continue } }
-    # Final completion check, as late as possible: a live peer may have published result.json and
-    # removed running.json in the window between the checks above and this claim, in which case it
-    # finished normally and there is nothing to report. Put the claim back the way we found it.
-    if (Test-Path $resultPath) {
-      if ($stale) { Move-Item -Path $lease -Destination $marker -Force -ErrorAction SilentlyContinue }
-      else        { Remove-Item $marker -Force -ErrorAction SilentlyContinue }
-      continue
+    # TAKE THE REPORT with a real lock: open the marker with FileShare::None, so the OS handle IS the
+    # mutual exclusion. Earlier attempts built the lock out of file operations — create-if-absent for
+    # a fresh claim, rename-to-lease for a stale retake — and each left a window where the marker did
+    # not exist as itself, which a scanner arriving mid-take reads as "unclaimed". An exclusive handle
+    # has no such window: the file is always present and always recognizable, exactly one process can
+    # hold it, and Windows releases it automatically if we are killed. One mechanism covers the fresh
+    # claim (OpenOrCreate creates it) and the retake (OpenOrCreate reopens it) identically.
+    # A peer probing while we hold it fails to read, sees an unreported claim, and leaves it to us.
+    $fs = $null
+    $markerPreexisted = Test-Path $marker
+    $abandonClaim     = $false
+    try {
+      $fs = [System.IO.File]::Open($marker, [System.IO.FileMode]::OpenOrCreate,
+                                   [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    } catch { continue }        # a peer holds the lock — it is reporting this one
+    try {
+      # Final completion check, as late as possible and under the lock: a live peer may have published
+      # result.json and removed running.json in the window between the checks above and this take, in
+      # which case it finished normally and there is nothing to report.
+      if (Test-Path $resultPath) { $abandonClaim = $true; continue }
+      $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
+      Write-Log WARN $m
+      Write-Evt 2011 Warning $m
+      Raise-SysSentryAlert $m
+      # reported=true is written LAST and is what turns a claim into a finished report: if we die
+      # before this, the marker stays unreported and a later run retakes it rather than losing it.
+      # Written through the locked handle — a temp-file-and-rename publish cannot replace a file we
+      # are holding open, and here the lock matters more than the rename.
+      $json  = [ordered]@{
+        runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version
+        lastLogLine = "$last"; reported = $true
+      } | ConvertTo-Json -Depth 4
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+      $fs.SetLength(0); $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+    } catch {
+      Write-Log WARN "could not complete the crash report for $($d.Name): $($_.Exception.Message)"
+    } finally {
+      $fs.Dispose()
+      # If the run turned out to have finished, leave the dir exactly as we found it — an empty marker
+      # we created for a completed run would be litter that reads like a claim.
+      if ($abandonClaim -and -not $markerPreexisted) { Remove-Item $marker -Force -ErrorAction SilentlyContinue }
     }
-    $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
-    Write-Log WARN $m
-    Write-Evt 2011 Warning $m
-    Raise-SysSentryAlert $m
-    # reported=true is what turns a claim into a finished report; without it the claim is retryable.
-    [void](Publish-JsonFile ([ordered]@{
-      runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version
-      lastLogLine = "$last"; reported = $true
-    }) $marker)
-    if ($stale) { Remove-Item $lease -Force -ErrorAction SilentlyContinue }
   }
 }
 

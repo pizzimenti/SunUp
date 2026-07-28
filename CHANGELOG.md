@@ -80,13 +80,18 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
     report (`reported: true`, never re-emitted), a report a peer is making right now (claim newer
     than 15 min, left alone), or an abandoned claim (older, unreported — retaken and reported, with a
     WARN saying so). At-least-once beats never for a crash notification.
-  - **Retaking a stale claim is exclusive too, and completion is rechecked last.** The retake path
-    used `New-Item -Force`, which two scanners can both win — undoing the exclusivity of the claim it
-    was part of. A retake is now a **rename** of the marker to a per-PID lease: a rename consumes its
-    source, so exactly one scanner can take an abandoned claim. And because a live peer can publish
-    `result.json` and drop `running.json` while a scanner is mid-probe, `result.json` is rechecked
-    once more *after* the claim is taken; if the run finished after all, the claim is put back the way
-    it was found and nothing is reported.
+  - **The claim is a real lock.** Building mutual exclusion out of file operations — create-if-absent
+    for a fresh claim, rename-to-lease for a stale retake — kept leaving windows in which the marker
+    did not exist *as itself*, which a scanner arriving mid-take reads as "unclaimed", so both would
+    report. The marker is now opened with `FileShare::None` and the OS handle **is** the lock: the
+    file is always present and recognizable, exactly one process can hold it, a peer that probes
+    while it is held simply finds an unreported claim and leaves it alone, and Windows releases the
+    handle automatically if the holder is killed. One mechanism now covers the fresh claim and the
+    retake identically, and `reported: true` is written through that handle last of all.
+  - **Completion is rechecked under the lock.** A live peer can publish `result.json` and drop
+    `running.json` in the window between the scan and the liveness probe, which would make a
+    normally-completed run look crashed. `result.json` is rechecked as late as possible — after the
+    lock is taken — and a marker created for a run that turns out to have finished is removed again.
   - **`running.json` is written the same atomic, verified way.** It was still using a plain
     `Set-Content`, which under `$ErrorActionPreference = 'Continue'` could fail without entering the
     `catch` — leaving a live run with no marker, which a peer would then read as crashed. All three
