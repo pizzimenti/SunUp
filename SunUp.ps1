@@ -693,26 +693,34 @@ function Parse-DcuReport { param([string]$XmlPath)
 # EMPTY means "do not apply anything this run" — see below).
 function Split-DcuUpdates { param($Updates, [string]$ExcludePattern)
   $all = @($Updates)
-  $res = @{ apply = $all; excluded = @(); collateral = @(); categories = @() }
+  $res = @{ apply = $all; excluded = @(); collateral = @(); categories = @(); reason = '' }
   if (-not $ExcludePattern -or $all.Count -eq 0) { return $res }
 
   $res.excluded = @($all | Where-Object { "$($_.name)" -match $ExcludePattern })
   if ($res.excluded.Count -eq 0) { return $res }
 
   $cat = { param($u) "$($u.category)".Trim().ToLower() }
-  $banned = @($res.excluded | ForEach-Object { & $cat $_ } | Where-Object { $_ } | Select-Object -Unique)
-  $rest   = @($all | Where-Object { "$($_.name)" -notmatch $ExcludePattern })
+  $rest = @($all | Where-Object { "$($_.name)" -notmatch $ExcludePattern })
 
-  # No category on the excluded update means there is nothing to filter on, and dcu-cli would happily
-  # install it. Refuse to apply ANYTHING this run rather than risk installing what we promised not to:
-  # a deferred driver costs a day, an overwritten pinned GPU driver costs a manual rollback.
-  if ($banned.Count -eq 0) { $res.apply = @(); return $res }
+  # FAIL CLOSED if ANY excluded update lacks a device category — not merely if they all do. A mixed
+  # scan (one uncategorized NVIDIA entry + one categorized GeForce entry) yields a non-empty banned
+  # list, and the resulting -updateDeviceCategory restriction cannot express "except the one with no
+  # category" — so the pinned driver would sail through the filter that exists to stop it.
+  $uncategorizedExclusions = @($res.excluded | Where-Object { -not (& $cat $_) })
+  if ($uncategorizedExclusions.Count -gt 0) {
+    $res.apply = @(); $res.collateral = $rest; $res.categories = @()
+    $res.reason = "$($uncategorizedExclusions.Count) excluded update(s) carry no device category — nothing can be filtered safely"
+    return $res
+  }
 
-  $res.collateral = @($rest | Where-Object { (& $cat $_) -in $banned })
-  $res.apply      = @($rest | Where-Object { (& $cat $_) -notin $banned })
-  $res.categories = @($res.apply | ForEach-Object { & $cat $_ } | Where-Object { $_ } | Select-Object -Unique)
-  # Everything left is uncategorized: same reasoning as above — no safe filter, so apply nothing.
-  if ($res.apply.Count -gt 0 -and $res.categories.Count -eq 0) { $res.apply = @() }
+  $banned = @($res.excluded | ForEach-Object { & $cat $_ } | Select-Object -Unique)
+  # An update with no category cannot be SELECTED by -updateDeviceCategory either, so it will not be
+  # installed by this apply — it must therefore be reported as deferred, never left in apply where it
+  # would be recorded as installed. dcu-cli's filter is a whitelist; anything unnameable is out.
+  $res.collateral = @($rest | Where-Object { $c = & $cat $_; (-not $c) -or ($c -in $banned) })
+  $res.apply      = @($rest | Where-Object { $c = & $cat $_; $c -and ($c -notin $banned) })
+  $res.categories = @($res.apply | ForEach-Object { & $cat $_ } | Select-Object -Unique)
+  if ($res.apply.Count -eq 0) { $res.categories = @(); if (-not $res.reason) { $res.reason = 'every remaining update shares a category with an excluded one, or has none' } }
   $res
 }
 
@@ -725,9 +733,24 @@ function Comp-Dell { param($Cfg)
   #    and size (the apply output carries none of it). One scan covers all types; we partition into
   #    what we apply (driver/firmware/utility) vs BIOS (report-only).
   $reportDir = $script:RunDir
-  $scanOut = & $dcu /scan -report="$reportDir" -silent 2>&1
+  $scanOut  = & $dcu /scan -report="$reportDir" -silent 2>&1
+  $scanCode = $LASTEXITCODE
   Write-CompLog 'dell-bios-scan' $scanOut
-  $avail   = Parse-DcuReport (Join-Path $reportDir 'DCUApplicableUpdates.xml')
+  Write-CompLog 'dell-bios-scan' "scan exit: $scanCode"
+  $xmlPath = Join-Path $reportDir 'DCUApplicableUpdates.xml'
+  # The scan report is the ONLY thing that can tell us an excluded update is applicable — dcu-cli
+  # cannot filter by name, so without a readable report there is no way to keep a pinned driver out
+  # of /applyUpdates. A failed or missing scan therefore means DO NOT APPLY, rather than apply
+  # everything: an empty parse used to look identical to "nothing to exclude" and silently removed
+  # the guard. (500 = no applicable updates, a legitimate empty result with no report to read.)
+  $scanUsable = ($scanCode -in 0, 500) -and (Test-Path $xmlPath)
+  if (-not $scanUsable -and "$($Cfg.dell.excludePattern)" -and $scanCode -ne 500) {
+    $m = "dcu-cli /scan failed (exit $scanCode, report $(if (Test-Path $xmlPath) { 'present' } else { 'missing' })) — skipping the apply so dell.excludePattern cannot be bypassed."
+    Write-Log WARN "dell: $m"
+    Write-CompLog 'dell-apply' "--- $m ---"
+    return @{ status = 'warn'; detail = "scan failed (exit $scanCode) — nothing applied, exclusions could not be enforced"; error = 'dcu-cli /scan unusable; see dell-bios-scan.log' }
+  }
+  $avail   = Parse-DcuReport $xmlPath
   $bios    = @($avail | Where-Object { "$($_.type)" -match 'BIOS' })
   $nonBios = @($avail | Where-Object { "$($_.type)" -notmatch 'BIOS' })   # driver/firmware/application = what we apply
   Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded). Scan found $($nonBios.Count) non-BIOS + $($bios.Count) BIOS applicable."
@@ -747,7 +770,7 @@ function Comp-Dell { param($Cfg)
       Write-CompLog 'dell-apply' "--- deferred (same device category as an excluded update): $cn ---"
     }
     if ($split.apply.Count -eq 0) {
-      Write-Log INFO 'dell: nothing left to apply once exclusions are honoured — skipping this run.'
+      Write-Log INFO "dell: nothing left to apply once exclusions are honoured — skipping this run.$(if ($split.reason) { " Reason: $($split.reason)." })"
       $biosOnly = if ($bios.Count -gt 0) { "; BIOS update AVAILABLE ($($bios.Count), not flashed)" } else { '; no BIOS update' }
       if ($bios.Count -gt 0) {
         Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
