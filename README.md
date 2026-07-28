@@ -85,7 +85,9 @@ Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
 
 A run that is killed mid-flight never writes `result.json`, and every other alert path runs after the
 updates — so the **next** run detects the orphaned dir, reports it once (event 2011 + a SysSentry
-alert naming the last line it logged) and marks it with `incomplete.json`.
+alert naming the last line it logged) and marks it with `incomplete.json`. A run still in progress
+looks the same from outside, so each run drops a `running.json` liveness marker (PID + process start
+time) while it works: a concurrent manual `-Force` run is recognised as alive and left alone.
 
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
 2005 reboot, 2006 stale-reboot-pending, 2010 errors, 2011 previous run killed mid-run).

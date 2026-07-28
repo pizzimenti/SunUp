@@ -36,8 +36,16 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
 - Each run now scans for the fingerprint of a dead run — a previous run dir with `run.log` but **no**
   `result.json` — and reports it once with **event 2011** + a SysSentry alert quoting the last line
   that run logged, so the message says *where* it stopped. `incomplete.json` marks a dir as reported
-  so the alert can't repeat. Only other run dirs are examined, and the task is
-  `MultipleInstances=IgnoreNew`, so a match is always a dead run and never a live peer.
+  so the alert can't repeat.
+- "No `result.json`" alone would also match a run **still in progress**. `MultipleInstances=IgnoreNew`
+  only serializes *task-launched* runs — the documented `SunUp.ps1 -Mode Run -Force` is a standalone
+  process the scheduler never sees, so a manual run and a scheduled one genuinely can overlap. Every
+  run therefore writes a **`running.json`** liveness marker (PID **plus that process's start time**,
+  because PIDs are recycled) before touching a single component, and deletes it once `result.json`
+  exists. `Test-RunAlive` clears a candidate only when the marked PID is running *and* the image name
+  and start time still match; if the start time can't be read it assumes **alive**, so a live peer is
+  never mislabelled. A dir with no marker predates v0.10.0 or died before writing one — either way
+  its owner is gone, so it still counts as crashed. (Caught in review by Codex.)
 
 ### Added — `tests\Test-SunUp.ps1`
 - First tests in the repo, covering both changes above without performing a real update run: the

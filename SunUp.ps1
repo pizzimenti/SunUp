@@ -25,6 +25,8 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         <component>.log                RAW output of each tool (defender/windowsupdate/
                                        winget/dell-apply/dell-bios-scan/psmodules)
         result.json                    structured per-component result for this run
+        running.json                   liveness marker (PID + process start) while the run is in
+                                       flight; deleted once result.json is written
         incomplete.json                ONLY if the run was killed before writing result.json —
                                        written by the NEXT run when it reports the crash (evt 2011)
   Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
@@ -179,8 +181,33 @@ function Flush-Report {
 # (Restart Manager killed the engine during winget's own PowerShell 7 upgrade) and nothing reported
 # it for five days. A dead run leaves a fingerprint: a run dir with run.log but no result.json.
 # Flag each one ONCE (incomplete.json marks it handled) and name the last thing it logged, so the
-# alert says where it stopped. Only ever inspects OTHER run dirs — never the live one — and the
-# SunUp task is MultipleInstances=IgnoreNew, so a leftover match is always a dead run, never a peer.
+# alert says where it stopped.
+#
+# "No result.json" alone is NOT proof of death — a run still in progress looks identical. The task is
+# MultipleInstances=IgnoreNew, but that only serializes TASK-launched runs: the documented
+# `SunUp.ps1 -Mode Run -Force` is a standalone process the scheduler never sees, so a manual run and
+# a scheduled one really can overlap. Every run therefore drops a running.json liveness marker
+# (PID + that process's start time, since PIDs get recycled) which Test-RunAlive checks before
+# anything is called dead. A dir with no marker predates v0.10.0 or lost the race to write it —
+# either way its owner is long gone, so it still counts as crashed.
+function Test-RunAlive { param([string]$Dir)
+  $marker = Join-Path $Dir 'running.json'
+  if (-not (Test-Path $marker)) { return $false }
+  try { $m = Get-Content $marker -Raw -ErrorAction Stop | ConvertFrom-Json } catch { return $false }
+  if (-not $m.pid) { return $false }
+  $p = Get-Process -Id ([int]$m.pid) -ErrorAction SilentlyContinue
+  if (-not $p) { return $false }                                             # owner is gone
+  if ($m.processName -and "$($p.ProcessName)" -ne "$($m.processName)") { return $false }   # PID recycled
+  try {
+    if ($m.processStartUtc) {
+      $claimed = [datetime]::Parse("$($m.processStartUtc)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+      # Same PID, same image, but started at a different moment = a recycled PID, not our run.
+      if (($claimed - $p.StartTime.ToUniversalTime()).Duration().TotalSeconds -gt 2) { return $false }
+    }
+  } catch { }   # start time unreadable: PID and image still match, so assume ALIVE — never cry crash on a live peer
+  $true
+}
+
 function Report-CrashedRuns {
   if (-not (Test-Path $RunsDir)) { return }
   $dirs = @(Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue |
@@ -191,6 +218,10 @@ function Report-CrashedRuns {
     if (Test-Path $marker) { continue }                                 # already reported
     $rl = Join-Path $d.FullName 'run.log'
     if (-not (Test-Path $rl)) { continue }                              # dir made, nothing logged — nothing to say
+    if (Test-RunAlive $d.FullName) {                                    # a concurrent manual run, still working
+      Write-Log INFO "run $($d.Name) is still in progress (another SunUp process) — not treating it as crashed."
+      continue
+    }
     $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
     $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
     Write-Log WARN $m
@@ -677,6 +708,19 @@ $runStamp      = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
 $script:RunDir = Join-Path $RunsDir $runStamp
 New-Item -ItemType Directory -Force -Path $script:RunDir | Out-Null
 $script:RunLog = Join-Path $script:RunDir 'run.log'
+# Liveness marker, so the NEXT run can tell a dead run from one still working (see Test-RunAlive).
+# Written before any component runs — a crash between here and result.json is what we want to catch.
+# Start time goes in alongside the PID because PIDs are recycled, and a recycled PID would otherwise
+# make a genuinely dead run look alive forever.
+$script:RunMarker = Join-Path $script:RunDir 'running.json'
+try {
+  $me = Get-Process -Id $PID -ErrorAction Stop
+  [ordered]@{
+    pid = $PID; processName = $me.ProcessName
+    processStartUtc = $me.StartTime.ToUniversalTime().ToString('o')
+    host = $env:COMPUTERNAME; startedLocal = (Get-Date).ToString('o')
+  } | ConvertTo-Json -Depth 4 | Set-Content $script:RunMarker
+} catch { $script:RunMarker = $null }
 try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force | Out-Null } catch {}
 
 $startUtc = (Get-Date).ToUniversalTime()
@@ -769,6 +813,8 @@ if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-cou
 elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
 $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
+# result.json now exists, so this run can never be mistaken for crashed — drop the liveness marker.
+if ($script:RunMarker) { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 # trim history to last 365 runs
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }
