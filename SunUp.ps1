@@ -42,7 +42,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.10.0'
+$script:Version = '0.10.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -501,21 +501,45 @@ function Get-WingetDownloadSizeMB { param([string]$Text)
 }
 
 # MSIRESTARTMANAGERCONTROL / REBOOT are Windows Installer PROPERTIES. They mean something to an MSI,
-# and to Burn/WiX bundles (which forward properties to the MSIs they wrap) — and nothing at all to an
-# MSIX/appx package such as Microsoft.DesktopAppInstaller, or to an Inno/NSIS .exe that would simply
-# receive them as junk on its command line and could fail or install non-silently. So ask winget what
-# it is about to run, and only attach the args where they can actually apply. An UNKNOWN type is
-# treated as "don't attach" (deterministic and safe): the package still upgrades, still goes last,
-# and if RM does kill the engine, the crash is now reported instead of vanishing.
-function Get-WingetInstallerType { param($Winget, [string]$Id)
-  try {
-    $out = & $Winget show --id $Id -e --accept-source-agreements 2>&1 | Out-String
-    if ($out -match '(?im)^\s*Installer Type:\s*(\S+)') { return $Matches[1].Trim().ToLower() }
-  } catch {}
-  $null
+# and to WiX/Burn packages (WiX builds MSIs; Burn bundles forward properties to the MSIs they wrap) —
+# and nothing at all to an MSIX/appx such as Microsoft.DesktopAppInstaller, or to an Inno/NSIS .exe
+# that would receive them as junk on its command line. So only attach them where they can apply.
+#
+# The obvious probe — read "Installer Type" from `winget show` — answers the WRONG QUESTION, which
+# live data caught right after v0.10.0 shipped. Microsoft.PowerShell publishes BOTH an msix and a
+# WiX-built .msi; plain `winget show` names the **msix**, because it reports the DEFAULT installer for
+# the calling context. But the 2026-07-22 upgrade that killed the engine ran
+# `PowerShell-7.6.4-win-x64.msi`: an UPGRADE matches the installed package's installer technology,
+# not the manifest default. Gating on that answer would have withheld the Restart Manager args from
+# the exact package this whole fix exists for — the fix silently disabling itself.
+# Ask instead whether the package offers an MSI-family installer AT ALL. If winget then picks a
+# different variant and rejects the args, Comp-Winget retries the upgrade without them.
+function Test-WingetHasMsiInstaller { param($Winget, [string]$Id)
+  foreach ($t in @('wix', 'msi', 'burn')) {
+    try {
+      $out = & $Winget show --id $Id -e --installer-type $t --accept-source-agreements 2>&1 | Out-String
+      if ($out -match '(?im)^\s*Installer Type:\s*(wix|msi|burn)\s*$') { return $true }
+    } catch {
+      # A non-match above already means "no such installer" without throwing, so reaching here means
+      # the PROBE failed (winget unreachable, bad path, timeout) — a different fact entirely, and one
+      # that must not masquerade in the log as "this package has no MSI installer".
+      Write-Log WARN "winget show --installer-type $t probe failed for ${Id}: $($_.Exception.Message)"
+    }
+  }
+  $false
 }
-function Test-MsiPropertiesApply { param([string]$InstallerType)
-  [bool]($InstallerType -and ($InstallerType.ToLower() -in @('msi', 'wix', 'burn')))
+
+# Was the failure the INSTALLER ARGUMENTS being rejected, or something that happened after the
+# install was already under way? The distinction is load-bearing: retrying without the Restart
+# Manager args is safe only if nothing has run yet. A download failure or a mid-install error would
+# otherwise trigger a second attempt that both reruns an installer against partially changed state
+# AND (for a self-hosting package) re-enables Restart Manager — reintroducing the very kill this
+# release exists to prevent. So verify the claim "argument rejection happens before any install
+# work" instead of assuming it: if winget reached a download, a verified hash, or the installer
+# launch, the arguments were accepted and the failure is something else entirely.
+function Test-WingetArgsRejected { param([string]$Output, [int]$ExitCode, [int[]]$RebootCodes)
+  if ($ExitCode -eq 0 -or $ExitCode -in $RebootCodes) { return $false }
+  -not ($Output -match '(?im)^\s*(Downloading\s+\S+|Starting package install|Successfully verified installer hash)')
 }
 
 function Comp-Winget { param($Cfg)
@@ -585,19 +609,39 @@ function Comp-Winget { param($Cfg)
   foreach ($p in $pending) {
     $extra = @(); $selfNote = ''
     if ((& $isSelfHost $p) -and $selfArgs) {
-      $itype = Get-WingetInstallerType $winget $p.id
-      if (Test-MsiPropertiesApply $itype) {
+      if (Test-WingetHasMsiInstaller $winget $p.id) {
         $extra    = @('--custom', $selfArgs)
-        $selfNote = " [self-hosting, $($itype): --custom $selfArgs]"
+        $selfNote = " [self-hosting, MSI-family installer available: --custom $selfArgs]"
       } else {
-        $selfNote = " [self-hosting, installer type '$(if ($itype) { $itype } else { 'unknown' })' — MSI properties do not apply, upgrading without --custom]"
-        Write-Log INFO "winget: $($p.id) is self-hosting but its installer type ($(if ($itype) { $itype } else { 'unknown' })) takes no MSI properties — deferred to last, but Restart Manager cannot be disabled for it."
+        $selfNote = ' [self-hosting, no MSI-family installer — MSI properties cannot apply, upgrading without --custom]'
+        Write-Log INFO "winget: $($p.id) is self-hosting but publishes no MSI/WiX/Burn installer — deferred to last, but Restart Manager cannot be disabled for it."
       }
     }
     Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $selfNote)
+    $upgrade = {
+      param($ExtraArgs)
+      & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @ExtraArgs 2>&1
+    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @extra 2>&1
-    $sw.Stop(); $code = $LASTEXITCODE
+    $o  = & $upgrade $extra
+    $code = $LASTEXITCODE
+    # If the installer args are what was rejected, the upgrade must still happen: a package left
+    # un-upgraded is worse than one upgraded without Restart Manager disabled, and the probe above
+    # can only tell us an MSI-family installer EXISTS, not that winget chose it for this upgrade.
+    # Retry once without them — but ONLY when nothing has installed yet (see Test-WingetArgsRejected).
+    if ($extra.Count -gt 0 -and (Test-WingetArgsRejected ($o | Out-String) $code $rebootCodes)) {
+      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) before installing anything — retrying without the Restart Manager args (RM may then terminate this run; a kill is now reported as event 2011)."
+      Write-CompLog 'winget' "--- retrying $($p.id) WITHOUT --custom (first attempt exit 0x$($code.ToString('X8')), nothing installed yet) ---"
+      $o    = @($o) + @('--- retry without installer args ---') + @(& $upgrade @())
+      $code = $LASTEXITCODE
+      $extra = @()
+    } elseif ($extra.Count -gt 0 -and $code -ne 0 -and $code -notin $rebootCodes) {
+      # Failed AFTER the install began: re-running would touch partially changed state, and would do
+      # it with Restart Manager re-enabled. Leave it for the next run and say so.
+      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) after the install had begun — NOT retrying (a retry would re-enable Restart Manager and rerun a partial install)."
+      Write-CompLog 'winget' "--- not retrying $($p.id): failure came after install work started ---"
+    }
+    $sw.Stop()
     $txt = $o | Out-String
     Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
     if ($code -eq 0 -or $code -in $rebootCodes) {
