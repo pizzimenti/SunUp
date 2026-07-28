@@ -2,6 +2,109 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.0] - 2026-07-27
+
+### Fixed — SunUp no longer kills itself while upgrading PowerShell
+- On **2026-07-22** the run died mid-flight and nothing said so for five days. Root cause:
+  winget's `Microsoft.PowerShell 7.6.3 → 7.6.4` upgrade. SunUp runs under `pwsh`, and the MSI's
+  **Restart Manager** enumerates processes holding files under the install target and shuts them
+  down — including the engine that asked for the install. Event log, 14:15:19–14:15:23:
+  `RestartManager 10002 Shutting down application or service 'PowerShell 7'` →
+  `10010 Application 'pwsh.exe' cannot be restarted — Application SID does not match Conductor SID` →
+  `MsiInstaller 11708 Product: PowerShell 7-x64 — Installation failed` (rolled back; the box stayed on
+  7.6.3). The engine was terminated ~200 lines before its reboot decision, so it never rebooted, never
+  showed the dialog, and never wrote `result.json`. The `ifRequired` policy was not at fault — the
+  code that evaluates it never executed. (Collateral: the same sweep killed ProcWatch's engine, which
+  stayed dead until the box was rebooted by hand.)
+- Packages that host the engine's own process are now identified by **`winget.selfHostPattern`**
+  (default `Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller`) and handled two ways:
+  - **Upgraded last**, after every other package — a surprise kill can no longer cost the packages
+    that hadn't been reached yet.
+  - **Installed with Restart Manager disabled**, via `winget --custom` carrying
+    **`MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress`** (`winget.selfHostInstallerArgs`).
+    With RM off, files in use fall back to PendingFileRename: the install completes, the engine
+    **survives**, and the MSI returns `3010`, which SunUp already maps to "reboot required" — so the
+    restart happens where it belongs, in the one coordinated reboot at the end of the run.
+  - `--custom` (appends to winget's defaults), never `--override` (which would *replace* them and
+    drop the `/qn` that keeps the install silent).
+- Those args are **Windows Installer properties**, so they are only attached when they can actually
+  apply. `Get-WingetInstallerType` asks `winget show` what is about to run and
+  `Test-MsiPropertiesApply` gates on it: `msi`/`wix`/`burn` (bundles forward properties to the MSIs
+  they wrap) get the args; `msix` — which is what `Microsoft.DesktopAppInstaller` is — along with
+  `exe`/`inno`/`nullsoft` and an unreadable type do not, since those would receive the properties as
+  junk on their command line. Such packages are still **deferred to last**, and the run logs that
+  Restart Manager could not be disabled for them. (Raised in review by CodeRabbit.)
+
+### Added — a killed run is no longer silent (event 2011)
+- A run terminated mid-flight produced **no signal whatsoever**: `result.json`, `history.jsonl`,
+  events 2001/2010, the SysSentry echo and the summary dialog are all written *after* the component
+  loop, and `lastrun.json` is never stamped — so the next day's run looked like an ordinary
+  first-run-of-the-day. The only trace of 2026-07-22 was ProcWatch's unrelated stale-heartbeat alert.
+- Each run now scans for the fingerprint of a dead run — a previous run dir with `run.log` but **no**
+  `result.json` — and reports it once with **event 2011** + a SysSentry alert quoting the last line
+  that run logged, so the message says *where* it stopped. `incomplete.json` marks a dir as reported
+  so the alert can't repeat.
+- "No `result.json`" alone would also match a run **still in progress**. `MultipleInstances=IgnoreNew`
+  only serializes *task-launched* runs — the documented `SunUp.ps1 -Mode Run -Force` is a standalone
+  process the scheduler never sees, so a manual run and a scheduled one genuinely can overlap. Every
+  run therefore writes a **`running.json`** liveness marker (PID **plus that process's start time**,
+  because PIDs are recycled) before touching a single component, and deletes it once `result.json`
+  exists. `Test-RunAlive` clears a candidate only when the marked PID is running *and* the image name
+  and start time still match; if the start time can't be read it assumes **alive**, so a live peer is
+  never mislabelled. A dir with no marker predates v0.10.0 or died before writing one — either way
+  its owner is gone, so it still counts as crashed. (Caught in review by Codex.)
+- Two further concurrency holes closed, also from review:
+  - **Run dirs are now claimed atomically.** The stamp has second resolution, so two runs starting in
+    the same second were handed the *same* dir — interleaved logs, one `running.json` overwriting the
+    other, and whichever finished first writing a `result.json` that made the dir look complete even
+    if its peer was killed later. `New-RunDirectory` claims a dir by **creating** it (`New-Item`
+    without `-Force` fails if it exists, so the claim is atomic against a racing peer) and falls back
+    to a PID-qualified name, then a counter.
+  - **The marker is dropped only once `result.json` is really on disk.** `$ErrorActionPreference` is
+    `Continue`, so a transient lock or I/O error let `Set-Content` fail quietly while the marker was
+    deleted regardless — leaving a run with neither file, which a peer could read as a crash or the
+    next run could read as a completed run that was killed. The write is now terminating and
+    verified; if it fails the marker stays and the run is reported unfinished, which is the truth.
+  - **`result.json` is published atomically.** `Set-Content` truncates the destination first, so a
+    kill or I/O error partway through left a truncated file that still satisfied "result.json
+    exists" — and the crash check would read that interrupted run as a normal finish. `Save-RunResult`
+    serializes and **parse-verifies** into a temp file, then renames it over the destination: a run
+    is declared complete only by a file that was already whole.
+  - **A crash report is claimed before it is emitted.** Two concurrent runs could both pass the
+    "no `incomplete.json`" check before either wrote one, and both would fire event 2011 and append
+    to `ALERTS.md`. The marker is now created first (`New-Item` without `-Force`, so a peer that got
+    there first makes this scanner skip the dir), and only the winner reports.
+  - **An abandoned claim no longer suppresses the report forever.** A scanner killed *between*
+    claiming and reporting used to leave a marker that silenced every later scan — this feature's own
+    failure mode, turned on itself. A marker now means one of three distinct things: a completed
+    report (`reported: true`, never re-emitted), a report a peer is making right now (claim newer
+    than 15 min, left alone), or an abandoned claim (older, unreported — retaken and reported, with a
+    WARN saying so). At-least-once beats never for a crash notification.
+  - **The claim is a real lock.** Building mutual exclusion out of file operations — create-if-absent
+    for a fresh claim, rename-to-lease for a stale retake — kept leaving windows in which the marker
+    did not exist *as itself*, which a scanner arriving mid-take reads as "unclaimed", so both would
+    report. The marker is now opened with `FileShare::None` and the OS handle **is** the lock: the
+    file is always present and recognizable, exactly one process can hold it, a peer that probes
+    while it is held simply finds an unreported claim and leaves it alone, and Windows releases the
+    handle automatically if the holder is killed. One mechanism now covers the fresh claim and the
+    retake identically, and `reported: true` is written through that handle last of all.
+  - **Completion is rechecked under the lock.** A live peer can publish `result.json` and drop
+    `running.json` in the window between the scan and the liveness probe, which would make a
+    normally-completed run look crashed. `result.json` is rechecked as late as possible — after the
+    lock is taken — and a marker created for a run that turns out to have finished is removed again.
+  - **`running.json` is written the same atomic, verified way.** It was still using a plain
+    `Set-Content`, which under `$ErrorActionPreference = 'Continue'` could fail without entering the
+    `catch` — leaving a live run with no marker, which a peer would then read as crashed. All three
+    JSON files now go through one `Publish-JsonFile` helper; a failure to write it is logged
+    explicitly as "a concurrent run could mistake this live run for a crashed one".
+
+### Added — `tests\Test-SunUp.ps1`
+- First tests in the repo, covering both changes above without performing a real update run: the
+  engine parses; `Report-CrashedRuns` (lifted from source via the PowerShell AST, so the test
+  exercises the shipped code) flags exactly the dead run dirs and exactly once, ignoring finished
+  runs, empty dirs and the live run; the self-hosting partition loses no package, orders PowerShell
+  last, and attaches `--custom` to that package alone. `pwsh -File .\tests\Test-SunUp.ps1`
+
 ## [0.9.0] - 2026-07-08
 
 ### Fixed — winget rows now show a real download size instead of "—"

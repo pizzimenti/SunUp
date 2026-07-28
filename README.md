@@ -83,8 +83,14 @@ Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
   `run.log`, a full `transcript.log`, the **raw output of every tool** in its own file, and a
   structured `result.json`.
 
+A run that is killed mid-flight never writes `result.json`, and every other alert path runs after the
+updates — so the **next** run detects the orphaned dir, reports it once (event 2011 + a SysSentry
+alert naming the last line it logged) and marks it with `incomplete.json`. A run still in progress
+looks the same from outside, so each run drops a `running.json` liveness marker (PID + process start
+time) while it works: a concurrent manual `-Force` run is recognised as alive and left alone.
+
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
-2005 reboot, 2006 stale-reboot-pending, 2010 errors).
+2005 reboot, 2006 stale-reboot-pending, 2010 errors, 2011 previous run killed mid-run).
 
 ## Install / uninstall
 
@@ -127,6 +133,8 @@ defaults):
 | `notify.historyMaxRows` | `500` | cap on history rows |
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
 | `winget.excludePattern` | (regex) | skip pinned/self-updating/per-user apps |
+| `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process: upgraded last, with Restart Manager disabled |
+| `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | extra installer args (via `--custom`) for those packages, so the MSI can't terminate SunUp mid-run — attached only when the installer is `msi`/`wix`/`burn`, since MSIX and `.exe` installers take no MSI properties |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
 

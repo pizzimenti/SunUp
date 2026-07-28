@@ -25,6 +25,10 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         <component>.log                RAW output of each tool (defender/windowsupdate/
                                        winget/dell-apply/dell-bios-scan/psmodules)
         result.json                    structured per-component result for this run
+        running.json                   liveness marker (PID + process start) while the run is in
+                                       flight; deleted once result.json is written
+        incomplete.json                ONLY if the run was killed before writing result.json —
+                                       written by the NEXT run when it reports the crash (evt 2011)
   Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
 
 Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
@@ -38,7 +42,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.9.0'
+$script:Version = '0.10.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -84,7 +88,15 @@ $DefaultConfig = [ordered]@{
   # refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.), and UWP *framework*
   # packages (VCLibs) that winget can't deploy — they fail 0x8A15005C "extract" every run and are
   # serviced by the Store/dependent apps, not winget, so attempting them is pure noise.
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs' }
+  # selfHostPattern: packages that own the process SunUp itself is running in. Upgrading one of these
+  # normally has Windows Installer's Restart Manager terminate the engine mid-run (see selfHostInstallerArgs).
+  # They are upgraded LAST and with RM disabled, so a surprise kill can't also cost the rest of the run.
+  winget             = [ordered]@{
+    enabled = $true; pinIds = @()
+    excludePattern        = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
+    selfHostPattern       = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
+    selfHostInstallerArgs = 'MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress'
+  }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
@@ -159,6 +171,159 @@ function Flush-Report {
   @('', $header) + $script:Report | Add-Content $ReportFile
   $all = @(Get-Content $ReportFile)
   if ($all.Count -gt 900) { ($all[0..4] + '_…older entries trimmed…_' + $all[-850..-1]) | Set-Content $ReportFile }
+}
+
+# ---- crashed-run detection --------------------------------------------------
+# A run killed mid-flight (its host process terminated, power loss, a hard reset) is otherwise
+# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the SysSentry
+# echo, the summary dialog — lives after the component loop, and lastrun.json is never stamped, so
+# the next run just looks like a normal first-run-of-the-day. The 2026-07-22 run died that way
+# (Restart Manager killed the engine during winget's own PowerShell 7 upgrade) and nothing reported
+# it for five days. A dead run leaves a fingerprint: a run dir with run.log but no result.json.
+# Flag each one ONCE (incomplete.json marks it handled) and name the last thing it logged, so the
+# alert says where it stopped.
+#
+# "No result.json" alone is NOT proof of death — a run still in progress looks identical. The task is
+# MultipleInstances=IgnoreNew, but that only serializes TASK-launched runs: the documented
+# `SunUp.ps1 -Mode Run -Force` is a standalone process the scheduler never sees, so a manual run and
+# a scheduled one really can overlap. Every run therefore drops a running.json liveness marker
+# (PID + that process's start time, since PIDs get recycled) which Test-RunAlive checks before
+# anything is called dead. A dir with no marker predates v0.10.0 or lost the race to write it —
+# either way its owner is long gone, so it still counts as crashed.
+# A run dir must belong to exactly ONE process. The stamp has second resolution, so a scheduled run
+# and a manual `-Mode Run -Force` starting in the same second would otherwise be handed the same dir:
+# interleaved logs, one running.json overwriting the other, and whichever finished first writing a
+# result.json that makes the dir look complete even if its peer is killed later — the peer's crash
+# would never be reported. So claim the dir by CREATING it: New-Item without -Force fails when it
+# already exists, which makes the claim atomic against a peer racing us, and we fall back to a
+# PID-qualified name (unique by definition) and then to a counter.
+# Publish a JSON file so readers only ever see it WHOLE: serialize and parse-verify into a temp file,
+# then rename over the destination. Every JSON file this engine writes carries meaning by its mere
+# presence — result.json says "this run finished", running.json says "this process owns this run" —
+# and Set-Content truncates its destination before writing, so a kill or I/O error partway through
+# would leave a half-file that still satisfies Test-Path and lies to whoever reads it next. The
+# rename is the publish. -ErrorAction Stop throughout, because $ErrorActionPreference is 'Continue'
+# and a quiet non-terminating failure here would be reported as success.
+# Returns $true only when the destination really exists afterwards.
+function Publish-JsonFile { param($Object, [string]$Path)
+  $tmp = "$Path.tmp"
+  try {
+    ($Object | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -ErrorAction Stop
+    $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json    # prove it is complete and parseable
+    Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
+    return (Test-Path $Path)
+  } catch {
+    Write-Log ERROR "could not publish $([IO.Path]::GetFileName($Path)): $($_.Exception.Message)"
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $false
+  }
+}
+
+function New-RunDirectory { param([string]$Base, [string]$Root)
+  if (-not $Root) { $Root = $RunsDir }
+  New-Item -ItemType Directory -Force -Path $Root | Out-Null
+  $candidates = @($Base, "${Base}_$PID") + (2..20 | ForEach-Object { "${Base}_${PID}_$_" })
+  foreach ($c in $candidates) {
+    try { return (New-Item -ItemType Directory -Path (Join-Path $Root $c) -ErrorAction Stop).FullName } catch { }
+  }
+  # Every candidate collided, which should be impossible — share the dir rather than skip the run.
+  $p = Join-Path $Root $Base; New-Item -ItemType Directory -Force -Path $p | Out-Null; $p
+}
+
+function Test-RunAlive { param([string]$Dir)
+  $marker = Join-Path $Dir 'running.json'
+  if (-not (Test-Path $marker)) { return $false }
+  try { $m = Get-Content $marker -Raw -ErrorAction Stop | ConvertFrom-Json } catch { return $false }
+  if (-not $m.pid) { return $false }
+  $p = Get-Process -Id ([int]$m.pid) -ErrorAction SilentlyContinue
+  if (-not $p) { return $false }                                             # owner is gone
+  if ($m.processName -and "$($p.ProcessName)" -ne "$($m.processName)") { return $false }   # PID recycled
+  try {
+    if ($m.processStartUtc) {
+      $claimed = [datetime]::Parse("$($m.processStartUtc)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+      # Same PID, same image, but started at a different moment = a recycled PID, not our run.
+      if (($claimed - $p.StartTime.ToUniversalTime()).Duration().TotalSeconds -gt 2) { return $false }
+    }
+  } catch { }   # start time unreadable: PID and image still match, so assume ALIVE — never cry crash on a live peer
+  $true
+}
+
+function Report-CrashedRuns {
+  if (-not (Test-Path $RunsDir)) { return }
+  $dirs = @(Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $script:RunDir } | Sort-Object Name)
+  foreach ($d in $dirs) {
+    $resultPath = Join-Path $d.FullName 'result.json'
+    if (Test-Path $resultPath) { continue }                             # finished normally
+    $marker = Join-Path $d.FullName 'incomplete.json'
+    $stale  = $false
+    # A marker means one of three things, and they must not be conflated: a COMPLETED report
+    # (reported=true — nothing more to do), a report a peer is making RIGHT NOW (recent claim, leave
+    # it alone), or an ABANDONED claim from a scanner that was itself killed between claiming and
+    # reporting. The last one used to suppress the crash forever — the very failure mode this feature
+    # exists to prevent, applied to itself — so a stale unreported claim is retaken after
+    # $ClaimStaleMinutes. Worst case that re-reports a crash whose first report died in a millisecond
+    # window: at-least-once beats never.
+    $ClaimStaleMinutes = 15
+    if (Test-Path $marker) {
+      $reported = $false
+      try { $reported = [bool]((Get-Content $marker -Raw -ErrorAction Stop | ConvertFrom-Json).reported) } catch { }
+      if ($reported) { continue }
+      $ageMin = try { ((Get-Date) - (Get-Item $marker).LastWriteTime).TotalMinutes } catch { 0 }
+      if ($ageMin -lt $ClaimStaleMinutes) { continue }                  # a peer is mid-report; let it finish
+      Write-Log WARN "re-taking an abandoned crash-report claim on $($d.Name) ($([int]$ageMin)m old, never reported)"
+      $stale = $true
+    }
+    $rl = Join-Path $d.FullName 'run.log'
+    if (-not (Test-Path $rl)) { continue }                              # dir made, nothing logged — nothing to say
+    if (Test-RunAlive $d.FullName) {                                    # a concurrent manual run, still working
+      Write-Log INFO "run $($d.Name) is still in progress (another SunUp process) — not treating it as crashed."
+      continue
+    }
+    $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
+    # TAKE THE REPORT with a real lock: open the marker with FileShare::None, so the OS handle IS the
+    # mutual exclusion. Earlier attempts built the lock out of file operations — create-if-absent for
+    # a fresh claim, rename-to-lease for a stale retake — and each left a window where the marker did
+    # not exist as itself, which a scanner arriving mid-take reads as "unclaimed". An exclusive handle
+    # has no such window: the file is always present and always recognizable, exactly one process can
+    # hold it, and Windows releases it automatically if we are killed. One mechanism covers the fresh
+    # claim (OpenOrCreate creates it) and the retake (OpenOrCreate reopens it) identically.
+    # A peer probing while we hold it fails to read, sees an unreported claim, and leaves it to us.
+    $fs = $null
+    $markerPreexisted = Test-Path $marker
+    $abandonClaim     = $false
+    try {
+      $fs = [System.IO.File]::Open($marker, [System.IO.FileMode]::OpenOrCreate,
+                                   [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    } catch { continue }        # a peer holds the lock — it is reporting this one
+    try {
+      # Final completion check, as late as possible and under the lock: a live peer may have published
+      # result.json and removed running.json in the window between the checks above and this take, in
+      # which case it finished normally and there is nothing to report.
+      if (Test-Path $resultPath) { $abandonClaim = $true; continue }
+      $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
+      Write-Log WARN $m
+      Write-Evt 2011 Warning $m
+      Raise-SysSentryAlert $m
+      # reported=true is written LAST and is what turns a claim into a finished report: if we die
+      # before this, the marker stays unreported and a later run retakes it rather than losing it.
+      # Written through the locked handle — a temp-file-and-rename publish cannot replace a file we
+      # are holding open, and here the lock matters more than the rename.
+      $json  = [ordered]@{
+        runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version
+        lastLogLine = "$last"; reported = $true
+      } | ConvertTo-Json -Depth 4
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+      $fs.SetLength(0); $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+    } catch {
+      Write-Log WARN "could not complete the crash report for $($d.Name): $($_.Exception.Message)"
+    } finally {
+      $fs.Dispose()
+      # If the run turned out to have finished, leave the dir exactly as we found it — an empty marker
+      # we created for a completed run would be litter that reads like a claim.
+      if ($abandonClaim -and -not $markerPreexisted) { Remove-Item $marker -Force -ErrorAction SilentlyContinue }
+    }
+  }
 }
 
 function Raise-SysSentryAlert { param($Msg)
@@ -335,6 +500,24 @@ function Get-WingetDownloadSizeMB { param([string]$Text)
   if ($got) { [math]::Round($totalBytes / 1MB, 1) } else { $null }
 }
 
+# MSIRESTARTMANAGERCONTROL / REBOOT are Windows Installer PROPERTIES. They mean something to an MSI,
+# and to Burn/WiX bundles (which forward properties to the MSIs they wrap) — and nothing at all to an
+# MSIX/appx package such as Microsoft.DesktopAppInstaller, or to an Inno/NSIS .exe that would simply
+# receive them as junk on its command line and could fail or install non-silently. So ask winget what
+# it is about to run, and only attach the args where they can actually apply. An UNKNOWN type is
+# treated as "don't attach" (deterministic and safe): the package still upgrades, still goes last,
+# and if RM does kill the engine, the crash is now reported instead of vanishing.
+function Get-WingetInstallerType { param($Winget, [string]$Id)
+  try {
+    $out = & $Winget show --id $Id -e --accept-source-agreements 2>&1 | Out-String
+    if ($out -match '(?im)^\s*Installer Type:\s*(\S+)') { return $Matches[1].Trim().ToLower() }
+  } catch {}
+  $null
+}
+function Test-MsiPropertiesApply { param([string]$InstallerType)
+  [bool]($InstallerType -and ($InstallerType.ToLower() -in @('msi', 'wix', 'burn')))
+}
+
 function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
@@ -369,13 +552,51 @@ function Comp-Winget { param($Cfg)
     return @{ status = 'ok'; detail = "up to date$skipNote" }
   }
 
+  # ---- self-hosting packages: upgrade LAST, with Restart Manager disabled -----
+  # SunUp runs under pwsh, so upgrading Microsoft.PowerShell means the MSI's Restart Manager
+  # enumerates processes holding files under the install target and shuts them down — including the
+  # engine that asked for the install. That is exactly what killed the 2026-07-22 run: RM terminated
+  # pwsh mid-winget, the MSI then failed to restart it ("Application SID does not match Conductor
+  # SID") and rolled back, and the run died before reaching its reboot decision, its summary dialog,
+  # or any alert path. Two mitigations, both needed:
+  #   * order  — these go last, so a surprise kill can't cost the packages that hadn't run yet;
+  #   * args   — MSIRESTARTMANAGERCONTROL=Disable tells Windows Installer not to use RM at all. Files
+  #              in use fall back to PendingFileRename, so the install completes, the engine SURVIVES,
+  #              and the MSI returns 3010 → $rebootCodes → a proper coordinated reboot at end of run.
+  #              REBOOT=ReallySuppress stops the MSI restarting the box behind SunUp's back.
+  # Passed with --custom (appends to winget's defaults) and NOT --override (which would REPLACE
+  # them, dropping the /qn that keeps the install silent).
+  $selfPat  = "$($Cfg.winget.selfHostPattern)"
+  $selfArgs = "$($Cfg.winget.selfHostInstallerArgs)"
+  $isSelfHost = { param($Pkg) $selfPat -and ($Pkg.id -match $selfPat -or $Pkg.name -match $selfPat) }
+  if ($selfPat) {
+    $deferred = @($pending | Where-Object { & $isSelfHost $_ })
+    if ($deferred.Count -gt 0) {
+      $pending = @(@($pending | Where-Object { -not (& $isSelfHost $_) }) + $deferred)
+      $ids = ($deferred | ForEach-Object { $_.id }) -join ', '
+      Write-CompLog 'winget' "--- deferring $($deferred.Count) self-hosting package(s) to the end of the run: $ids ---"
+      Write-Log INFO "winget: deferring $($deferred.Count) self-hosting package(s) to last: $ids"
+    }
+  }
+
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
   $ok = 0; $fail = 0; $reboot = $false
   foreach ($p in $pending) {
-    Write-CompLog 'winget' "--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---"
+    $extra = @(); $selfNote = ''
+    if ((& $isSelfHost $p) -and $selfArgs) {
+      $itype = Get-WingetInstallerType $winget $p.id
+      if (Test-MsiPropertiesApply $itype) {
+        $extra    = @('--custom', $selfArgs)
+        $selfNote = " [self-hosting, $($itype): --custom $selfArgs]"
+      } else {
+        $selfNote = " [self-hosting, installer type '$(if ($itype) { $itype } else { 'unknown' })' — MSI properties do not apply, upgrading without --custom]"
+        Write-Log INFO "winget: $($p.id) is self-hosting but its installer type ($(if ($itype) { $itype } else { 'unknown' })) takes no MSI properties — deferred to last, but Restart Manager cannot be disabled for it."
+      }
+    }
+    Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $selfNote)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @extra 2>&1
     $sw.Stop(); $code = $LASTEXITCODE
     $txt = $o | Out-String
     Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
@@ -602,15 +823,37 @@ if (-not $Force -and $stamp -and $stamp.date -eq $today) {
 
 # Set up this run's isolated log dir + rotate the main log + full transcript.
 Rotate-Log $LogFile
-$runStamp      = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
-$script:RunDir = Join-Path $RunsDir $runStamp
-New-Item -ItemType Directory -Force -Path $script:RunDir | Out-Null
+$script:RunDir = New-RunDirectory ((Get-Date).ToString('yyyy-MM-dd_HHmmss'))   # claimed atomically; see the function
+$runStamp      = Split-Path $script:RunDir -Leaf
 $script:RunLog = Join-Path $script:RunDir 'run.log'
+# Liveness marker, so the NEXT run can tell a dead run from one still working (see Test-RunAlive).
+# Written before any component runs — a crash between here and result.json is what we want to catch.
+# Start time goes in alongside the PID because PIDs are recycled, and a recycled PID would otherwise
+# make a genuinely dead run look alive forever.
+$script:RunMarker = Join-Path $script:RunDir 'running.json'
+$markerOk = $false
+try {
+  $me = Get-Process -Id $PID -ErrorAction Stop
+  $markerOk = Publish-JsonFile ([ordered]@{
+    pid = $PID; processName = $me.ProcessName
+    processStartUtc = $me.StartTime.ToUniversalTime().ToString('o')
+    host = $env:COMPUTERNAME; startedLocal = (Get-Date).ToString('o')
+  }) $script:RunMarker
+} catch { }
+if (-not $markerOk) {
+  # Publish-JsonFile already logged why. Without a marker this run is indistinguishable from a dead
+  # one, so say so plainly rather than leaving a path that points at nothing.
+  $script:RunMarker = $null
+  Write-Log WARN 'running.json could not be written — a concurrent run could mistake this live run for a crashed one.'
+}
 try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force | Out-Null } catch {}
 
 $startUtc = (Get-Date).ToUniversalTime()
 Write-Log INFO "===== $Name v$script:Version run start ($today, forced=$([bool]$Force)) — $runStamp ====="
 Write-Evt 2000 Information "$Name run started ($today) — logs in $script:RunDir"
+# Never let crash DETECTION be the thing that crashes the run — that would recreate the exact silent
+# failure it exists to report, one day later. Its internals are individually guarded; this is the belt.
+try { Report-CrashedRuns } catch { Write-Log WARN "crashed-run check failed (continuing): $($_.Exception.Message)" }
 
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }
@@ -696,7 +939,15 @@ $willReboot       = switch ("$($cfg.rebootPolicy)") {
 if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
 elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
-$result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
+# The marker may only be dropped once result.json is REALLY on disk. $ErrorActionPreference is
+# 'Continue', so a transient lock or I/O error would let Set-Content fail quietly — and clearing the
+# marker anyway would leave a run with neither file: a peer could then declare this live run crashed,
+# or the next run could call a completed run killed. If the write fails the marker stays, and the run
+# is reported as never-finished — which is the truth: its result was never persisted.
+$resultPath    = Join-Path $script:RunDir 'result.json'
+$resultWritten = Publish-JsonFile $result $resultPath
+if (-not $resultWritten) { Write-Log WARN "result.json missing — keeping running.json so this run is reported as unfinished." }
+elseif ($script:RunMarker)   { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 # trim history to last 365 runs
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }
