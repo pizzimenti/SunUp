@@ -27,8 +27,15 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
   reboot-required code, it is retried once without them. The probe can only prove an MSI-family
   installer *exists*, not that winget chose it, and a package left un-upgraded is a worse outcome
   than one upgraded with Restart Manager still active — especially now that such a kill is reported
-  as event 2011 instead of vanishing. An argument rejection happens before any install work, so the
-  retry is clean.
+  as event 2011 instead of vanishing.
+- The retry is **gated on nothing having installed yet** (`Test-WingetArgsRejected`). Retrying on any
+  failure would have been actively dangerous: a download error or a mid-install failure on
+  `Microsoft.PowerShell` would trigger a second attempt that both reruns an installer against
+  partially changed state *and* drops `MSIRESTARTMANAGERCONTROL=Disable` — re-arming, within the same
+  run, the exact kill this release exists to prevent. So the claim "an argument rejection happens
+  before any install work" is now **verified** rather than assumed: if winget reached a download, a
+  verified hash, or the installer launch, the args were accepted, the failure is something else, and
+  the package is left for the next run with a WARN saying exactly that. (Caught as a P1 by Codex.)
 
 ## [0.10.0] - 2026-07-27
 

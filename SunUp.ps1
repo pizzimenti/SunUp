@@ -529,6 +529,19 @@ function Test-WingetHasMsiInstaller { param($Winget, [string]$Id)
   $false
 }
 
+# Was the failure the INSTALLER ARGUMENTS being rejected, or something that happened after the
+# install was already under way? The distinction is load-bearing: retrying without the Restart
+# Manager args is safe only if nothing has run yet. A download failure or a mid-install error would
+# otherwise trigger a second attempt that both reruns an installer against partially changed state
+# AND (for a self-hosting package) re-enables Restart Manager — reintroducing the very kill this
+# release exists to prevent. So verify the claim "argument rejection happens before any install
+# work" instead of assuming it: if winget reached a download, a verified hash, or the installer
+# launch, the arguments were accepted and the failure is something else entirely.
+function Test-WingetArgsRejected { param([string]$Output, [int]$ExitCode, [int[]]$RebootCodes)
+  if ($ExitCode -eq 0 -or $ExitCode -in $RebootCodes) { return $false }
+  -not ($Output -match '(?im)^\s*(Downloading\s+\S+|Starting package install|Successfully verified installer hash)')
+}
+
 function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
@@ -612,17 +625,21 @@ function Comp-Winget { param($Cfg)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $o  = & $upgrade $extra
     $code = $LASTEXITCODE
-    # If the installer args are what winget/the installer objected to, the upgrade must still happen:
-    # a package left un-upgraded is a worse outcome than one upgraded without Restart Manager
-    # disabled, and the probe above can only tell us an MSI-family installer EXISTS, not that winget
-    # chose it for this upgrade. Retry once, cleanly, without them. The retry is safe because an
-    # argument rejection happens before any install work begins.
-    if ($extra.Count -gt 0 -and $code -ne 0 -and $code -notin $rebootCodes) {
-      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) with Restart Manager args — retrying without them (Restart Manager may terminate this run; a kill is now reported as event 2011)."
-      Write-CompLog 'winget' "--- retrying $($p.id) WITHOUT --custom (first attempt exit 0x$($code.ToString('X8'))) ---"
+    # If the installer args are what was rejected, the upgrade must still happen: a package left
+    # un-upgraded is worse than one upgraded without Restart Manager disabled, and the probe above
+    # can only tell us an MSI-family installer EXISTS, not that winget chose it for this upgrade.
+    # Retry once without them — but ONLY when nothing has installed yet (see Test-WingetArgsRejected).
+    if ($extra.Count -gt 0 -and (Test-WingetArgsRejected ($o | Out-String) $code $rebootCodes)) {
+      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) before installing anything — retrying without the Restart Manager args (RM may then terminate this run; a kill is now reported as event 2011)."
+      Write-CompLog 'winget' "--- retrying $($p.id) WITHOUT --custom (first attempt exit 0x$($code.ToString('X8')), nothing installed yet) ---"
       $o    = @($o) + @('--- retry without installer args ---') + @(& $upgrade @())
       $code = $LASTEXITCODE
       $extra = @()
+    } elseif ($extra.Count -gt 0 -and $code -ne 0 -and $code -notin $rebootCodes) {
+      # Failed AFTER the install began: re-running would touch partially changed state, and would do
+      # it with Restart Manager re-enabled. Leave it for the next run and say so.
+      Write-Log WARN "winget: $($p.id) exited 0x$($code.ToString('X8')) after the install had begun — NOT retrying (a retry would re-enable Restart Manager and rerun a partial install)."
+      Write-CompLog 'winget' "--- not retrying $($p.id): failure came after install work started ---"
     }
     $sw.Stop()
     $txt = $o | Out-String

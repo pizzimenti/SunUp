@@ -34,7 +34,7 @@ function Raise-SysSentryAlert { param($Msg)
 }
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Test-WingetHasMsiInstaller') {
+foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Test-WingetHasMsiInstaller','Test-WingetArgsRejected') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -202,6 +202,27 @@ $fakeDead = { throw 'winget exploded' }
 Check 'a package publishing a WiX .msi is detected despite an msix default' (Test-WingetHasMsiInstaller $realPwsh 'Microsoft.PowerShell')
 Check 'an msix-only package is not' (-not (Test-WingetHasMsiInstaller $realMsixOnly 'Microsoft.DesktopAppInstaller'))
 Check 'a failing winget show yields false, not a crash' (-not (Test-WingetHasMsiInstaller $fakeDead 'whatever'))
+
+# Retrying without the Restart Manager args is only safe BEFORE anything installs. A failure that
+# happens after the download/install started must NOT be retried: the retry would rerun an installer
+# against partially changed state with RM re-enabled — the original kill, re-armed.
+$rc = 3010, 0x8A150077, 0x8A150078, 0x8A150079
+$rejected = "winget: unrecognized argument`nAn unexpected error occurred."
+$downloadFailed = @'
+Found PowerShell [Microsoft.PowerShell]
+Downloading https://example.invalid/PowerShell-7.6.4-win-x64.msi
+Network error
+'@
+$installFailed = @'
+Successfully verified installer hash
+Starting package install...
+Installer failed with exit code: 1603
+'@
+Check 'an argument rejection is retried'            (Test-WingetArgsRejected $rejected 1 $rc)
+Check 'a failed download is NOT retried'            (-not (Test-WingetArgsRejected $downloadFailed 1 $rc))
+Check 'a failure after install began is NOT retried' (-not (Test-WingetArgsRejected $installFailed 1603 $rc))
+Check 'success is never retried'                     (-not (Test-WingetArgsRejected $rejected 0 $rc))
+Check 'a reboot-required exit is never retried'      (-not (Test-WingetArgsRejected $rejected 3010 $rc))
 
 # End-to-end arg decision, using the real probe against each package's real winget behaviour.
 $probeFor = @{ 'Microsoft.PowerShell' = $realPwsh; 'Microsoft.DesktopAppInstaller' = $realMsixOnly }
