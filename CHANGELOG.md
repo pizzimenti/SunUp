@@ -2,6 +2,33 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.1] - 2026-07-27
+
+### Fixed — the v0.10.0 installer-type gate would have disabled the fix on the one package it exists for
+- Caught by live data minutes after v0.10.0 was tagged, while checking whether PowerShell 7.6.4 would
+  now install by itself. `Get-WingetInstallerType` read the **default** installer out of
+  `winget show`, and for `Microsoft.PowerShell` that answer is **`msix`** — so the gate would have
+  withheld `MSIRESTARTMANAGERCONTROL=Disable` and left Restart Manager free to kill the engine again:
+
+  | probe | answer |
+  |---|---|
+  | `winget show --id Microsoft.PowerShell` | `Installer Type: msix` |
+  | `winget show … --installer-type wix` | **`Installer Type: wix`** ← the `.msi` |
+
+  The package publishes **both**, and an *upgrade* matches the installed package's installer
+  technology rather than the manifest default — which is why the 2026-07-22 run installed
+  `PowerShell-7.6.4-win-x64.msi` (per the `MsiInstaller` events) while `winget show` says msix.
+  "What is the default installer type" was simply the wrong question.
+- Replaced with **`Test-WingetHasMsiInstaller`**, which asks whether the package offers an MSI-family
+  installer **at all** (`--installer-type wix|msi|burn`). Verified against live winget 1.29.280:
+  `Microsoft.PowerShell` → true, `Microsoft.DesktopAppInstaller` → false, `Google.Chrome.EXE` → false.
+- Added a **retry**: if an upgrade carrying the Restart Manager args fails with anything other than a
+  reboot-required code, it is retried once without them. The probe can only prove an MSI-family
+  installer *exists*, not that winget chose it, and a package left un-upgraded is a worse outcome
+  than one upgraded with Restart Manager still active — especially now that such a kill is reported
+  as event 2011 instead of vanishing. An argument rejection happens before any install work, so the
+  retry is clean.
+
 ## [0.10.0] - 2026-07-27
 
 ### Fixed — SunUp no longer kills itself while upgrading PowerShell
