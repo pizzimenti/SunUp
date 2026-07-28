@@ -190,6 +190,24 @@ function Flush-Report {
 # (PID + that process's start time, since PIDs get recycled) which Test-RunAlive checks before
 # anything is called dead. A dir with no marker predates v0.10.0 or lost the race to write it —
 # either way its owner is long gone, so it still counts as crashed.
+# A run dir must belong to exactly ONE process. The stamp has second resolution, so a scheduled run
+# and a manual `-Mode Run -Force` starting in the same second would otherwise be handed the same dir:
+# interleaved logs, one running.json overwriting the other, and whichever finished first writing a
+# result.json that makes the dir look complete even if its peer is killed later — the peer's crash
+# would never be reported. So claim the dir by CREATING it: New-Item without -Force fails when it
+# already exists, which makes the claim atomic against a peer racing us, and we fall back to a
+# PID-qualified name (unique by definition) and then to a counter.
+function New-RunDirectory { param([string]$Base, [string]$Root)
+  if (-not $Root) { $Root = $RunsDir }
+  New-Item -ItemType Directory -Force -Path $Root | Out-Null
+  $candidates = @($Base, "${Base}_$PID") + (2..20 | ForEach-Object { "${Base}_${PID}_$_" })
+  foreach ($c in $candidates) {
+    try { return (New-Item -ItemType Directory -Path (Join-Path $Root $c) -ErrorAction Stop).FullName } catch { }
+  }
+  # Every candidate collided, which should be impossible — share the dir rather than skip the run.
+  $p = Join-Path $Root $Base; New-Item -ItemType Directory -Force -Path $p | Out-Null; $p
+}
+
 function Test-RunAlive { param([string]$Dir)
   $marker = Join-Path $Dir 'running.json'
   if (-not (Test-Path $marker)) { return $false }
@@ -731,9 +749,8 @@ if (-not $Force -and $stamp -and $stamp.date -eq $today) {
 
 # Set up this run's isolated log dir + rotate the main log + full transcript.
 Rotate-Log $LogFile
-$runStamp      = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
-$script:RunDir = Join-Path $RunsDir $runStamp
-New-Item -ItemType Directory -Force -Path $script:RunDir | Out-Null
+$script:RunDir = New-RunDirectory ((Get-Date).ToString('yyyy-MM-dd_HHmmss'))   # claimed atomically; see the function
+$runStamp      = Split-Path $script:RunDir -Leaf
 $script:RunLog = Join-Path $script:RunDir 'run.log'
 # Liveness marker, so the NEXT run can tell a dead run from one still working (see Test-RunAlive).
 # Written before any component runs — a crash between here and result.json is what we want to catch.
@@ -841,9 +858,19 @@ $willReboot       = switch ("$($cfg.rebootPolicy)") {
 if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
 elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 
-$result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $script:RunDir 'result.json')
-# result.json now exists, so this run can never be mistaken for crashed — drop the liveness marker.
-if ($script:RunMarker) { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
+# The marker may only be dropped once result.json is REALLY on disk. $ErrorActionPreference is
+# 'Continue', so a transient lock or I/O error would let Set-Content fail quietly — and clearing the
+# marker anyway would leave a run with neither file: a peer could then declare this live run crashed,
+# or the next run could call a completed run killed. If the write fails the marker stays, and the run
+# is reported as never-finished — which is the truth: its result was never persisted.
+$resultPath = Join-Path $script:RunDir 'result.json'
+$resultWritten = $false
+try {
+  $result | ConvertTo-Json -Depth 8 | Set-Content $resultPath -ErrorAction Stop
+  $resultWritten = Test-Path $resultPath
+} catch { Write-Log ERROR "could not write result.json: $($_.Exception.Message)" }
+if (-not $resultWritten) { Write-Log WARN "result.json missing — keeping running.json so this run is reported as unfinished." }
+elseif ($script:RunMarker)   { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 # trim history to last 365 runs
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }

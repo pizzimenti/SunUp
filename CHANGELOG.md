@@ -53,6 +53,18 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
   and start time still match; if the start time can't be read it assumes **alive**, so a live peer is
   never mislabelled. A dir with no marker predates v0.10.0 or died before writing one — either way
   its owner is gone, so it still counts as crashed. (Caught in review by Codex.)
+- Two further concurrency holes closed, also from review:
+  - **Run dirs are now claimed atomically.** The stamp has second resolution, so two runs starting in
+    the same second were handed the *same* dir — interleaved logs, one `running.json` overwriting the
+    other, and whichever finished first writing a `result.json` that made the dir look complete even
+    if its peer was killed later. `New-RunDirectory` claims a dir by **creating** it (`New-Item`
+    without `-Force` fails if it exists, so the claim is atomic against a racing peer) and falls back
+    to a PID-qualified name, then a counter.
+  - **The marker is dropped only once `result.json` is really on disk.** `$ErrorActionPreference` is
+    `Continue`, so a transient lock or I/O error let `Set-Content` fail quietly while the marker was
+    deleted regardless — leaving a run with neither file, which a peer could read as a crash or the
+    next run could read as a completed run that was killed. The write is now terminating and
+    verified; if it fails the marker stays and the run is reported unfinished, which is the truth.
 
 ### Added — `tests\Test-SunUp.ps1`
 - First tests in the repo, covering both changes above without performing a real update run: the

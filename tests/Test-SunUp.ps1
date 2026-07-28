@@ -26,7 +26,7 @@ function Write-Evt { param([int]$Id, [string]$Type = 'Information', [string]$Msg
 function Raise-SysSentryAlert { param($Msg) $script:alerts += $Msg }
 $script:Version = 'test'
 
-foreach ($name in 'Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
+foreach ($name in 'New-RunDirectory','Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -55,6 +55,15 @@ $self = Get-Process -Id $PID
 'died with a marker' | Set-Content (Join-Path $RunsDir 'stale\run.log')
 @{ pid = $PID; processName = $self.ProcessName; processStartUtc = $self.StartTime.ToUniversalTime().AddHours(-5).ToString('o') } |
   ConvertTo-Json | Set-Content (Join-Path $RunsDir 'stale\running.json')
+
+# Same-second starts (scheduled run + manual -Force) must never share a run dir.
+$sameSecond = ' 2026-07-22_141106'.Trim()
+$claims = 1..3 | ForEach-Object { New-RunDirectory $sameSecond $RunsDir }
+Check 'concurrent claims on the same stamp get distinct dirs' ((@($claims | Sort-Object -Unique).Count) -eq 3) ($claims -join ' | ')
+Check 'the first claim keeps the plain stamp' ((Split-Path $claims[0] -Leaf) -eq $sameSecond)
+Check 'later claims are PID-qualified' ((Split-Path $claims[1] -Leaf) -like "${sameSecond}_$PID*")
+Check 'every claimed dir actually exists' (@($claims | Where-Object { Test-Path $_ }).Count -eq 3)
+$claims | ForEach-Object { Remove-Item $_ -Recurse -Force }
 
 Check 'a live peer is detected as alive' (Test-RunAlive (Join-Path $RunsDir 'peer'))
 Check 'a recycled PID is NOT mistaken for alive' (-not (Test-RunAlive (Join-Path $RunsDir 'stale')))
