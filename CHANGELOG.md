@@ -27,6 +27,13 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
     restart happens where it belongs, in the one coordinated reboot at the end of the run.
   - `--custom` (appends to winget's defaults), never `--override` (which would *replace* them and
     drop the `/qn` that keeps the install silent).
+- Those args are **Windows Installer properties**, so they are only attached when they can actually
+  apply. `Get-WingetInstallerType` asks `winget show` what is about to run and
+  `Test-MsiPropertiesApply` gates on it: `msi`/`wix`/`burn` (bundles forward properties to the MSIs
+  they wrap) get the args; `msix` — which is what `Microsoft.DesktopAppInstaller` is — along with
+  `exe`/`inno`/`nullsoft` and an unreadable type do not, since those would receive the properties as
+  junk on their command line. Such packages are still **deferred to last**, and the run logs that
+  Restart Manager could not be disabled for them. (Raised in review by CodeRabbit.)
 
 ### Added — a killed run is no longer silent (event 2011)
 - A run terminated mid-flight produced **no signal whatsoever**: `result.json`, `history.jsonl`,

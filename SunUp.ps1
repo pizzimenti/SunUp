@@ -408,6 +408,24 @@ function Get-WingetDownloadSizeMB { param([string]$Text)
   if ($got) { [math]::Round($totalBytes / 1MB, 1) } else { $null }
 }
 
+# MSIRESTARTMANAGERCONTROL / REBOOT are Windows Installer PROPERTIES. They mean something to an MSI,
+# and to Burn/WiX bundles (which forward properties to the MSIs they wrap) — and nothing at all to an
+# MSIX/appx package such as Microsoft.DesktopAppInstaller, or to an Inno/NSIS .exe that would simply
+# receive them as junk on its command line and could fail or install non-silently. So ask winget what
+# it is about to run, and only attach the args where they can actually apply. An UNKNOWN type is
+# treated as "don't attach" (deterministic and safe): the package still upgrades, still goes last,
+# and if RM does kill the engine, the crash is now reported instead of vanishing.
+function Get-WingetInstallerType { param($Winget, [string]$Id)
+  try {
+    $out = & $Winget show --id $Id -e --accept-source-agreements 2>&1 | Out-String
+    if ($out -match '(?im)^\s*Installer Type:\s*(\S+)') { return $Matches[1].Trim().ToLower() }
+  } catch {}
+  $null
+}
+function Test-MsiPropertiesApply { param([string]$InstallerType)
+  [bool]($InstallerType -and ($InstallerType.ToLower() -in @('msi', 'wix', 'burn')))
+}
+
 function Comp-Winget { param($Cfg)
   $winget = Resolve-Winget
   if (-not $winget) { return @{ status = 'error'; detail = 'winget not found'; error = 'winget.exe not resolvable' } }
@@ -473,9 +491,18 @@ function Comp-Winget { param($Cfg)
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
   $ok = 0; $fail = 0; $reboot = $false
   foreach ($p in $pending) {
-    $extra = @()
-    if ((& $isSelfHost $p) -and $selfArgs) { $extra = @('--custom', $selfArgs) }
-    Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $(if ($extra) { " [self-hosting: --custom $selfArgs]" } else { '' }))
+    $extra = @(); $selfNote = ''
+    if ((& $isSelfHost $p) -and $selfArgs) {
+      $itype = Get-WingetInstallerType $winget $p.id
+      if (Test-MsiPropertiesApply $itype) {
+        $extra    = @('--custom', $selfArgs)
+        $selfNote = " [self-hosting, $($itype): --custom $selfArgs]"
+      } else {
+        $selfNote = " [self-hosting, installer type '$(if ($itype) { $itype } else { 'unknown' })' — MSI properties do not apply, upgrading without --custom]"
+        Write-Log INFO "winget: $($p.id) is self-hosting but its installer type ($(if ($itype) { $itype } else { 'unknown' })) takes no MSI properties — deferred to last, but Restart Manager cannot be disabled for it."
+      }
+    }
+    Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $selfNote)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @extra 2>&1
     $sw.Stop(); $code = $LASTEXITCODE
@@ -726,7 +753,9 @@ try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force 
 $startUtc = (Get-Date).ToUniversalTime()
 Write-Log INFO "===== $Name v$script:Version run start ($today, forced=$([bool]$Force)) — $runStamp ====="
 Write-Evt 2000 Information "$Name run started ($today) — logs in $script:RunDir"
-Report-CrashedRuns   # surface any earlier run that was killed before it could report anything
+# Never let crash DETECTION be the thing that crashes the run — that would recreate the exact silent
+# failure it exists to report, one day later. Its internals are individually guarded; this is the belt.
+try { Report-CrashedRuns } catch { Write-Log WARN "crashed-run check failed (continuing): $($_.Exception.Message)" }
 
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }

@@ -134,7 +134,7 @@ defaults):
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
 | `winget.excludePattern` | (regex) | skip pinned/self-updating/per-user apps |
 | `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process: upgraded last, with Restart Manager disabled |
-| `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | extra installer args (via `--custom`) for those packages, so the MSI can't terminate SunUp mid-run |
+| `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | extra installer args (via `--custom`) for those packages, so the MSI can't terminate SunUp mid-run — attached only when the installer is `msi`/`wix`/`burn`, since MSIX and `.exe` installers take no MSI properties |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
 

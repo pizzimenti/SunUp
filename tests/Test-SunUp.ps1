@@ -26,7 +26,7 @@ function Write-Evt { param([int]$Id, [string]$Type = 'Information', [string]$Msg
 function Raise-SysSentryAlert { param($Msg) $script:alerts += $Msg }
 $script:Version = 'test'
 
-foreach ($name in 'Test-RunAlive','Report-CrashedRuns') {
+foreach ($name in 'Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -34,6 +34,7 @@ foreach ($name in 'Test-RunAlive','Report-CrashedRuns') {
 
 $RunsDir = Join-Path $PSScriptRoot 'runs'
 if (Test-Path $RunsDir) { Remove-Item $RunsDir -Recurse -Force }
+try {   # everything below is in try/finally so a throwing assertion can't leave tests\runs behind
 # good  = finished normally            dead1/dead2 = killed mid-run
 # empty = dir with no run.log          live        = this process's own run dir
 # peer  = a CONCURRENT run (manual -Force alongside the scheduled task) that is still working
@@ -79,30 +80,62 @@ Write-Host "`n[3] self-hosting partition + --custom tagging"
 $selfPat  = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
 $selfArgs = 'MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress'
 $isSelfHost = { param($Pkg) $selfPat -and ($Pkg.id -match $selfPat -or $Pkg.name -match $selfPat) }
-# the real 2026-07-22 list, minus the excluded VCLibs pair
+# the real 2026-07-22 list (minus the excluded VCLibs pair) plus App Installer, the OTHER half of the
+# default selfHostPattern — and an MSIX, so it must be deferred but must NOT receive MSI properties
 $pending = @(
-  [pscustomobject]@{ name='Google Chrome';   id='Google.Chrome.EXE';    old='150.0.7871.129'; new='150.0.7871.182' }
-  [pscustomobject]@{ name='PowerShell 7-x64'; id='Microsoft.PowerShell'; old='7.6.3.0';        new='7.6.4.0' }
-  [pscustomobject]@{ name='Tailscale';        id='tailscale.tailscale';  old='1.98.9';         new='1.99.0' }
+  [pscustomobject]@{ name='Google Chrome';    id='Google.Chrome.EXE';            old='150.0.7871.129'; new='150.0.7871.182' }
+  [pscustomobject]@{ name='PowerShell 7-x64'; id='Microsoft.PowerShell';         old='7.6.3.0';        new='7.6.4.0' }
+  [pscustomobject]@{ name='App Installer';    id='Microsoft.DesktopAppInstaller'; old='1.29.280.0';    new='1.30.0.0' }
+  [pscustomobject]@{ name='Tailscale';        id='tailscale.tailscale';          old='1.98.9';         new='1.99.0' }
 )
 $deferred = @($pending | Where-Object { & $isSelfHost $_ })
-Check 'PowerShell is detected as self-hosting' ($deferred.Count -eq 1 -and $deferred[0].id -eq 'Microsoft.PowerShell')
+Check 'both self-hosting packages are detected' ($deferred.Count -eq 2) (($deferred | ForEach-Object id) -join ',')
 $pending = @(@($pending | Where-Object { -not (& $isSelfHost $_) }) + $deferred)
-Check 'no package is lost by the partition' ($pending.Count -eq 3)
-Check 'PowerShell is upgraded last' ($pending[-1].id -eq 'Microsoft.PowerShell') (($pending | ForEach-Object id) -join ' -> ')
+Check 'no package is lost by the partition' ($pending.Count -eq 4)
+Check 'self-hosting packages are upgraded last' ((& $isSelfHost $pending[-1]) -and (& $isSelfHost $pending[-2])) (($pending | ForEach-Object id) -join ' -> ')
+Check 'ordinary packages keep their original order' ((($pending[0..1] | ForEach-Object id) -join ',') -eq 'Google.Chrome.EXE,tailscale.tailscale')
+
+# Installer-type gate: MSI properties are only meaningful to Windows Installer packages.
+Check 'msi takes MSI properties'  (Test-MsiPropertiesApply 'msi')
+Check 'wix/burn bundles forward MSI properties' ((Test-MsiPropertiesApply 'wix') -and (Test-MsiPropertiesApply 'burn'))
+Check 'msix does NOT take MSI properties' (-not (Test-MsiPropertiesApply 'msix'))
+Check 'exe/inno/nullsoft do NOT take MSI properties' (-not (Test-MsiPropertiesApply 'exe') -and -not (Test-MsiPropertiesApply 'inno') -and -not (Test-MsiPropertiesApply 'nullsoft'))
+Check 'unknown type does NOT take MSI properties' (-not (Test-MsiPropertiesApply $null) -and -not (Test-MsiPropertiesApply ''))
+
+# Get-WingetInstallerType parses winget show output; a scriptblock stands in for winget.exe.
+$fakeMsi  = { @'
+Found PowerShell [Microsoft.PowerShell]
+Version: 7.6.4.0
+Installer:
+  Installer Type: msi
+  Installer Url: https://example.invalid/PowerShell-7.6.4-win-x64.msi
+'@ }
+$fakeMsix = { "Installer:`n  Installer Type: msix`n  Installer Url: https://example.invalid/app.msixbundle" }
+$fakeDead = { throw 'winget exploded' }
+Check 'installer type parsed from winget show' ((Get-WingetInstallerType $fakeMsi 'Microsoft.PowerShell') -eq 'msi')
+Check 'msix installer type parsed'             ((Get-WingetInstallerType $fakeMsix 'Microsoft.DesktopAppInstaller') -eq 'msix')
+Check 'a failing winget show yields null, not a crash' ($null -eq (Get-WingetInstallerType $fakeDead 'whatever'))
+
+# End-to-end arg decision, using the real gate against each package's real installer type.
+$typeOf = @{ 'Microsoft.PowerShell' = 'msi'; 'Microsoft.DesktopAppInstaller' = 'msix' }
 $argsFor = $pending | ForEach-Object {
-  $extra = @(); if ((& $isSelfHost $_) -and $selfArgs) { $extra = @('--custom', $selfArgs) }
+  $extra = @()
+  if ((& $isSelfHost $_) -and $selfArgs -and (Test-MsiPropertiesApply $typeOf[$_.id])) { $extra = @('--custom', $selfArgs) }
   [pscustomobject]@{ id = $_.id; extra = ($extra -join ' ') }
 }
-Check 'only the self-hosting package gets --custom' (@($argsFor | Where-Object extra).Count -eq 1 -and ($argsFor | Where-Object extra).id -eq 'Microsoft.PowerShell')
-Check 'RM is disabled in those args' (($argsFor | Where-Object extra).extra -match 'MSIRESTARTMANAGERCONTROL=Disable')
-Check 'not --override (would drop winget''s silent defaults)' (($argsFor | Where-Object extra).extra -notmatch '--override')
+$tagged = @($argsFor | Where-Object extra)
+Check 'only the MSI self-hosting package gets --custom' ($tagged.Count -eq 1 -and $tagged[0].id -eq 'Microsoft.PowerShell') (($tagged | ForEach-Object id) -join ',')
+Check 'the MSIX self-hosting package is deferred but NOT given MSI properties' (-not ($argsFor | Where-Object { $_.id -eq 'Microsoft.DesktopAppInstaller' }).extra)
+Check 'RM is disabled in those args' ($tagged[0].extra -match 'MSIRESTARTMANAGERCONTROL=Disable')
+Check 'not --override (would drop winget''s silent defaults)' ($tagged[0].extra -notmatch '--override')
 # Splatting an array into a native command must expand to separate argv entries, with the
 # space-containing value kept as ONE argument (quoted by PowerShell) — otherwise winget would see
 # REBOOT=ReallySuppress as a stray positional and reject the command.
 $echoed = & cmd /c echo @('--custom', $selfArgs)
 Check 'array splat expands to --custom + one quoted value' ($echoed -match '^--custom "MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress"$') $echoed
 
-Remove-Item $RunsDir -Recurse -Force
+} finally {
+  if (Test-Path $RunsDir) { Remove-Item $RunsDir -Recurse -Force -ErrorAction SilentlyContinue }
+}
 Write-Host ""
 if ($fail -eq 0) { Write-Host "ALL TESTS PASSED" -ForegroundColor Green } else { Write-Host "$fail TEST(S) FAILED" -ForegroundColor Red; exit 1 }
