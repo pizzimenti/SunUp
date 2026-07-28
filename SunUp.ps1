@@ -253,8 +253,10 @@ function Report-CrashedRuns {
   $dirs = @(Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -ne $script:RunDir } | Sort-Object Name)
   foreach ($d in $dirs) {
-    if (Test-Path (Join-Path $d.FullName 'result.json')) { continue }   # finished normally
+    $resultPath = Join-Path $d.FullName 'result.json'
+    if (Test-Path $resultPath) { continue }                             # finished normally
     $marker = Join-Path $d.FullName 'incomplete.json'
+    $stale  = $false
     # A marker means one of three things, and they must not be conflated: a COMPLETED report
     # (reported=true — nothing more to do), a report a peer is making RIGHT NOW (recent claim, leave
     # it alone), or an ABANDONED claim from a scanner that was itself killed between claiming and
@@ -270,6 +272,7 @@ function Report-CrashedRuns {
       $ageMin = try { ((Get-Date) - (Get-Item $marker).LastWriteTime).TotalMinutes } catch { 0 }
       if ($ageMin -lt $ClaimStaleMinutes) { continue }                  # a peer is mid-report; let it finish
       Write-Log WARN "re-taking an abandoned crash-report claim on $($d.Name) ($([int]$ageMin)m old, never reported)"
+      $stale = $true
     }
     $rl = Join-Path $d.FullName 'run.log'
     if (-not (Test-Path $rl)) { continue }                              # dir made, nothing logged — nothing to say
@@ -278,13 +281,25 @@ function Report-CrashedRuns {
       continue
     }
     $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
-    # CLAIM the report before making it. Two concurrent runs can both pass the checks above before
-    # either writes the marker, and would then both fire event 2011 and both append to ALERTS.md,
-    # breaking the report-once promise. Creating the file without -Force fails if a peer got there
-    # first, so exactly one scanner reports each dead run. (-Force only when retaking a stale claim,
-    # where the file already exists and its owner is provably gone.)
-    if (Test-Path $marker) { try { $null = New-Item -ItemType File -Path $marker -Force -ErrorAction Stop } catch { continue } }
-    else                   { try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop }        catch { continue } }
+    # CLAIM the report before making it — exclusively, in BOTH paths. Two concurrent scanners can
+    # pass every check above together, and would then each fire event 2011 and each append to
+    # ALERTS.md, breaking the report-once promise.
+    #   * fresh claim  — New-Item without -Force fails if a peer created the marker first;
+    #   * stale retake — RENAME the marker to a per-PID lease. A rename is atomic and consumes its
+    #     source, so of two scanners retaking the same abandoned claim exactly one succeeds and the
+    #     other finds nothing to move. (-Force here only overwrites OUR own leftover lease; it never
+    #     makes the take non-exclusive, because the exclusivity comes from the source disappearing.)
+    $lease = "$marker.claim-$PID"
+    if ($stale) { try { Move-Item -Path $marker -Destination $lease -Force -ErrorAction Stop } catch { continue } }
+    else        { try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop }      catch { continue } }
+    # Final completion check, as late as possible: a live peer may have published result.json and
+    # removed running.json in the window between the checks above and this claim, in which case it
+    # finished normally and there is nothing to report. Put the claim back the way we found it.
+    if (Test-Path $resultPath) {
+      if ($stale) { Move-Item -Path $lease -Destination $marker -Force -ErrorAction SilentlyContinue }
+      else        { Remove-Item $marker -Force -ErrorAction SilentlyContinue }
+      continue
+    }
     $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
     Write-Log WARN $m
     Write-Evt 2011 Warning $m
@@ -294,6 +309,7 @@ function Report-CrashedRuns {
       runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version
       lastLogLine = "$last"; reported = $true
     }) $marker)
+    if ($stale) { Remove-Item $lease -Force -ErrorAction SilentlyContinue }
   }
 }
 

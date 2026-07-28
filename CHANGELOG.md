@@ -80,6 +80,13 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
     report (`reported: true`, never re-emitted), a report a peer is making right now (claim newer
     than 15 min, left alone), or an abandoned claim (older, unreported — retaken and reported, with a
     WARN saying so). At-least-once beats never for a crash notification.
+  - **Retaking a stale claim is exclusive too, and completion is rechecked last.** The retake path
+    used `New-Item -Force`, which two scanners can both win — undoing the exclusivity of the claim it
+    was part of. A retake is now a **rename** of the marker to a per-PID lease: a rename consumes its
+    source, so exactly one scanner can take an abandoned claim. And because a live peer can publish
+    `result.json` and drop `running.json` while a scanner is mid-probe, `result.json` is rechecked
+    once more *after* the claim is taken; if the run finished after all, the claim is put back the way
+    it was found and nothing is reported.
   - **`running.json` is written the same atomic, verified way.** It was still using a plain
     `Set-Content`, which under `$ErrorActionPreference = 'Continue'` could fail without entering the
     `catch` — leaving a live run with no marker, which a peer would then read as crashed. All three

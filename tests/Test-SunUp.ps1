@@ -123,6 +123,26 @@ $script:events = @(); $script:alerts = @()
 Report-CrashedRuns
 Check 'a completed report is never re-emitted, however stale' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
 
+# A run that publishes result.json in the window between the scan and the claim finished normally,
+# and must not be reported. Simulated by having the alert stub publish it mid-flight.
+New-Item -ItemType Directory -Force (Join-Path $RunsDir 'racer') | Out-Null
+'racing run' | Set-Content (Join-Path $RunsDir 'racer\run.log')
+$script:events = @(); $script:alerts = @()
+function Test-RunAlive { param([string]$Dir)   # stub: peer completes during the liveness probe
+  if ($Dir -like '*racer') { '{}' | Set-Content (Join-Path $Dir 'result.json') }
+  $false
+}
+Report-CrashedRuns
+Check 'a peer that completes mid-scan is not reported as crashed' (-not ($script:alerts -match 'racer')) ($script:alerts -join ' | ')
+Check 'and its claim is not left behind' (-not (Test-Path (Join-Path $RunsDir 'racer\incomplete.json')))
+
+# The invariant the stale retake rests on: a rename CONSUMES its source, so of two scanners taking
+# the same abandoned claim exactly one can win — unlike New-Item -Force, which would let both.
+$src = Join-Path $RunsDir 'lease-src'; 'x' | Set-Content $src
+$won = 0
+foreach ($i in 1..2) { try { Move-Item -Path $src -Destination "$src.claim-$i" -Force -ErrorAction Stop; $won++ } catch { } }
+Check 'a rename-based retake can only be won once' ($won -eq 1) "won=$won"
+
 $script:events = @(); $script:alerts = @()
 Report-CrashedRuns
 Check 'second pass is silent (alert fires once)' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
