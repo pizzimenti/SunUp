@@ -25,6 +25,8 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         <component>.log                RAW output of each tool (defender/windowsupdate/
                                        winget/dell-apply/dell-bios-scan/psmodules)
         result.json                    structured per-component result for this run
+        incomplete.json                ONLY if the run was killed before writing result.json —
+                                       written by the NEXT run when it reports the crash (evt 2011)
   Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
 
 Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
@@ -38,7 +40,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.9.0'
+$script:Version = '0.10.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -84,7 +86,15 @@ $DefaultConfig = [ordered]@{
   # refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.), and UWP *framework*
   # packages (VCLibs) that winget can't deploy — they fail 0x8A15005C "extract" every run and are
   # serviced by the Store/dependent apps, not winget, so attempting them is pure noise.
-  winget             = [ordered]@{ enabled = $true; pinIds = @(); excludePattern = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs' }
+  # selfHostPattern: packages that own the process SunUp itself is running in. Upgrading one of these
+  # normally has Windows Installer's Restart Manager terminate the engine mid-run (see selfHostInstallerArgs).
+  # They are upgraded LAST and with RM disabled, so a surprise kill can't also cost the rest of the run.
+  winget             = [ordered]@{
+    enabled = $true; pinIds = @()
+    excludePattern        = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
+    selfHostPattern       = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
+    selfHostInstallerArgs = 'MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress'
+  }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
   dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
@@ -159,6 +169,38 @@ function Flush-Report {
   @('', $header) + $script:Report | Add-Content $ReportFile
   $all = @(Get-Content $ReportFile)
   if ($all.Count -gt 900) { ($all[0..4] + '_…older entries trimmed…_' + $all[-850..-1]) | Set-Content $ReportFile }
+}
+
+# ---- crashed-run detection --------------------------------------------------
+# A run killed mid-flight (its host process terminated, power loss, a hard reset) is otherwise
+# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the SysSentry
+# echo, the summary dialog — lives after the component loop, and lastrun.json is never stamped, so
+# the next run just looks like a normal first-run-of-the-day. The 2026-07-22 run died that way
+# (Restart Manager killed the engine during winget's own PowerShell 7 upgrade) and nothing reported
+# it for five days. A dead run leaves a fingerprint: a run dir with run.log but no result.json.
+# Flag each one ONCE (incomplete.json marks it handled) and name the last thing it logged, so the
+# alert says where it stopped. Only ever inspects OTHER run dirs — never the live one — and the
+# SunUp task is MultipleInstances=IgnoreNew, so a leftover match is always a dead run, never a peer.
+function Report-CrashedRuns {
+  if (-not (Test-Path $RunsDir)) { return }
+  $dirs = @(Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $script:RunDir } | Sort-Object Name)
+  foreach ($d in $dirs) {
+    if (Test-Path (Join-Path $d.FullName 'result.json')) { continue }   # finished normally
+    $marker = Join-Path $d.FullName 'incomplete.json'
+    if (Test-Path $marker) { continue }                                 # already reported
+    $rl = Join-Path $d.FullName 'run.log'
+    if (-not (Test-Path $rl)) { continue }                              # dir made, nothing logged — nothing to say
+    $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
+    $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
+    Write-Log WARN $m
+    Write-Evt 2011 Warning $m
+    Raise-SysSentryAlert $m
+    try {
+      [ordered]@{ runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version; lastLogLine = "$last" } |
+        ConvertTo-Json -Depth 4 | Set-Content $marker
+    } catch { Write-Log WARN "could not mark $($d.Name) incomplete: $_" }
+  }
 }
 
 function Raise-SysSentryAlert { param($Msg)
@@ -369,13 +411,42 @@ function Comp-Winget { param($Cfg)
     return @{ status = 'ok'; detail = "up to date$skipNote" }
   }
 
+  # ---- self-hosting packages: upgrade LAST, with Restart Manager disabled -----
+  # SunUp runs under pwsh, so upgrading Microsoft.PowerShell means the MSI's Restart Manager
+  # enumerates processes holding files under the install target and shuts them down — including the
+  # engine that asked for the install. That is exactly what killed the 2026-07-22 run: RM terminated
+  # pwsh mid-winget, the MSI then failed to restart it ("Application SID does not match Conductor
+  # SID") and rolled back, and the run died before reaching its reboot decision, its summary dialog,
+  # or any alert path. Two mitigations, both needed:
+  #   * order  — these go last, so a surprise kill can't cost the packages that hadn't run yet;
+  #   * args   — MSIRESTARTMANAGERCONTROL=Disable tells Windows Installer not to use RM at all. Files
+  #              in use fall back to PendingFileRename, so the install completes, the engine SURVIVES,
+  #              and the MSI returns 3010 → $rebootCodes → a proper coordinated reboot at end of run.
+  #              REBOOT=ReallySuppress stops the MSI restarting the box behind SunUp's back.
+  # Passed with --custom (appends to winget's defaults) and NOT --override (which would REPLACE
+  # them, dropping the /qn that keeps the install silent).
+  $selfPat  = "$($Cfg.winget.selfHostPattern)"
+  $selfArgs = "$($Cfg.winget.selfHostInstallerArgs)"
+  $isSelfHost = { param($Pkg) $selfPat -and ($Pkg.id -match $selfPat -or $Pkg.name -match $selfPat) }
+  if ($selfPat) {
+    $deferred = @($pending | Where-Object { & $isSelfHost $_ })
+    if ($deferred.Count -gt 0) {
+      $pending = @(@($pending | Where-Object { -not (& $isSelfHost $_) }) + $deferred)
+      $ids = ($deferred | ForEach-Object { $_.id }) -join ', '
+      Write-CompLog 'winget' "--- deferring $($deferred.Count) self-hosting package(s) to the end of the run: $ids ---"
+      Write-Log INFO "winget: deferring $($deferred.Count) self-hosting package(s) to last: $ids"
+    }
+  }
+
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
   $rebootCodes = 3010, 0x8A150077, 0x8A150078, 0x8A150079
   $ok = 0; $fail = 0; $reboot = $false
   foreach ($p in $pending) {
-    Write-CompLog 'winget' "--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---"
+    $extra = @()
+    if ((& $isSelfHost $p) -and $selfArgs) { $extra = @('--custom', $selfArgs) }
+    Write-CompLog 'winget' ("--- upgrading $($p.id) ($($p.old) -> $($p.new)) ---" + $(if ($extra) { " [self-hosting: --custom $selfArgs]" } else { '' }))
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+    $o  = & $winget upgrade --id $p.id -e --include-unknown --silent --accept-package-agreements --accept-source-agreements --disable-interactivity @extra 2>&1
     $sw.Stop(); $code = $LASTEXITCODE
     $txt = $o | Out-String
     Write-CompLog 'winget' $o ; Write-CompLog 'winget' "exit: 0x$($code.ToString('X8')), $([int]$sw.Elapsed.TotalSeconds)s"
@@ -611,6 +682,7 @@ try { Start-Transcript -Path (Join-Path $script:RunDir 'transcript.log') -Force 
 $startUtc = (Get-Date).ToUniversalTime()
 Write-Log INFO "===== $Name v$script:Version run start ($today, forced=$([bool]$Force)) — $runStamp ====="
 Write-Evt 2000 Information "$Name run started ($today) — logs in $script:RunDir"
+Report-CrashedRuns   # surface any earlier run that was killed before it could report anything
 
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }

@@ -2,6 +2,50 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.0] - 2026-07-27
+
+### Fixed — SunUp no longer kills itself while upgrading PowerShell
+- On **2026-07-22** the run died mid-flight and nothing said so for five days. Root cause:
+  winget's `Microsoft.PowerShell 7.6.3 → 7.6.4` upgrade. SunUp runs under `pwsh`, and the MSI's
+  **Restart Manager** enumerates processes holding files under the install target and shuts them
+  down — including the engine that asked for the install. Event log, 14:15:19–14:15:23:
+  `RestartManager 10002 Shutting down application or service 'PowerShell 7'` →
+  `10010 Application 'pwsh.exe' cannot be restarted — Application SID does not match Conductor SID` →
+  `MsiInstaller 11708 Product: PowerShell 7-x64 — Installation failed` (rolled back; the box stayed on
+  7.6.3). The engine was terminated ~200 lines before its reboot decision, so it never rebooted, never
+  showed the dialog, and never wrote `result.json`. The `ifRequired` policy was not at fault — the
+  code that evaluates it never executed. (Collateral: the same sweep killed ProcWatch's engine, which
+  stayed dead until the box was rebooted by hand.)
+- Packages that host the engine's own process are now identified by **`winget.selfHostPattern`**
+  (default `Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller`) and handled two ways:
+  - **Upgraded last**, after every other package — a surprise kill can no longer cost the packages
+    that hadn't been reached yet.
+  - **Installed with Restart Manager disabled**, via `winget --custom` carrying
+    **`MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress`** (`winget.selfHostInstallerArgs`).
+    With RM off, files in use fall back to PendingFileRename: the install completes, the engine
+    **survives**, and the MSI returns `3010`, which SunUp already maps to "reboot required" — so the
+    restart happens where it belongs, in the one coordinated reboot at the end of the run.
+  - `--custom` (appends to winget's defaults), never `--override` (which would *replace* them and
+    drop the `/qn` that keeps the install silent).
+
+### Added — a killed run is no longer silent (event 2011)
+- A run terminated mid-flight produced **no signal whatsoever**: `result.json`, `history.jsonl`,
+  events 2001/2010, the SysSentry echo and the summary dialog are all written *after* the component
+  loop, and `lastrun.json` is never stamped — so the next day's run looked like an ordinary
+  first-run-of-the-day. The only trace of 2026-07-22 was ProcWatch's unrelated stale-heartbeat alert.
+- Each run now scans for the fingerprint of a dead run — a previous run dir with `run.log` but **no**
+  `result.json` — and reports it once with **event 2011** + a SysSentry alert quoting the last line
+  that run logged, so the message says *where* it stopped. `incomplete.json` marks a dir as reported
+  so the alert can't repeat. Only other run dirs are examined, and the task is
+  `MultipleInstances=IgnoreNew`, so a match is always a dead run and never a live peer.
+
+### Added — `tests\Test-SunUp.ps1`
+- First tests in the repo, covering both changes above without performing a real update run: the
+  engine parses; `Report-CrashedRuns` (lifted from source via the PowerShell AST, so the test
+  exercises the shipped code) flags exactly the dead run dirs and exactly once, ignoring finished
+  runs, empty dirs and the live run; the self-hosting partition loses no package, orders PowerShell
+  last, and attaches `--custom` to that package alone. `pwsh -File .\tests\Test-SunUp.ps1`
+
 ## [0.9.0] - 2026-07-08
 
 ### Fixed — winget rows now show a real download size instead of "—"
