@@ -23,10 +23,18 @@ Write-Host "`n[2] Report-CrashedRuns"
 $script:logged = @(); $script:events = @(); $script:alerts = @()
 function Write-Log { param($Level, $Msg) $script:logged += "$Level|$Msg" }
 function Write-Evt { param([int]$Id, [string]$Type = 'Information', [string]$Msg) $script:events += $Id }
-function Raise-SysSentryAlert { param($Msg) $script:alerts += $Msg }
+$script:claimedAtAlert = @()
+function Raise-SysSentryAlert { param($Msg)
+  $script:alerts += $Msg
+  # A report must be CLAIMED (incomplete.json created) before it is emitted, or two concurrent
+  # scanners would both alert on the same dead run. Record what was true at alert time.
+  if ($Msg -match 'Previous run (\S+) never finished') {
+    $script:claimedAtAlert += [bool](Test-Path (Join-Path $RunsDir (Join-Path $Matches[1] 'incomplete.json')))
+  }
+}
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
+foreach ($name in 'New-RunDirectory','Save-RunResult','Test-RunAlive','Report-CrashedRuns','Get-WingetInstallerType','Test-MsiPropertiesApply') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -65,6 +73,17 @@ Check 'later claims are PID-qualified' ((Split-Path $claims[1] -Leaf) -like "${s
 Check 'every claimed dir actually exists' (@($claims | Where-Object { Test-Path $_ }).Count -eq 3)
 $claims | ForEach-Object { Remove-Item $_ -Recurse -Force }
 
+# result.json must only ever appear whole — a truncated one would read as "this run finished".
+$okDir = Join-Path $RunsDir 'save-ok'; New-Item -ItemType Directory -Force $okDir | Out-Null
+$okPath = Join-Path $okDir 'result.json'
+$sample = [ordered]@{ date = '2026-07-27'; components = @(@{ name = 'winget'; status = 'ok' }); updates = @() }
+Check 'Save-RunResult reports success' (Save-RunResult $sample $okPath)
+Check 'the published result parses as JSON' ((Get-Content $okPath -Raw | ConvertFrom-Json).components[0].name -eq 'winget')
+Check 'no .tmp file is left behind' (-not (Test-Path "$okPath.tmp"))
+$badPath = Join-Path $RunsDir 'no-such-dir\deeper\result.json'
+Check 'an unwritable destination returns false' (-not (Save-RunResult $sample $badPath))
+Check 'and leaves no result.json behind' (-not (Test-Path $badPath))
+
 Check 'a live peer is detected as alive' (Test-RunAlive (Join-Path $RunsDir 'peer'))
 Check 'a recycled PID is NOT mistaken for alive' (-not (Test-RunAlive (Join-Path $RunsDir 'stale')))
 Check 'a dir with no marker is not alive' (-not (Test-RunAlive (Join-Path $RunsDir 'dead1')))
@@ -80,6 +99,14 @@ Check 'ignores the run dir with no run.log' (-not ($script:alerts -match 'empty'
 Check 'never flags the live run dir' (-not ($script:alerts -match 'live'))
 Check 'quotes the last line the dead run logged' ($script:alerts[0] -match 'winget: starting') $script:alerts[0]
 Check 'writes incomplete.json markers' ((Test-Path (Join-Path $RunsDir 'dead1\incomplete.json')) -and (Test-Path (Join-Path $RunsDir 'dead2\incomplete.json')))
+Check 'each report is claimed BEFORE it is emitted' ($script:claimedAtAlert.Count -eq 3 -and -not ($script:claimedAtAlert -contains $false)) ($script:claimedAtAlert -join ',')
+# A dead run already claimed by a peer scanner must silence this one entirely.
+New-Item -ItemType Directory -Force (Join-Path $RunsDir 'claimed') | Out-Null
+'peer-claimed run' | Set-Content (Join-Path $RunsDir 'claimed\run.log')
+New-Item -ItemType File -Force (Join-Path $RunsDir 'claimed\incomplete.json') | Out-Null
+$script:events = @(); $script:alerts = @()
+Report-CrashedRuns
+Check 'a dead run already claimed by a peer is not re-reported' ($script:events.Count -eq 0 -and $script:alerts.Count -eq 0)
 
 $script:events = @(); $script:alerts = @()
 Report-CrashedRuns

@@ -65,6 +65,15 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
     deleted regardless — leaving a run with neither file, which a peer could read as a crash or the
     next run could read as a completed run that was killed. The write is now terminating and
     verified; if it fails the marker stays and the run is reported unfinished, which is the truth.
+  - **`result.json` is published atomically.** `Set-Content` truncates the destination first, so a
+    kill or I/O error partway through left a truncated file that still satisfied "result.json
+    exists" — and the crash check would read that interrupted run as a normal finish. `Save-RunResult`
+    serializes and **parse-verifies** into a temp file, then renames it over the destination: a run
+    is declared complete only by a file that was already whole.
+  - **A crash report is claimed before it is emitted.** Two concurrent runs could both pass the
+    "no `incomplete.json`" check before either wrote one, and both would fire event 2011 and append
+    to `ALERTS.md`. The marker is now created first (`New-Item` without `-Force`, so a peer that got
+    there first makes this scanner skip the dir), and only the winner reports.
 
 ### Added — `tests\Test-SunUp.ps1`
 - First tests in the repo, covering both changes above without performing a real update run: the

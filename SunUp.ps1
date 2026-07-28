@@ -197,6 +197,25 @@ function Flush-Report {
 # would never be reported. So claim the dir by CREATING it: New-Item without -Force fails when it
 # already exists, which makes the claim atomic against a peer racing us, and we fall back to a
 # PID-qualified name (unique by definition) and then to a counter.
+# Publish result.json ATOMICALLY. Set-Content creates/truncates the destination first, so a kill or
+# I/O error partway through would leave a truncated file that still satisfies "result.json exists" —
+# and Report-CrashedRuns would read that interrupted run as a normal finish and never report it.
+# Serialize and PARSE-VERIFY into a temp file, then rename over the destination: the run is declared
+# complete only by a file that was already whole. Returns $true only if the destination now exists.
+function Save-RunResult { param($Result, [string]$Path)
+  $tmp = "$Path.tmp"
+  try {
+    ($Result | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -ErrorAction Stop
+    $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json    # prove it is complete and parseable
+    Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
+    return (Test-Path $Path)
+  } catch {
+    Write-Log ERROR "could not write result.json: $($_.Exception.Message)"
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $false
+  }
+}
+
 function New-RunDirectory { param([string]$Base, [string]$Root)
   if (-not $Root) { $Root = $RunsDir }
   New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -241,14 +260,19 @@ function Report-CrashedRuns {
       continue
     }
     $last = try { @(Get-Content $rl -Tail 1 -ErrorAction Stop)[0] } catch { $null }
-    $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
-    Write-Log WARN $m
-    Write-Evt 2011 Warning $m
-    Raise-SysSentryAlert $m
+    # CLAIM the report before making it. Two concurrent runs can both pass the Test-Path above before
+    # either writes the marker, and would then both fire event 2011 and both append to ALERTS.md,
+    # breaking the report-once promise. Creating the file without -Force fails if a peer got there
+    # first, so exactly one scanner reports each dead run.
+    try { $null = New-Item -ItemType File -Path $marker -ErrorAction Stop } catch { continue }
     try {
       [ordered]@{ runStamp = $d.Name; detectedLocal = (Get-Date).ToString('o'); detectedByVersion = $script:Version; lastLogLine = "$last" } |
         ConvertTo-Json -Depth 4 | Set-Content $marker
     } catch { Write-Log WARN "could not mark $($d.Name) incomplete: $_" }
+    $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
+    Write-Log WARN $m
+    Write-Evt 2011 Warning $m
+    Raise-SysSentryAlert $m
   }
 }
 
@@ -863,12 +887,8 @@ elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
 # marker anyway would leave a run with neither file: a peer could then declare this live run crashed,
 # or the next run could call a completed run killed. If the write fails the marker stays, and the run
 # is reported as never-finished — which is the truth: its result was never persisted.
-$resultPath = Join-Path $script:RunDir 'result.json'
-$resultWritten = $false
-try {
-  $result | ConvertTo-Json -Depth 8 | Set-Content $resultPath -ErrorAction Stop
-  $resultWritten = Test-Path $resultPath
-} catch { Write-Log ERROR "could not write result.json: $($_.Exception.Message)" }
+$resultPath    = Join-Path $script:RunDir 'result.json'
+$resultWritten = Save-RunResult $result $resultPath
 if (-not $resultWritten) { Write-Log WARN "result.json missing — keeping running.json so this run is reported as unfinished." }
 elseif ($script:RunMarker)   { Remove-Item $script:RunMarker -Force -ErrorAction SilentlyContinue }
 $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
