@@ -5,6 +5,7 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
 ## [0.10.1] - 2026-07-27
 
 ### Fixed — the v0.10.0 installer-type gate would have disabled the fix on the one package it exists for
+
 - Caught by live data minutes after v0.10.0 was tagged, while checking whether PowerShell 7.6.4 would
   now install by itself. `Get-WingetInstallerType` read the **default** installer out of
   `winget show`, and for `Microsoft.PowerShell` that answer is **`msix`** — so the gate would have

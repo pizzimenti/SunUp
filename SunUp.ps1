@@ -519,7 +519,12 @@ function Test-WingetHasMsiInstaller { param($Winget, [string]$Id)
     try {
       $out = & $Winget show --id $Id -e --installer-type $t --accept-source-agreements 2>&1 | Out-String
       if ($out -match '(?im)^\s*Installer Type:\s*(wix|msi|burn)\s*$') { return $true }
-    } catch { }
+    } catch {
+      # A non-match above already means "no such installer" without throwing, so reaching here means
+      # the PROBE failed (winget unreachable, bad path, timeout) — a different fact entirely, and one
+      # that must not masquerade in the log as "this package has no MSI installer".
+      Write-Log WARN "winget show --installer-type $t probe failed for ${Id}: $($_.Exception.Message)"
+    }
   }
   $false
 }
