@@ -291,6 +291,25 @@ Check 'the engine passes no --custom installer args any more' ($engineCode -notm
 Check 'the engine registers the one-shot handoff task' ($engineText -match 'Register-ScheduledTask -TaskName \$SelfHostTask')
 Check 'the handoff is skipped when a reboot is imminent' ($engineText -match 'if \(\$willReboot\)[\s\S]{0,200}NOT starting')
 
+Write-Host "`n[6] the update-collapse block must not clobber `$Name"
+# REGRESSION: the block assigned $name for a row label. PowerShell variable names are
+# case-insensitive and the block runs at SCRIPT scope, so it overwrote the global $Name = 'SunUp'
+# with the last collapsed update's product name. Real runs logged "===== Google Chrome run end ====="
+# (2026-07-18) and raised event 2001 as "Tailscale run ... clean" (2026-07-28). It only triggered
+# with 2+ updates in a run, which made it look intermittent. Lift the real block and run it.
+$srcText = Get-Content $src -Raw
+$m = [regex]::Match($srcText, '(?ms)^# ---- collapse exact-duplicate update rows.*?(?=^# ---- structured result)')
+Check 'the collapse block was found in source' $m.Success
+$Name = 'SunUp'
+$script:Updates = [System.Collections.Generic.List[object]]::new()
+$script:Updates.Add([ordered]@{ name='Tailscale';    source='winget'; old='1.98.9'; new='1.99.0';  durationSec=3; sizeMB=10 })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
+Invoke-Expression $m.Value
+Check '$Name survives the collapse block' ($Name -eq 'SunUp') "got '$Name'"
+Check 'duplicate rows still collapse' ($script:Updates.Count -eq 2) "$($script:Updates.Count) rows"
+Check 'and the collapsed row is annotated' (($script:Updates | ForEach-Object { $_.name }) -join ',' -match ([char]0x00D7)) (($script:Updates | ForEach-Object { $_.name }) -join ',')
+
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
   # unwound straight past the counter to the summary, which then printed ALL TESTS PASSED -- while

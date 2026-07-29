@@ -992,9 +992,14 @@ if ($script:Updates.Count -gt 1) {
   foreach ($key in $order) {
     $grp   = $groups[$key]
     $first = $grp[0]
-    $name  = if ($grp.Count -gt 1) { "$($first.name) $([char]0x00D7)$($grp.Count)" } else { "$($first.name)" }
+    # NOT $name: PowerShell variable names are CASE-INSENSITIVE, and this block runs at SCRIPT
+    # scope, so `$name` here is the same variable as the global $Name = 'SunUp' set at the top.
+    # It silently renamed the product to the last collapsed update, which is why runs logged
+    # "===== Google Chrome run end =====" (2026-07-18) and "Tailscale run ... clean" (2026-07-28)
+    # in the event log. Only bit when a run had 2+ updates, so it looked random.
+    $rowName = if ($grp.Count -gt 1) { "$($first.name) $([char]0x00D7)$($grp.Count)" } else { "$($first.name)" }
     $dur   = ($grp | ForEach-Object { $_.durationSec } | Where-Object { $_ -ne $null } | Measure-Object -Maximum).Maximum
-    $deduped.Add([ordered]@{ name=$name; source=$first.source; old=$first.old; new=$first.new; durationSec=$dur; sizeMB=$first.sizeMB })
+    $deduped.Add([ordered]@{ name=$rowName; source=$first.source; old=$first.old; new=$first.new; durationSec=$dur; sizeMB=$first.sizeMB })
   }
   $script:Updates = $deduped
 }
