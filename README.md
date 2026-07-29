@@ -132,12 +132,34 @@ defaults):
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |
 | `notify.historyMaxRows` | `500` | cap on history rows |
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
-| `winget.excludePattern` | (regex) | skip pinned/self-updating/per-user apps |
+| `winget.excludePattern` | (regex) | skip pinned/self-updating apps — applied to **both** the machine and user passes |
+| `winget.userScope` | `true` | also upgrade per-user (HKCU) packages via `SunUp-User` (see below) |
 | `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process. The engine does **not** upgrade these — it hands them to `SelfHost.ps1` (see below) |
 | `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | **unused since v0.12.0**, retained so existing configs load. Passing this via `--custom` did not stop Restart Manager (measured 2026-07-28) |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
 | `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted |
+
+### Per-user packages (`SunUp-User`)
+
+winget resolves installed packages **per user**. The engine runs as SYSTEM, so anything registered
+under **HKCU is invisible to it** — not skipped, simply absent from `winget upgrade`. On this box
+the two lists were disjoint, and six user-scope tools (Deno, yt-dlp FFmpeg, fzf, ripgrep, Rufus,
+Sysinternals) matched nothing in `excludePattern` — they had never been updated by SunUp at all.
+
+`UserScope.ps1` runs as the interactive user via the **`SunUp-User`** task (same principal as the
+notify and tray tasks), started by the engine at the end of a run. It **shares the engine's
+`excludePattern` and `selfHostPattern`**, so there is one policy in one place: apps excluded
+because they self-update (Claude, Spotify, Discord, Slack, Teams, LM Studio) stay excluded, and
+self-hosting packages remain the SYSTEM handoff's job.
+
+- Requires a logged-on user; a headless run defers to the next run that has a session.
+- Results in `user-winget.log` / `user-winget.json` in the run dir; events 2030/2031.
+- Never reboots — the engine owns that decision.
+- **Limitation:** the dialog payload is written before this runs, so packages upgraded here appear
+  in the next run's history rather than that run's dialog.
+
+Set `winget.userScope: false` to turn the pass off.
 
 ### Upgrading PowerShell itself
 
