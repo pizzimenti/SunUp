@@ -310,6 +310,54 @@ Check '$Name survives the collapse block' ($Name -eq 'SunUp') "got '$Name'"
 Check 'duplicate rows still collapse' ($script:Updates.Count -eq 2) "$($script:Updates.Count) rows"
 Check 'and the collapsed row is annotated' (($script:Updates | ForEach-Object { $_.name }) -join ',' -match ([char]0x00D7)) (($script:Updates | ForEach-Object { $_.name }) -join ',')
 
+Write-Host "`n[7] user-scope pass (v0.13.0)"
+$userSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'UserScope.ps1'
+Check 'UserScope.ps1 exists' (Test-Path $userSrc)
+$userText = Get-Content $userSrc -Raw
+$uast = [System.Management.Automation.Language.Parser]::ParseFile($userSrc, [ref]$null, [ref]$null)
+$pu = $uast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Parse-Upgrades' }, $true)
+Check 'Parse-Upgrades found in source' ($null -ne $pu)
+Invoke-Expression $pu.Extent.Text
+
+# The REAL user-scope output measured on caldera 2026-07-28 - the list SYSTEM could not see.
+$realUserList = @(
+  'Name               Id                           Version                       Available'
+  '-----------------------------------------------------------------------------------------------------------'
+  'Deno               DenoLand.Deno                2.9.2                         2.9.4'
+  'FFmpeg for yt-dlp  yt-dlp.FFmpeg                N-124716-g054dffd133-20260531 N-125365-g9a01c1cb6a-20260630'
+  'fzf                junegunn.fzf                 0.73.1                        0.74.1'
+  'LM Studio 0.4.16+2 ElementLabs.LMStudio         0.4.16+2                      0.4.20+1'
+  'RipGrep MSVC       BurntSushi.ripgrep.MSVC      15.1.0                        15.2.0'
+  'Rufus              Rufus.Rufus                  4.14                          4.15'
+  'Sysinternals Suite Microsoft.Sysinternals.Suite 2026-06-17                    2026-07-09'
+  '7 upgrades available.'
+)
+$parsed = @(Parse-Upgrades $realUserList)
+Check 'parses every row, dropping header/rule/footer' ($parsed.Count -eq 7) "$($parsed.Count) rows"
+Check 'ids are read from the right column' ((($parsed | ForEach-Object { $_.id }) -join ',') -eq 'DenoLand.Deno,yt-dlp.FFmpeg,junegunn.fzf,ElementLabs.LMStudio,BurntSushi.ripgrep.MSVC,Rufus.Rufus,Microsoft.Sysinternals.Suite')
+Check 'a version containing dashes survives' ((@($parsed | Where-Object { $_.id -eq 'yt-dlp.FFmpeg' }).new) -eq 'N-125365-g9a01c1cb6a-20260630')
+
+# THE POLICY CONTRACT: excludePattern is SHARED with the engine, so an app excluded there is
+# excluded here. LM Studio must be skipped; the six that match nothing must all go through.
+$exclReal = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
+$selfReal = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
+$uPending = @($parsed | Where-Object {
+  -not ($_.name -match $exclReal -or $_.id -match $exclReal) -and
+  -not ($_.name -match $selfReal -or $_.id -match $selfReal) })
+$uSkipped = @($parsed | Where-Object { $_.name -match $exclReal -or $_.id -match $exclReal })
+Check 'LM Studio is still excluded in user scope' ((($uSkipped | ForEach-Object { $_.id }) -join ',') -eq 'ElementLabs.LMStudio')
+Check 'the six scope-only packages all pass the filter' ($uPending.Count -eq 6) (($uPending | ForEach-Object { $_.id }) -join ',')
+Check 'ripgrep specifically is now covered' ((($uPending | ForEach-Object { $_.id }) -contains 'BurntSushi.ripgrep.MSVC'))
+# Microsoft.Sysinternals.Suite starts with "Microsoft." - it must NOT be caught by selfHostPattern.
+Check 'Sysinternals is not mistaken for a self-hosting package' ((($uPending | ForEach-Object { $_.id }) -contains 'Microsoft.Sysinternals.Suite'))
+
+Check 'the user pass never reboots the box' ($userText -notmatch 'shutdown\.exe|Restart-Computer')
+Check 'the user pass reads excludePattern from the shared config' ($userText -match 'cfg\.winget\.excludePattern')
+Check 'a failed upgrade LIST is not reported as up to date' ($userText -match 'list failed' -and $userText -match '\$listCode -ne 0')
+$engineText2 = Get-Content $src -Raw
+Check 'the engine starts the user task only when interactive' ($engineText2 -match 'if \(\$interactive\)[\s\S]{0,160}Start-ScheduledTask -TaskName \$UserTask')
+Check 'and says so when there is no session' ($engineText2 -match 'no interactive session')
+
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
   # unwound straight past the counter to the summary, which then printed ALL TESTS PASSED -- while

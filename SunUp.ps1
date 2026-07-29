@@ -29,6 +29,9 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
                                        flight; deleted once result.json is written
         incomplete.json                ONLY if the run was killed before writing result.json —
                                        written by the NEXT run when it reports the crash (evt 2011)
+        user-winget.log/.json          ONLY if the per-user pass ran — written AFTER this run ends,
+                                       by UserScope.ps1 as the interactive user (SYSTEM cannot see
+                                       HKCU-registered packages at all)
         selfhost.log / selfhost.json   ONLY if self-hosting packages (PowerShell, winget itself)
                                        were upgraded — written AFTER this run ends, by SelfHost.ps1
                                        under Windows PowerShell 5.1; see its header for why
@@ -45,7 +48,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.12.0'
+$script:Version = '0.13.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -53,6 +56,7 @@ $Name          = 'SunUp'
 $TaskName      = $Name                 # SYSTEM engine task
 $NotifyTask    = "$Name-Notify"        # interactive dialog task
 $SelfHostTask  = "$Name-SelfHost"      # one-shot task for packages that own the engine's own runtime
+$UserTask      = "$Name-User"          # interactive task for per-user (HKCU) packages SYSTEM can't see
 $Root          = "C:\ProgramData\$Name"
 $LogDir        = Join-Path $Root 'logs'
 $LogFile       = Join-Path $LogDir ("{0}.log" -f $Name.ToLower())
@@ -100,8 +104,10 @@ $DefaultConfig = [ordered]@{
   # selfHostInstallerArgs is RETAINED but UNUSED: v0.11.0 passed it via winget's --custom to disable
   # Restart Manager and it demonstrably did not work (2026-07-28: RM ran and killed the engine
   # anyway). Kept only so an existing config.json carrying it still loads.
+  # userScope: run the per-user (HKCU) pass via SunUp-User. SHARES excludePattern with this pass on
+  # purpose — one policy, one place to change it. Set false to run machine scope only.
   winget             = [ordered]@{
-    enabled = $true; pinIds = @()
+    enabled = $true; pinIds = @(); userScope = $true
     excludePattern        = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
     selfHostPattern       = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
     selfHostInstallerArgs = 'MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress'
@@ -1146,6 +1152,22 @@ else { Write-Log INFO 'No reboot required.' }
 if ($notifyEnabled -and $interactive) {
   try { Start-ScheduledTask -TaskName $NotifyTask -ErrorAction Stop; Write-Log INFO "Launched $NotifyTask dialog." }
   catch { Write-Log WARN "could not start ${NotifyTask}: $_" }
+}
+
+# ---- user-scope winget pass --------------------------------------------------
+# winget resolves installed packages PER USER, so HKCU-registered packages are invisible to this
+# SYSTEM process entirely. Hand them to SunUp-User, which runs as the interactive user and shares
+# this run's excludePattern. Requires a logged-on user (an Interactive task cannot run without a
+# session), so a headless run simply leaves them for the next run that has one.
+if ($cfg.winget.enabled) {
+  if ($interactive) {
+    try {
+      Start-ScheduledTask -TaskName $UserTask -ErrorAction Stop
+      Write-Log INFO "user-scope: started $UserTask (per-user winget packages SYSTEM cannot see)."
+    } catch { Write-Log WARN "user-scope: could not start ${UserTask}: $_" }
+  } else {
+    Write-Log INFO "user-scope: no interactive session — skipping $UserTask this run (per-user packages need a logged-on user)."
+  }
 }
 
 Write-Log INFO "===== $Name run end ($runStamp) ====="
