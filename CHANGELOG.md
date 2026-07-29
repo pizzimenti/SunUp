@@ -46,7 +46,20 @@ All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](h
   behaviours are pinned by tests.
 - **Test harness fix:** a terminating error inside a check's *condition* (an invalid regex) unwound
   past the failure counter to the summary, which printed `ALL TESTS PASSED` while the remaining
-  checks never ran. Unhandled errors now count as failures and say so. Suite is 79 checks.
+  checks never ran. Unhandled errors now count as failures and say so.
+
+### Fixed — the update-collapse block silently renamed the product
+
+- The duplicate-row collapse assigned `$name` for a row label. PowerShell variable names are
+  **case-insensitive**, and that block runs at **script scope**, so it overwrote the global
+  `$Name = 'SunUp'` with the last collapsed update's product name.
+- Every `$Name` use after that point was wrong: real runs logged
+  `===== Google Chrome run end =====` (2026-07-18) and raised event 2001 as
+  `Tailscale run 2026-07-28_231314 clean: ...` (2026-07-28). It only triggered on runs with 2+
+  updates, so it read as random corruption rather than a variable collision.
+- Renamed to `$rowName`. Pinned by a test that lifts the real block out of the source, runs it, and
+  asserts `$Name` survives — verified by mutation (reintroducing `$name` fails the test).
+- Suite is 83 checks.
 
 ## [0.11.0] - 2026-07-27
 
