@@ -89,8 +89,18 @@ alert naming the last line it logged) and marks it with `incomplete.json`. A run
 looks the same from outside, so each run drops a `running.json` liveness marker (PID + process start
 time) while it works: a concurrent manual `-Force` run is recognised as alive and left alone.
 
+The two detached passes (`SunUp-User`, `SunUp-SelfHost`) finish after the engine has exited, so they
+write their own records into that run's dir — `user-winget.json`, `selfhost.json`,
+`user-selfhost.json` — and the **next** run folds them into its `updates[]`, dialog, history and
+reboot decision, exactly once (marked `ingested`).
+
+`C:\SunUp\dcu` holds the Dell scan report. It is not under `C:\ProgramData` because `dcu-cli`
+refuses to write reports into reserved folders — `C:\ProgramData`, `C:\Windows\Temp` and
+`C:\Users\Public` all make it exit 107 without scanning. `-Purge` removes it.
+
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
-2005 reboot, 2006 stale-reboot-pending, 2010 errors, 2011 previous run killed mid-run).
+2002 completed with warnings, 2005 reboot, 2006 stale-reboot-pending, 2010 errors, 2011 previous run
+killed mid-run, 2020/2021 self-host handoff, 2030/2031 user-scope pass).
 
 ## Install / uninstall
 
@@ -138,7 +148,7 @@ defaults):
 | `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | **unused since v0.12.0**, retained so existing configs load. Passing this via `--custom` did not stop Restart Manager (measured 2026-07-28) |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
-| `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted |
+| `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted. Categories are mapped onto dcu-cli's own vocabulary (`audio,video,network,storage,input,chipset,others`) first; the report's free text (`Application`, `Serial ATA`, …) is not a valid value and gets the whole apply rejected. If the scan report is missing or unparseable the apply is **skipped entirely**, since the exclusion cannot be enforced without it |
 
 ### Per-user packages (`SunUp-User`)
 
@@ -150,14 +160,18 @@ Sysinternals) matched nothing in `excludePattern` — they had never been update
 `UserScope.ps1` runs as the interactive user via the **`SunUp-User`** task (same principal as the
 notify and tray tasks), started by the engine at the end of a run. It **shares the engine's
 `excludePattern` and `selfHostPattern`**, so there is one policy in one place: apps excluded
-because they self-update (Claude, Spotify, Discord, Slack, Teams, LM Studio) stay excluded, and
-self-hosting packages remain the SYSTEM handoff's job.
+because they self-update (Claude, Spotify, Discord, Slack, Teams, LM Studio) stay excluded.
 
-- Requires a logged-on user; a headless run defers to the next run that has a session.
+- Requires a logged-on user; a headless run defers to the next run that has a session. Skipped too
+  when the run is going to reboot — the pass outlives a 300 s countdown, and restarting on top of a
+  live `winget upgrade` leaves a package half-installed.
+- Self-hosting packages found **here** cannot go to the SYSTEM handoff — they are HKCU-registered,
+  which is exactly what SYSTEM cannot see. The pass launches `SelfHost.ps1` itself (Windows
+  PowerShell 5.1, as this user, after the pass exits) and records them in `user-selfhost.json`.
 - Results in `user-winget.log` / `user-winget.json` in the run dir; events 2030/2031.
-- Never reboots — the engine owns that decision.
+- Never reboots — the engine owns that decision, and acts on a reboot recorded here at the next run.
 - **Limitation:** the dialog payload is written before this runs, so packages upgraded here appear
-  in the next run's history rather than that run's dialog.
+  in the next run's dialog and history rather than that run's dialog.
 
 Set `winget.userScope: false` to turn the pass off.
 
@@ -175,11 +189,17 @@ winget's `--custom`) **did not work** — RM ran anyway. So the engine no longer
 - `Comp-Winget` splits out packages matching `winget.selfHostPattern` and upgrades everything else.
 - As its last act, the engine registers and starts the one-shot **`SunUp-SelfHost`** task, which
   runs `SelfHost.ps1` under **Windows PowerShell 5.1** — a separate installation RM cannot reach.
-- The helper waits for the engine's PID to exit, then upgrades. The run is already complete, so a
-  kill costs nothing. Results land in `selfhost.log` / `selfhost.json` in the run dir. The task
-  self-deletes.
-- If a reboot is already imminent the handoff is skipped (it would race the shutdown) and the
-  packages are picked up next run.
+- The helper waits for the engine's PID to exit — and for the `SunUp-User` task to go idle, since
+  that pass runs under pwsh 7 and would otherwise be killed mid-upgrade — then upgrades. The run is
+  already complete, so a kill costs nothing. Results land in `selfhost.log` / `selfhost.json` in the
+  run dir, and the **next run folds them into its own `updates[]`, dialog, history and reboot
+  decision**. The task self-deletes.
+- A *headless* reboot skips the handoff (it would race the shutdown). An interactive countdown is
+  cancellable, so the helper is started anyway and sits it out first: postponing no longer costs a
+  day for a reboot that never happened.
+- The engine confirms the task actually entered `Running` before reporting a handoff —
+  `Start-ScheduledTask` returns success without running anything when an `IgnoreNew` instance is
+  already active.
 
 **Your open `pwsh` terminals will still be killed** when PowerShell 7 upgrades. That is Restart
 Manager; nothing short of a reboot-time install avoids it.

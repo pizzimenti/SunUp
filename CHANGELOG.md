@@ -2,6 +2,145 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.13.1] - 2026-08-02
+
+### Fixed — the Dell update path had been dead for four days, reporting clean
+
+- **`dcu-cli` refuses to write its scan report into a reserved folder, and `C:\ProgramData` is one.**
+  Every run since 2026-07-29 logged `The path provided for option '-report' is a reserved folder
+  that may not be used.` / `return code: 107` and applied **nothing** — while `dell` reported `warn`,
+  which `$errors` (status `-eq 'error'`) does not count, so the run raised event 2001 "clean" and
+  exited 0. Measured this time: `C:\ProgramData\…`, `C:\Windows\Temp\…` and `C:\Users\Public\…` all
+  return 107; `C:\SunUp\dcu` returns 0 with a real report. The scan now stages there (locked to
+  SYSTEM + Administrators on every run, since the drive root lets anyone create folders) and the
+  report is copied into the run dir for the record.
+- An unusable scan is now status **`error`**, not `warn` — it blocks every Dell update, so it must
+  reach event 2010 and SysSentry instead of reading as a clean run.
+- **`-updateDeviceCategory` was being fed values dcu-cli does not accept.** It takes exactly
+  `(audio,video,network,storage,input,chipset,others)`; the scan report is free text, and the real
+  report on caldera says `<category>Application</category>`. Dell also ships categories containing
+  commas and spaces ("Mouse, Keyboard & Input Devices", "Serial ATA"), which `-join ','` split into
+  extra bogus tokens. dcu-cli rejects the whole command for an unknown value: the apply exits
+  non-zero having installed nothing, for as long as a pinned update keeps the exclusion path alive.
+  New `ConvertTo-DcuCategory` maps report text onto dcu's own vocabulary (`Application` → `others`,
+  `Serial ATA` → `storage`, …) and the apply refuses to run if a token ever escapes that mapping.
+- **The fail-closed guard did not check the parse.** `Parse-DcuReport` swallowed every XML error into
+  `return @()`, which is indistinguishable from "nothing to exclude" — so a truncated, locked or
+  schema-changed report produced no exclusions, no category restriction, and an **unrestricted**
+  `/applyUpdates` over the pinned GTX 1060. It now returns `$null` for "unreadable" and an empty
+  array for "empty", and the caller fails closed on the difference.
+- A Dell run where updates are deferred **only** as collateral (or where the split failed closed on
+  an uncategorized exclusion) returned `ok`. Every driver/firmware update on the box can be blocked
+  that way, indefinitely; it is now `warn` with the reason. A run with warnings raises new event
+  **2002** instead of 2001 "clean".
+
+### Fixed — handoffs that reported success without doing anything
+
+- **`SelfHost.ps1` resolved `winget.exe` once and kept using it while upgrading
+  `Microsoft.DesktopAppInstaller`** — the package that owns the versioned `WindowsApps` folder that
+  path points into. The next iteration's launch raised `CommandNotFoundException`, which `2>&1` does
+  **not** capture, leaving `$LASTEXITCODE` at the previous package's `0`: `Microsoft.PowerShell
+  upgraded (exit 0x00000000)`, `ok=2/failed=0`, event 2020 — for a package winget never saw, every
+  run, forever. It now re-resolves per package, catches the launch failure, and records
+  `(not launched)` rather than a success.
+- **The retry gate lost two of its three markers.** Dropping `--custom REBOOT=ReallySuppress` and
+  retrying is only safe when winget rejected the *argument*; gating on `Starting package install`
+  alone meant a failure mid-**download** was retried without the suppression, leaving the PowerShell
+  MSI free to restart the box unannounced under `/qn`. `Test-InstallStarted` restores the
+  `Downloading …` / `Successfully verified installer hash` checks the deleted
+  `Test-WingetArgsRejected` had, with the tests that went with them.
+- **`Start-ScheduledTask` on an `IgnoreNew` task silently no-ops when an instance is already
+  running**, and the engine logged "started …" plus event 2020 on that call regardless. New
+  `Start-TaskVerified` refuses to start over a live instance and confirms the task really entered
+  Running before anything is claimed; a no-op is reported as `did NOT start`.
+- **`UserScope.ps1` dropped HKCU-registered self-hosting packages and logged them as "left to the
+  SYSTEM handoff"** — a handoff that cannot see HKCU packages at all, which is the entire premise of
+  that script. Nobody upgraded them, ever. It now launches the same helper itself: Windows
+  PowerShell 5.1 (outside Restart Manager's blast radius), as the interactive user (so HKCU is
+  visible), waiting for the pass to exit, writing `user-selfhost.json`.
+
+### Fixed — records and reboots the engine threw away
+
+- **Nothing read `selfhost.json` / `user-winget.json`.** Self-hosting packages leave `$pending`
+  before the upgrade loop, which deleted their `Add-Update` call, so a successful PowerShell 7
+  upgrade never appeared in `updates[]`, the dialog or the history — and a failing one left the run
+  reporting `winget = ok`. A winget "restart required" exit code was lost outright: the engine had
+  already made its reboot decision, and such a reboot sets no OS pending flag for the stale-reboot
+  watchdog to find either. New `Import-DetachedResults` folds the previous run's records in (once,
+  marked `ingested`, newest three run dirs) **before** the reboot decision, as a `handoff` component.
+- **The user-scope pass had no `$willReboot` guard** — the guard its sibling handoff has had all
+  along. With a 300 s countdown on screen and a pass that routinely runs longer, the box restarted on
+  top of a live `winget upgrade`. It is now skipped when a reboot is due, and `winget.userScope`
+  is finally honoured by the engine (it only ever checked `winget.enabled`).
+- **The self-host handoff skipped itself on `$willReboot` alone**, but with a user logged in that
+  only means the dialog offers a *cancellable* countdown: every Postpone cost a day, for a reboot
+  that never happened. It now skips only the headless case and otherwise passes `-InitialDelaySec`
+  so the helper sits out the countdown and proceeds if the box is still up.
+- **The engine started `SunUp-User` (pwsh 7) seconds before handing PowerShell 7 to the upgrade
+  helper.** Restart Manager shuts down 'PowerShell 7' and killed that pass mid-`winget upgrade` — no
+  `user-winget.json`, no event, no alert. The helper now also waits for the `SunUp-User` task to go
+  idle (`-WaitForTask`), and a machine-wide `Global\SunUp-Winget` mutex serializes the two helpers
+  so they cannot collide with "Another installation is already in progress".
+
+### Fixed — uninstall
+
+- The process-kill loop matched only `SunUp-Tray.ps1` under `pwsh.exe`, so a detached
+  `SelfHost.ps1` (Windows PowerShell **5.1**) went on upgrading PowerShell 7 minutes after the admin
+  was told SunUp was removed, and `UserScope.ps1` kept upgrading against a deleted config dir.
+  Uninstall now stops both hosts by script name, `Stop-ScheduledTask`s each task before
+  unregistering it (unregistering does not stop a running instance), and `-Purge` also removes the
+  `C:\SunUp` scan-report staging dir.
+
+### Hardened after review
+
+- The scan-report staging dir is locked down by **replacing** its DACL (`Set-Acl`, protected, SYSTEM
+  + Administrators) and taking ownership, not by `icacls /inheritance:r /grant` — which strips only
+  *inherited* entries, so an unprivileged process that created `C:\SunUp` first kept its explicit ACE
+  **and its ownership**, and an owner can put the DACL back. Verified by squatting the directory.
+  A reparse point there is refused outright, and a lockdown that fails **fails closed** (the
+  component errors rather than trusting a report a non-admin may be able to rewrite).
+- An exit-0 scan whose report contains **no recognized update records** is unusable, not empty:
+  dcu-cli has a separate code for "nothing applicable" (500), so a parse that disagrees with a
+  successful scan means a schema change — which would otherwise read as "nothing to exclude".
+- Detached results are discovered across **every retained run dir** (a helper can finish several
+  `-Force` runs later) and bounded by an ingestion cursor taken **before** the scan, so a record
+  written while the run was in flight is not consumed unread.
+- A reboot a detached pass asked for is carried in the stamp until a boot is actually observed —
+  postponing the dialog's countdown no longer loses it — and one whose helper finished *before* the
+  last boot is treated as already satisfied rather than triggering a second restart.
+- `Start-TaskVerified` requires `LastRunTime` to advance past its own start call; observing `Running`
+  confirmed only that *an* instance was up, which is precisely the one `IgnoreNew` dropped ours for.
+- The winget mutex is created with an explicit SYSTEM + Administrators ACL (its two holders are
+  different principals) and a failure to take it is logged rather than silently running unserialized.
+- `UserScope.ps1` checks that the helper it launches did not exit immediately — `Start-Process`
+  reports only that the *host* started, so a non-elevated child dying on `#Requires` read as success.
+- `Uninstall.ps1 -Purge` reports only the paths it actually removed, removes only the `dcu` subtree
+  (`C:\SunUp` may pre-date SunUp and hold unrelated data — the parent goes only when left empty), and
+  kills only processes running the **installed** scripts under `C:\ProgramData\SunUp\bin`.
+- Concurrency, throughout: one ingest at a time (`Global\SunUp-Ingest`), one task start at a time
+  (`Global\SunUp-TaskStart`), one winget pass at a time (`Global\SunUp-Winget`) — a documented
+  `-Mode Run -Force` really can overlap a scheduled run. Every one of those locks **fails closed**:
+  no lock means no ingest and no upgrade, since the records persist and the next run picks them up.
+  The stamp write is the deliberate exception — it also carries the once-per-day gate, so skipping it
+  would re-run the entire update pass; it merges, verifies and retries instead.
+- Detached records are published atomically by their producers (`.tmp` + rename) and timed in **UTC**
+  by the file's write time — a reader that caught a `Set-Content` mid-write treated the record as
+  lost, and a local-time comparison would bury a fresh record during a DST fall-back.
+- **Found by running it, not by reading it:** the stamp verification compared timestamps as *text*.
+  `ConvertFrom-Json` parses an ISO-8601 value back into a `[datetime]`, whose string form is
+  culture-formatted **local** time (`08/03/2026 06:18:05`) and never equals the round-trip string it
+  was written from — so every single run logged a phantom `a concurrent run rewrote it` and wrote the
+  stamp three times. New `ConvertTo-UtcTime` normalizes either form and the comparison is on
+  instants. A false alarm on every run is the same class of defect as a missed one.
+
+### Tests
+
+- Suite is 218 checks (was 97). New coverage: every shipped script parses (UserScope, Install and
+  Uninstall had none); `Parse-DcuReport`'s `$null`-vs-empty contract; the dcu category vocabulary,
+  including the real `Application` category and comma-bearing Dell categories; `Test-InstallStarted`
+  against real winget output; the detached-result ingest, including that ingesting twice does not
+  double-count; and the uninstall kill list.
+
 ## [0.13.0] - 2026-07-28
 
 ### Added — the per-user packages the engine structurally could not see

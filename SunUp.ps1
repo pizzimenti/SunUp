@@ -48,7 +48,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.13.0'
+$script:Version = '0.13.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -352,7 +352,68 @@ function Raise-SysSentryAlert { param($Msg)
 
 # ---- per-day stamp ----------------------------------------------------------
 function Get-Stamp { if (Test-Path $StampFile) { try { Get-Content $StampFile -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
+
+# Normalize a stamp timestamp to UTC whatever form it arrives in. ConvertFrom-Json parses an
+# ISO-8601 string into a [datetime], so a value written as '…Z' comes BACK as a DateTime and
+# interpolates as culture-formatted local wall time ("08/03/2026 06:18:05") — which never equals the
+# round-trip string it was written from. Comparing those as strings made the stamp verification
+# below report a phantom concurrent write on every single run: three writes and a misleading warning
+# each time, which is precisely the kind of false signal this release exists to remove. Caught by
+# running the engine, not by reading it.
+function ConvertTo-UtcTime { param($Value)
+  if ($null -eq $Value -or "$Value" -eq '') { return $null }
+  if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+  try { return ([datetime]::Parse("$Value", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() }
+  catch { return $null }
+}
 function Save-Stamp { param($Obj) try { $Obj | ConvertTo-Json -Depth 8 | Set-Content $StampFile } catch { Write-Log WARN "could not write stamp: $_" } }
+
+# Save the stamp as a read-modify-write under the ingest lock, merging the two fields a CONCURRENT
+# run can legitimately have advanced since we read it. The ingest mutex is released long before the
+# stamp is written, so with a manual `-Mode Run -Force` overlapping a scheduled run: one run can scan
+# before a detached reboot record exists, the other then ingests it and stamps
+# handoffRebootPending=true, and the first — finishing last — would blank the flag with an
+# unconditional write. The record is already marked ingested, so that reboot would be lost for good.
+#   * handoffRebootPending is never cleared here on someone else's behalf. Only an observed boot
+#     clears it (that is what $Booted means), so the merge is an OR.
+#   * ingestCursor only ever moves forward: a peer that scanned more recently knows more than we do.
+function Save-StampMerged { param($Obj, [bool]$Booted)
+  $mx = $null; $have = $false
+  try { $mx = New-Object System.Threading.Mutex($false, 'Global\SunUp-Ingest') } catch { $mx = $null }
+  if ($mx) {
+    try { $have = $mx.WaitOne([timespan]::FromSeconds(15)) }
+    catch [System.Threading.AbandonedMutexException] { $have = $true }
+    catch { $have = $false }
+  }
+  # NOT abandoned when the lock cannot be taken, unlike the ingest: this stamp also carries the
+  # once-per-day gate, and skipping the write would have the next trigger re-run the entire update
+  # pass. So it always writes — but it merges, writes, then VERIFIES, and retries if a concurrent
+  # save landed in between. Bounded, because two engines could otherwise trade writes indefinitely.
+  if (-not $have) { Write-Log WARN 'stamp: could not take the ingest lock — merging without it and verifying the result.' }
+  try {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+      $onDisk = Get-Stamp
+      if (-not $Booted -and $onDisk -and $onDisk.handoffRebootPending) { $Obj.handoffRebootPending = $true }
+      $ours = ConvertTo-UtcTime $Obj.ingestCursor
+      if ($onDisk -and $ours) {
+        $theirs = ConvertTo-UtcTime $onDisk.ingestCursor
+        if ($theirs -and $theirs -gt $ours) { $Obj.ingestCursor = $onDisk.ingestCursor; $ours = $theirs }
+      }
+      Save-Stamp $Obj
+      # Compare as UTC instants, never as text: what comes back from ConvertFrom-Json is a [datetime]
+      # whose string form is culture-formatted local time, so a string compare here always "differed".
+      $after = Get-Stamp
+      $lost  = [bool]($after -and (
+                 (((-not $Booted) -and $Obj.handoffRebootPending) -and -not $after.handoffRebootPending) -or
+                 ($ours -and ((ConvertTo-UtcTime $after.ingestCursor) -ne $ours))))
+      if (-not $lost) { break }
+      Write-Log WARN "stamp: a concurrent run rewrote it — merging again (attempt $attempt of 3)."
+    }
+  } finally {
+    if ($have) { try { $mx.ReleaseMutex() } catch { } }
+    if ($mx)   { try { $mx.Dispose() } catch { } }
+  }
+}
 
 # ---- winget path resolver (SYSTEM can't see the per-user PATH shim) ----------
 function Resolve-Winget {
@@ -621,9 +682,17 @@ function Comp-Winget { param($Cfg)
 # Parse dcu-cli's `/scan -report` XML into per-update records. The report lists every APPLICABLE
 # update with its name, AVAILABLE version, size (bytes), and type — everything we need for the table
 # EXCEPT the currently-installed (old) version, which dcu-cli does not expose anywhere.
+#
+# Returns $null when the report cannot be READ or PARSED, and an (possibly empty) array when it can.
+# Those two are not the same thing and must never be conflated: a truncated, locked or schema-changed
+# report used to come back as an empty array, which reads as "nothing to exclude" — so the exclusion
+# split found nothing to ban, passed no category restriction, and handed /applyUpdates a completely
+# unrestricted run over the very driver the pin exists to protect. The caller fails closed on $null.
+# (`return ,$out` on purpose: a bare `return @()` unrolls to nothing and would arrive as $null.)
 function Parse-DcuReport { param([string]$XmlPath)
-  if (-not (Test-Path $XmlPath)) { return @() }
-  try { [xml]$r = Get-Content $XmlPath -Raw } catch { return @() }
+  if (-not (Test-Path $XmlPath)) { return $null }
+  try { [xml]$r = Get-Content $XmlPath -Raw -ErrorAction Stop } catch { return $null }
+  if (-not $r -or -not $r.DocumentElement) { return $null }
   $out = @()
   foreach ($u in $r.SelectNodes('//*[local-name()="update"]')) {
     $g = { param($n) ($u.ChildNodes | Where-Object { $_.LocalName -eq $n } | Select-Object -First 1).InnerText }
@@ -633,7 +702,34 @@ function Parse-DcuReport { param([string]$XmlPath)
       type    = "$(& $g 'type')";    category = "$(& $g 'category')"; urgency = "$(& $g 'urgency')"; bytes = $bytes
     }
   }
-  $out
+  ,$out    # comma on purpose: a bare `$out` unrolls an empty array to nothing, i.e. to $null — the
+           # one value that means "unreadable" here, which would invert the whole guard.
+}
+
+# Map a scan report's free-text <category> onto the FIXED vocabulary dcu-cli's -updateDeviceCategory
+# accepts. `dcu-cli /applyUpdates -help` (v5.7.0, this box) states plainly:
+#     -updateDeviceCategory - Allows the user to filter updates based on device type.
+#     Expected value(s): (audio,video,network,storage,input,chipset,others)
+# The report does NOT speak that vocabulary. The real DCUApplicableUpdates.xml on caldera carries
+# <category>Application</category>, and Dell also ships categories with spaces and commas in them
+# ("Mouse, Keyboard & Input Devices", "Serial ATA"). Lower-casing the raw text and joining it with
+# commas — what this used to do — produced `-updateDeviceCategory=application`, which dcu-cli rejects
+# outright: the apply exits non-zero and installs NOTHING, for as long as a pinned update keeps the
+# exclusion path alive. Anything unrecognized maps to 'others', dcu-cli's own catch-all bucket.
+# Empty stays empty: an update with no category is UNFILTERABLE, and Split-DcuUpdates fails closed on
+# it rather than guessing a bucket that might not select it.
+function ConvertTo-DcuCategory { param([string]$Raw)
+  $c = "$Raw".Trim().ToLower()
+  if (-not $c) { return '' }
+  switch -Regex ($c) {
+    'audio|sound'                                                { return 'audio'   }
+    'video|graphic|display'                                      { return 'video'   }
+    'network|wireless|wi-?fi|wlan|ethernet|\blan\b|modem|bluetooth' { return 'network' }
+    'storage|serial ?ata|sata|nvme|\bssd\b|hard ?drive|\bdisk\b|raid' { return 'storage' }
+    'input|mouse|keyboard|touch|pointing'                        { return 'input'   }
+    'chipset'                                                    { return 'chipset' }
+    default                                                      { return 'others'  }
+  }
 }
 
 # Decide what a Dell apply may touch, given a name-based exclusion (e.g. a pinned GPU driver).
@@ -658,7 +754,11 @@ function Split-DcuUpdates { param($Updates, [string]$ExcludePattern)
   $res.excluded = @($all | Where-Object { "$($_.name)" -match $ExcludePattern })
   if ($res.excluded.Count -eq 0) { return $res }
 
-  $cat = { param($u) "$($u.category)".Trim().ToLower() }
+  # Canonical dcu-cli tokens, not raw report text — see ConvertTo-DcuCategory. Both sides of the
+  # decision (what is banned, what may still apply) go through the same mapping, so two updates that
+  # land in the same dcu bucket are treated as sharing a category even when the report words them
+  # differently. That is the conservative direction: it defers more, never applies more.
+  $cat = { param($u) ConvertTo-DcuCategory "$($u.category)" }
   $rest = @($all | Where-Object { "$($_.name)" -notmatch $ExcludePattern })
 
   # FAIL CLOSED if ANY excluded update lacks a device category — not merely if they all do. A mixed
@@ -683,6 +783,93 @@ function Split-DcuUpdates { param($Updates, [string]$ExcludePattern)
   $res
 }
 
+# Where dcu-cli is allowed to write its scan report. NOT the run dir: dcu-cli validates -report
+# against a list of RESERVED FOLDERS and refuses to scan at all when the path is one of them, and
+# C:\ProgramData — where every run dir lives — is on it. Measured on caldera (dcu-cli 5.7.0):
+#     C:\ProgramData\SunUp\...   exit 107   "The path provided for option '-report' is a reserved
+#     C:\Windows\Temp\...        exit 107    folder that may not be used."
+#     C:\Users\Public\...        exit 107
+#     C:\SunUp\dcu               exit 0     (full scan, real report)
+# The runs of 2026-07-29, 07-30 and 08-02 all died on that 107 and, with the fail-closed guard below,
+# applied nothing at all while still reporting a clean run. Hence a dedicated staging dir, locked to
+# SYSTEM + Administrators: this report decides which updates may install, so a non-admin able to
+# rewrite it could drop the NVIDIA entry and let the pinned driver through.
+# Is any component of this path a junction or symlink? Checking only the leaf is not enough: an
+# unprivileged user who pre-creates C:\SunUp as a junction to a directory they own leaves the leaf
+# looking like an ordinary folder, while every ACL we set follows the junction to their target — and
+# they can re-point it after we harden it. So walk from the drive root down.
+function Test-PathHasReparsePoint { param([string]$Path)
+  $parts = @("$Path" -split '\\' | Where-Object { $_ })
+  if ($parts.Count -eq 0) { return $false }
+  $cur = $parts[0] + '\'                       # "C:\"
+  for ($i = 1; $i -lt $parts.Count; $i++) {
+    $cur = Join-Path $cur $parts[$i]
+    $it  = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+    if ($it -and ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      Write-Log ERROR "dell: $cur is a reparse point — refusing to scan under it."
+      return $true
+    }
+  }
+  $false
+}
+
+# Make one directory admin-only, and prove it. REPLACES the DACL rather than adding to it: the drive
+# root lets any authenticated user create folders, so this path may have been created by an
+# unprivileged process first — and `icacls /inheritance:r /grant` (what this used to do) removes only
+# INHERITED entries, leaving any explicit ACE that creator added AND their ownership, which lets them
+# put the DACL back. A fresh DirectorySecurity carries an empty protected DACL, so Set-Acl drops
+# every other ACE and the owner moves to Administrators in the same call.
+# SIDs, not names, so it is locale-independent (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators).
+# Returns $false if the directory cannot be trusted afterwards — callers must then apply nothing:
+# this report decides which updates may install, and a blocked Dell run is recoverable where an
+# attacker-editable exclusion list is not.
+function Protect-Directory { param([string]$Path)
+  if (Test-PathHasReparsePoint $Path) { return $false }
+  try {
+    $system = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
+    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $sd = New-Object System.Security.AccessControl.DirectorySecurity
+    $sd.SetAccessRuleProtection($true, $false)     # protected; inherited entries discarded
+    foreach ($sid in @($system, $admins)) {
+      $sd.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    $sd.SetOwner($admins)
+    Set-Acl -Path $Path -AclObject $sd -ErrorAction Stop
+    return $true
+  } catch {
+    Write-Log ERROR "dell: could not lock down $Path ($($_.Exception.Message)) — refusing to use a directory that may be writable by non-admins."
+    return $false
+  }
+}
+
+# Returns $null if the directory cannot be trusted — the caller must then apply nothing.
+function Get-DcuReportDir {
+  $root = Join-Path $env:SystemDrive 'SunUp'
+  $dir  = Join-Path $root 'dcu'
+  $rootExisted = Test-Path $root
+  if (-not $rootExisted) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
+  # Never take over a directory that is not ours. If C:\SunUp pre-dates SunUp and holds unrelated
+  # files, replacing its DACL and owner would lock its owner out of their own data — so refuse it and
+  # say what to do instead. Uninstall's -Purge draws the same line from the other side: it removes
+  # only the dcu child, and the parent only when we left it empty.
+  if ($rootExisted) {
+    $foreign = @(Get-ChildItem $root -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'dcu' })
+    if ($foreign.Count -gt 0) {
+      $names = ($foreign | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', '
+      Write-Log ERROR "dell: $root already contains files that are not SunUp's ($names) — refusing to take ownership of it. Move them elsewhere, or set dell.enabled=false."
+      return $null
+    }
+  }
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  foreach ($d in @($root, $dir)) { if (-not (Protect-Directory $d)) { return $null } }
+  # Per-run staging dirs left behind by a crashed run. Cheap to prune, and it keeps the dir readable.
+  Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+    ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+  $dir
+}
+
 function Comp-Dell { param($Cfg)
   $dcu = @('C:\Program Files\Dell\CommandUpdate\dcu-cli.exe','C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe') |
          Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -690,26 +877,78 @@ function Comp-Dell { param($Cfg)
 
   # 1. Scan to an XML report FIRST — this is the only source of each update's name, available version
   #    and size (the apply output carries none of it). One scan covers all types; we partition into
-  #    what we apply (driver/firmware/utility) vs BIOS (report-only).
-  $reportDir = $script:RunDir
-  $scanOut  = & $dcu /scan -report="$reportDir" -silent 2>&1
+  #    what we apply (driver/firmware/utility) vs BIOS (report-only). See Get-DcuReportDir for why
+  #    the report cannot be written into the run dir.
+  $scanRoot = Get-DcuReportDir
+  if (-not $scanRoot) {
+    return @{ status = 'error'; detail = 'scan report directory could not be trusted — nothing applied'
+              error = 'the dcu report staging dir is a reparse point or could not be locked down; see sunup.log' }
+  }
+  # A subdirectory PER RUN. The documented `-Mode Run -Force` can overlap a scheduled run, and a
+  # shared staging dir has each of them deleting the other's report mid-flight: one run then finds no
+  # report, calls the scan unusable and skips every Dell update, or worse parses its peer's report.
+  # The subdir inherits the parent's protected SYSTEM + Administrators ACL.
+  $scanDir = Join-Path $scanRoot (Split-Path $script:RunDir -Leaf)
+  try { New-Item -ItemType Directory -Force -Path $scanDir | Out-Null }
+  catch {
+    return @{ status = 'error'; detail = 'could not create the per-run scan staging dir — nothing applied'
+              error = "$($_.Exception.Message)" }
+  }
+  # Harden the CHILD too. -Force reuses an existing directory, and the run stamp is predictable
+  # (yyyy-MM-dd_HHmmss, from a daily 08:00 trigger), so one pre-created before the parent was ever
+  # locked down would keep its creator's explicit ACEs and ownership — leaving them free to rewrite
+  # the report after dcu-cli produces it and before it is parsed.
+  if (-not (Protect-Directory $scanDir)) {
+    return @{ status = 'error'; detail = 'per-run scan staging dir could not be trusted — nothing applied'
+              error = 'could not lock down the per-run dcu staging dir; see sunup.log' }
+  }
+  # Clear the whole staging dir first: a stale report must never pass as this run's scan.
+  Get-ChildItem $scanDir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+  $scanOut  = & $dcu /scan -report="$scanDir" -silent 2>&1
   $scanCode = $LASTEXITCODE
   Write-CompLog 'dell-bios-scan' $scanOut
-  Write-CompLog 'dell-bios-scan' "scan exit: $scanCode"
-  $xmlPath = Join-Path $reportDir 'DCUApplicableUpdates.xml'
+  Write-CompLog 'dell-bios-scan' "scan exit: $scanCode (report dir: $scanDir)"
+  # dcu-cli 5.7.0 (measured on this box, along with the 107s above) takes a DIRECTORY for -report and
+  # writes DCUApplicableUpdates.xml into it; other versions are documented as taking a full .xml path.
+  # Rather than depend on either, take whatever .xml the scan just produced.
+  $report  = Get-ChildItem $scanDir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $xmlPath = if ($report) { $report.FullName } else { Join-Path $scanDir 'DCUApplicableUpdates.xml' }
+  # Keep the report with the rest of this run's evidence.
+  if (Test-Path $xmlPath) { try { Copy-Item $xmlPath (Join-Path $script:RunDir 'DCUApplicableUpdates.xml') -Force } catch {} }
+
   # The scan report is the ONLY thing that can tell us an excluded update is applicable — dcu-cli
-  # cannot filter by name, so without a readable report there is no way to keep a pinned driver out
-  # of /applyUpdates. A failed or missing scan therefore means DO NOT APPLY, rather than apply
-  # everything: an empty parse used to look identical to "nothing to exclude" and silently removed
-  # the guard. (500 = no applicable updates, a legitimate empty result with no report to read.)
-  $scanUsable = ($scanCode -in 0, 500) -and (Test-Path $xmlPath)
-  if (-not $scanUsable -and "$($Cfg.dell.excludePattern)" -and $scanCode -ne 500) {
-    $m = "dcu-cli /scan failed (exit $scanCode, report $(if (Test-Path $xmlPath) { 'present' } else { 'missing' })) — skipping the apply so dell.excludePattern cannot be bypassed."
-    Write-Log WARN "dell: $m"
-    Write-CompLog 'dell-apply' "--- $m ---"
-    return @{ status = 'warn'; detail = "scan failed (exit $scanCode) — nothing applied, exclusions could not be enforced"; error = 'dcu-cli /scan unusable; see dell-bios-scan.log' }
+  # cannot filter by name, so without a readable AND PARSEABLE report there is no way to keep a
+  # pinned driver out of /applyUpdates. A failed scan, a missing report, or one that will not parse
+  # therefore means DO NOT APPLY, rather than apply everything: an empty parse used to look identical
+  # to "nothing to exclude" and silently removed the guard. Parse-DcuReport returns $null for the
+  # first case and an empty array for the second, which is the whole distinction.
+  # (500 = no applicable updates: a legitimate empty result, for which dcu writes no report at all.)
+  # A structurally EMPTY report at exit 0 counts as unusable too. dcu-cli already has a distinct code
+  # for "nothing is applicable" (500, no report written), so exit 0 means it had something to report —
+  # and if our parse finds no update records in it, the two disagree and the report cannot be trusted
+  # to name a pinned driver. A renamed element in a future schema would otherwise read as "nothing to
+  # exclude" and hand /applyUpdates an unrestricted run: the same fail-open shape as an empty parse.
+  $avail      = Parse-DcuReport $xmlPath
+  $scanUsable = if ($scanCode -eq 500) { $true } else { ($scanCode -eq 0) -and ($null -ne $avail) -and (@($avail).Count -gt 0) }
+  if ($scanCode -eq 500) { $avail = @() }
+  if (-not $scanUsable) {
+    $why = if ($null -eq $avail) { if (Test-Path $xmlPath) { 'report unreadable' } else { 'report missing' } }
+           elseif (@($avail).Count -eq 0) { 'report contains no recognized update records' }
+           else { 'report parsed but the scan failed' }
+    if ("$($Cfg.dell.excludePattern)") {
+      $m = "dcu-cli /scan unusable (exit $scanCode, $why) — skipping the apply so dell.excludePattern cannot be bypassed."
+      Write-Log ERROR "dell: $m"
+      Write-CompLog 'dell-apply' "--- $m ---"
+      # ERROR, not warn: this blocks every Dell driver/firmware update on the box, and only 'error'
+      # reaches event 2010 and SysSentry. The 107 runs above sat in exactly this state for four days
+      # while every run logged "clean".
+      return @{ status = 'error'; detail = "scan unusable (exit $scanCode, $why) — nothing applied, exclusions could not be enforced"; error = 'dcu-cli /scan unusable; see dell-bios-scan.log' }
+    }
+    Write-Log WARN "dell: scan unusable (exit $scanCode, $why); no dell.excludePattern is set, so the apply still runs unfiltered."
+    $avail = @()
   }
-  $avail   = Parse-DcuReport $xmlPath
   $bios    = @($avail | Where-Object { "$($_.type)" -match 'BIOS' })
   $nonBios = @($avail | Where-Object { "$($_.type)" -notmatch 'BIOS' })   # driver/firmware/application = what we apply
   Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded). Scan found $($nonBios.Count) non-BIOS + $($bios.Count) BIOS applicable."
@@ -734,7 +973,29 @@ function Comp-Dell { param($Cfg)
       if ($bios.Count -gt 0) {
         Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
       }
-      return @{ status = 'ok'; detail = "nothing applied — all $($nonBios.Count) update(s) excluded or category-deferred$biosOnly" }
+      $detail = "nothing applied — all $($nonBios.Count) update(s) excluded or category-deferred$biosOnly"
+      # Two very different situations end up here, and reporting both as 'ok' hid the bad one:
+      #   * every applicable update was ITSELF excluded → the pin did its job, nothing is being held
+      #     back, and a clean status is the truth;
+      #   * updates we WOULD have installed are deferred (collateral), or the split failed closed on
+      #     an uncategorized exclusion → the whole Dell path is blocked for as long as that excluded
+      #     update stays applicable, which must not read as a clean run.
+      if ($split.collateral.Count -gt 0 -or $split.reason) {
+        $blockReason = if ($split.reason) { $split.reason } else { "$($split.collateral.Count) update(s) share a device category with an excluded one" }
+        return @{ status = 'warn'; detail = $detail; error = "no Dell update can be applied while the exclusion stands: $blockReason — see dell-apply.log" }
+      }
+      return @{ status = 'ok'; detail = $detail }
+    }
+    # Belt-and-braces on ConvertTo-DcuCategory: dcu-cli rejects the WHOLE command for an unknown
+    # category value, so a token that ever escapes the mapping must defer the run, not fire an apply
+    # we already know will fail with nothing installed.
+    $validCats = 'audio','video','network','storage','input','chipset','others'
+    $badCats   = @($split.categories | Where-Object { $validCats -notcontains $_ })
+    if ($badCats.Count -gt 0) {
+      $m = "device category $($badCats -join ',') is not one dcu-cli accepts ($($validCats -join ',')) — skipping the apply rather than sending a command that installs nothing."
+      Write-Log WARN "dell: $m"
+      Write-CompLog 'dell-apply' "--- $m ---"
+      return @{ status = 'warn'; detail = "nothing applied — unmappable device category ($($badCats -join ','))"; error = $m }
     }
     $catArgs = @("-updateDeviceCategory=$($split.categories -join ',')")
     Write-CompLog 'dell-apply' "--- restricting apply to device categories: $($split.categories -join ',') ---"
@@ -808,6 +1069,178 @@ function Test-PSModulesDue {
   $true
 }
 function Set-PSModulesStamp { @{ date = (Get-Date).ToString('yyyy-MM-dd') } | ConvertTo-Json | Set-Content $PSModStamp -Encoding UTF8 }
+
+# ---- starting a scheduled task, and KNOWING that it started -----------------
+# Start-ScheduledTask reports success without running anything when an instance of the task is
+# already active and the task is registered -MultipleInstances IgnoreNew — which both handoff tasks
+# are. The engine used to log "started …" and raise event 2020 unconditionally on that call, so a
+# handoff that was silently dropped read exactly like one that ran: the
+# silent-no-op-that-looks-like-success shape v0.12.0 exists to eliminate. So refuse to start over a
+# live instance, then confirm the task really entered Running (or ran to completion) before claiming
+# anything happened. Returns @{ ok = $bool; reason = '<why not>' }.
+function Start-TaskVerified { param([string]$TaskName, [int]$TimeoutSec = 20)
+  # Serialized machine-wide, because the confirmation below is only as good as the pre-check above it:
+  # two engines can both pass that pre-check before either task enters Running, Task Scheduler starts
+  # exactly one (IgnoreNew drops the other), and both then observe the SAME advanced LastRunTime and
+  # both claim success — so one run's package set is never handed off while its log says it was.
+  # Under the lock the loser's pre-check sees Running and it reports that honestly instead.
+  $mx = $null; $haveStart = $false
+  try { $mx = New-Object System.Threading.Mutex($false, 'Global\SunUp-TaskStart') } catch { $mx = $null }
+  if ($mx) {
+    try { $haveStart = $mx.WaitOne([timespan]::FromSeconds(30)) }
+    catch [System.Threading.AbandonedMutexException] { $haveStart = $true }
+    catch { $haveStart = $false }
+  }
+  if (-not $haveStart) {
+    if ($mx) { try { $mx.Dispose() } catch { } }
+    return @{ ok = $false; reason = 'another run holds the task-start lock, so this start could not be confirmed' }
+  }
+  try {
+  $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+  if ($t.State -eq 'Running')  { return @{ ok = $false; reason = 'an instance is already running (MultipleInstances=IgnoreNew would silently drop this one)' } }
+  if ($t.State -eq 'Disabled') { return @{ ok = $false; reason = 'the task is disabled' } }
+  $before    = try { (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).LastRunTime } catch { $null }
+  $startedAt = Get-Date
+  Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+    # LastRunTime must have moved, AND moved past OUR call. Accepting `State -eq 'Running'` proved
+    # nothing on its own: an instance that entered Running between the pre-check and the start is
+    # exactly the instance IgnoreNew dropped ours in favour of, and it looks identical from here.
+    # (A manual `-Mode Run -Force` alongside a scheduled run really can produce two engines here.)
+    $now = try { (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).LastRunTime } catch { $null }
+    if ($now -and ((-not $before) -or ($now -gt $before)) -and ($now -ge $startedAt.AddSeconds(-2))) {
+      return @{ ok = $true; reason = '' }
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  @{ ok = $false; reason = "the task did not register a new run within ${TimeoutSec}s" }
+  } finally {
+    if ($haveStart) { try { $mx.ReleaseMutex() } catch { } }
+    if ($mx)        { try { $mx.Dispose() } catch { } }
+  }
+}
+
+# ---- fold in what the detached passes did after the LAST run ended ----------
+# SelfHost.ps1 and UserScope.ps1 both finish after the engine that started them has exited, so their
+# results cannot appear in that run's result.json — and until now nothing ever read the JSON they
+# leave behind. That cost three separate silent failures: a successful PowerShell 7 upgrade never
+# appeared in updates[], the dialog or the history; a FAILED one never appeared anywhere, so the run
+# still reported winget=ok; and a winget "restart required" exit code was lost entirely, because the
+# engine had already made its reboot decision and a winget-signalled reboot sets no OS pending flag
+# for the stale-reboot watchdog to find either.
+# So each run ingests the records written since it last looked, exactly once — ingested=true is
+# written back through the same atomic publish everything else here uses.
+# $Since = when the last run's ingest scan began (the cursor, carried in the stamp). A record written
+# before that was already on disk while that run was deciding, so it is not news: it is marked
+# consumed and named in the log rather than resurfacing days later as today's updates.
+# $BootedUtc = the box's last boot. A reboot request from a helper that finished BEFORE that boot has
+# already been satisfied — importing it would otherwise schedule a second, pointless restart.
+function Import-DetachedResults { param($Since, $BootedUtc)
+  # scanned = the records were actually examined. Every early return below leaves it false, and the
+  # caller must then NOT advance the cursor: doing so would mark records that existed at the aborted
+  # attempt's start time as stale on the next run and consume them unread — the very loss the cursor
+  # exists to prevent, reintroduced by the abort path.
+  $out = @{ upgraded = 0; failed = 0; reboot = $false; notes = @(); scanned = $false }
+  if (-not (Test-Path $RunsDir)) { return $out }
+  # ONE ingest at a time, machine-wide. Two engines really can run at once — the documented
+  # `-Mode Run -Force` alongside a scheduled run, which the crash detector already has to reason
+  # about — and read-count-then-mark is not atomic: both would count the same upgrade into their own
+  # history and dialog, and both act on its reboot request. If the lock cannot be taken, ingest
+  # NOTHING: every record keeps ingested=false and the next run picks it up, which is the safe
+  # direction. (No explicit ACL here, unlike SelfHost.ps1's winget lock: both holders are the engine,
+  # which is always SYSTEM or an elevated manual run — and .NET 5+ dropped the MutexSecurity ctor.)
+  $mx = $null; $haveLock = $false
+  try { $mx = New-Object System.Threading.Mutex($false, 'Global\SunUp-Ingest') } catch { $mx = $null }
+  if (-not $mx) {
+    # No lock means no protection, so do not ingest at all. Falling through here would have been a
+    # fail-OPEN path in the very guard added to stop two engines double-counting the same record.
+    Write-Log WARN 'handoff: could not create the ingest lock — leaving the detached records for the next run.'
+    return $out
+  }
+  try { $haveLock = $mx.WaitOne([timespan]::FromSeconds(60)) }
+  catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
+  catch { $haveLock = $false }
+  if (-not $haveLock) {
+    Write-Log WARN 'handoff: another run holds the ingest lock — leaving the detached records for the next run.'
+    try { $mx.Dispose() } catch { }
+    return $out
+  }
+  try {
+  $files = @(
+    @{ name = 'selfhost.json';      source = 'winget (self-host)' }
+    @{ name = 'user-winget.json';   source = 'winget (user scope)' }
+    @{ name = 'user-selfhost.json'; source = 'winget (user self-host)' }
+  )
+  # EVERY retained run dir, not the newest few. A helper can finish long after its own run — it waits
+  # for the engine, for the user-scope task, for a reboot countdown, for the winget lock — by which
+  # time several `-Mode Run -Force` runs may have created newer dirs. Capping the search by count
+  # would drop those records permanently; the $Since cursor below is what keeps old news out instead.
+  $dirs = @(Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $script:RunDir } | Sort-Object Name -Descending)
+  foreach ($d in $dirs) {
+    foreach ($f in $files) {
+      $p = Join-Path $d.FullName $f.name
+      if (-not (Test-Path $p)) { continue }
+      $j = try { Get-Content $p -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+      if (-not $j) { Write-Log WARN "handoff: $($d.Name)\$($f.name) is unreadable — whatever it recorded is lost."; continue }
+      if ($j.ingested) { continue }
+      # Older than the cursor = it predates this feature (or was already visible to a run that chose
+      # not to act on it). Consume it so it cannot resurface, and say what was skipped.
+      # The timestamp is when the record became VISIBLE (the file's write time), not the
+      # finishedLocal the helper stamped inside it before serializing: those differ by the length of
+      # the write, and a scan that caught the file mid-write skipped it as unreadable. Judging the
+      # completed record by the earlier embedded time would then bury it as stale, unimported.
+      # (The producers publish atomically now, which closes the mid-write window itself.)
+      # UTC on both sides. In local time, the repeated hour after a daylight-saving fall-back gives a
+      # file written AFTER the cursor a wall-clock stamp that reads as earlier, and this branch would
+      # then consume a brand-new record unread — once a year, silently, which is the worst kind.
+      $written = try { (Get-Item $p -ErrorAction Stop).LastWriteTimeUtc } catch { $null }
+      if (-not $written) {
+        try { $written = ([datetime]::Parse("$($j.finishedLocal)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { }
+      }
+      $sinceUtc = if ($Since) { $Since.ToUniversalTime() } else { $null }
+      if ($sinceUtc -and $written -and $written -le $sinceUtc) {
+        Write-Log INFO "handoff: $($d.Name)\$($f.name) predates the last run ($written UTC) — marking it consumed without counting it."
+        $j | Add-Member -NotePropertyName ingested -NotePropertyValue $true -Force
+        [void](Publish-JsonFile $j $p)
+        continue
+      }
+      foreach ($r in @($j.results)) {
+        if (-not $r) { continue }
+        if ($r.ok) {
+          $out.upgraded++
+          $label = if ("$($r.name)") { "$($r.name)" } else { "$($r.id)" }
+          $old   = if ("$($r.old)")  { "$($r.old)" }  else { '—' }
+          $new   = if ("$($r.new)")  { "$($r.new)" }  else { '—' }
+          Add-Update -Name $label -Source $f.source -Old $old -New $new -DurationSec $r.durationSec -SizeMB $null
+        } else {
+          $out.failed++
+          $out.notes += ("{0} failed (exit {1}, run {2})" -f "$($r.id)", "$($r.exitCode)", $d.Name)
+        }
+      }
+      if ($j.rebootRequired) {
+        $satisfied = $BootedUtc -and $written -and ($written -le $BootedUtc)   # both UTC, see above
+        if ($satisfied) {
+          Write-Log INFO "handoff: $($d.Name)\$($f.name) wanted a reboot, but the box has booted since it finished — already satisfied."
+        } else {
+          $out.reboot = $true
+          $out.notes  += ("{0} needs a reboot (run {1})" -f $f.name, $d.Name)
+        }
+      }
+      # Mark it consumed. A failed write would have the record ingested again next run and
+      # double-counted, so it is reported rather than left to repeat quietly.
+      $j | Add-Member -NotePropertyName ingested -NotePropertyValue $true -Force
+      if (-not (Publish-JsonFile $j $p)) { Write-Log WARN "handoff: could not mark $($d.Name)\$($f.name) ingested — it may be counted again next run." }
+    }
+  }
+  $out.scanned = $true      # only here: every record was looked at, so the cursor may advance
+  } finally {
+    if ($haveLock) { try { $mx.ReleaseMutex() } catch { } }
+    if ($mx)       { try { $mx.Dispose() } catch { } }
+  }
+  $out
+}
 
 # =====================  query modes  =========================================
 function Get-LatestRunDir { Get-ChildItem $RunsDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1 }
@@ -969,9 +1402,66 @@ if ($cfg.psModules.enabled) {
   }
 }
 
+# The detached passes started by the LAST run finished after its result.json was written. Fold them
+# in HERE — before the reboot decision and before updates[] is built — so an upgrade they made shows
+# up in this run's dialog and history, a failure they hit is reported, and a reboot they asked for is
+# actually acted on instead of being dropped on the floor.
+$lastRunEnd = $null
+if ($stamp -and $stamp.finishedLocal) {
+  try { $lastRunEnd = [datetime]::Parse("$($stamp.finishedLocal)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { }
+}
+# The cursor is the moment the LAST run's ingest scan began — not when that run finished. A helper
+# that writes its JSON after the scan has passed its directory but before the stamp is saved has a
+# timestamp inside that gap: measured against the run's end it looks old and would be consumed
+# unread, losing its upgrades, failures and reboot request for good. Taken before the scan, the gap
+# falls on the safe side and the record is simply picked up next time.
+# Held and compared in UTC throughout: a local-time cursor is ambiguous across the repeated hour of a
+# daylight-saving fall-back, where it would read a newer record as older. Stamps written by earlier
+# versions carry a local offset, which round-trip parsing converts correctly.
+$ingestCursor = $null
+if ($stamp -and $stamp.ingestCursor) {
+  $ingestCursor = ConvertTo-UtcTime $stamp.ingestCursor
+} elseif ($lastRunEnd) {
+  $ingestCursor = $lastRunEnd.ToUniversalTime()   # stamp written by a version before the cursor existed
+}
+$ingestScanAt = (Get-Date).ToUniversalTime()      # becomes the next run's cursor
+# Read the boot time BEFORE ingesting: a record whose helper finished before the last boot has had
+# its reboot request satisfied already, and re-importing it would schedule a second, pointless one.
+$bootUtc = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { $null }
+$detached = Import-DetachedResults $ingestCursor $bootUtc
+
+# A reboot a detached pass asked for must NOT be consumed by the run that ingests it. Under the
+# default ifRequired policy with a user logged in, that run only offers a cancellable countdown — if
+# it is postponed the record is already marked ingested, and since a winget-signalled reboot sets no
+# OS pending flag, the requirement would vanish for good. So it is carried in the stamp and only
+# cleared once the box has actually booted since the last run finished.
+$bootedSinceLastRun = [bool]($bootUtc -and $lastRunEnd -and ($bootUtc -gt $lastRunEnd.ToUniversalTime()))
+$carriedReboot = [bool]($stamp -and $stamp.handoffRebootPending) -and -not $bootedSinceLastRun
+if ($carriedReboot -and -not $detached.reboot) {
+  Write-Log INFO 'handoff: a previous detached pass still needs a reboot and none has happened since — carrying it forward.'
+}
+$handoffReboot = [bool]($detached.reboot -or $carriedReboot)
+
+if ($detached.upgraded -gt 0 -or $detached.failed -gt 0 -or $handoffReboot) {
+  $dStatus = if ($detached.failed -gt 0) { 'warn' } else { 'ok' }
+  $dDetail = "$($detached.upgraded) upgraded, $($detached.failed) failed since the last run" + $(if ($handoffReboot) { '; reboot required' } else { '' })
+  $results.Add([pscustomobject]([ordered]@{
+    name        = 'handoff'
+    status      = $dStatus
+    detail      = $dDetail
+    error       = $(if ($detached.failed -gt 0) { ($detached.notes -join '; ') } else { $null })
+    reboot      = $handoffReboot
+    durationSec = 0
+    log         = 'run.log'
+  }))
+  Write-Log $(if ($dStatus -eq 'warn') { 'WARN' } else { 'INFO' }) "handoff: $dDetail$(if ($detached.notes.Count) { " ($($detached.notes -join '; '))" })"
+  Add-Report ("- handoff: **{0}** {1}" -f $dStatus, $dDetail)
+}
+
 $rebootPending       = Test-PendingReboot                                  # global state (info/Status only)
 $rebootRequiredByRun = @($results | Where-Object reboot).Count -gt 0        # did THIS run's updates ask for it?
 $errors  = @($results | Where-Object status -eq 'error')
+$warns   = @($results | Where-Object status -eq 'warn')
 $endUtc  = (Get-Date).ToUniversalTime()
 $durSec  = [math]::Round(($endUtc - $startUtc).TotalSeconds, 1)
 
@@ -1075,7 +1565,15 @@ if ($rebootPending -and -not $willReboot) {
 }
 
 # day stamp (marks today done so the other triggers no-op; carries the pending-reboot watchdog state)
-Save-Stamp ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted })
+# ingestCursor: when THIS run's detached-result scan began (see above) — anything a helper wrote
+# after that point is still unread and must stay ingestable. Advanced ONLY when the scan actually
+# ran: an ingest aborted because a concurrent engine held the lock examined nothing, and moving the
+# cursor anyway would have the next run write off every record that already existed as stale.
+$nextCursor = if ($detached.scanned) { $ingestScanAt.ToString('o') } elseif ($stamp) { "$($stamp.ingestCursor)" } else { '' }
+if (-not $detached.scanned) { Write-Log INFO 'handoff: ingest did not run — leaving the cursor where it was.' }
+# handoffRebootPending: survives until a boot is actually observed, so postponing the dialog's
+# countdown cannot lose a reboot a detached pass asked for.
+Save-StampMerged ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted; handoffRebootPending = $handoffReboot; ingestCursor = $nextCursor }) $bootedSinceLastRun
 
 $summary = ($results | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
 Write-Log INFO "Components: $summary  (total ${durSec}s)"
@@ -1085,6 +1583,11 @@ if ($errors.Count -gt 0) {
   $msg = "$Name run $runStamp finished with errors: " + (($errors | ForEach-Object { $_.name }) -join ', ') + ". Drill in: $Name.ps1 -Mode Errors"
   Write-Evt 2010 Warning $msg
   Raise-SysSentryAlert $msg
+} elseif ($warns.Count -gt 0) {
+  # A warn is a component that did LESS than it was asked to — a Dell apply blocked by an exclusion,
+  # a package the handoff failed to upgrade. Logging event 2001 "clean" for those made a wholly
+  # blocked update path indistinguishable from a healthy run in the event log.
+  Write-Evt 2002 Warning ("$Name run $runStamp completed with warnings: " + (($warns | ForEach-Object { "$($_.name) — $($_.detail)" }) -join '; '))
 } else {
   Write-Evt 2001 Information "$Name run $runStamp clean: $summary"
 }
@@ -1159,15 +1662,32 @@ if ($notifyEnabled -and $interactive) {
 # SYSTEM process entirely. Hand them to SunUp-User, which runs as the interactive user and shares
 # this run's excludePattern. Requires a logged-on user (an Interactive task cannot run without a
 # session), so a headless run simply leaves them for the next run that has one.
-if ($cfg.winget.enabled) {
-  if ($interactive) {
-    try {
-      Start-ScheduledTask -TaskName $UserTask -ErrorAction Stop
-      Write-Log INFO "user-scope: started $UserTask (per-user winget packages SYSTEM cannot see)."
-    } catch { Write-Log WARN "user-scope: could not start ${UserTask}: $_" }
-  } else {
+# NOT started when this run is going to reboot: the pass routinely runs longer than the interactive
+# countdown (rebootGraceInteractiveSec, 300s by default), so the box would restart on top of a live
+# `winget upgrade` — a half-replaced install directory and no record of what was attempted. The
+# self-host handoff below has always skipped itself for exactly this reason; this one never did.
+$userScopeEnabled = $cfg.winget.enabled -and
+                    (($cfg.winget.PSObject.Properties.Name -notcontains 'userScope') -or $cfg.winget.userScope)
+$userTaskStarted  = $false
+if ($userScopeEnabled) {
+  if (-not $interactive) {
     Write-Log INFO "user-scope: no interactive session — skipping $UserTask this run (per-user packages need a logged-on user)."
+  } elseif ($willReboot) {
+    Write-Log INFO "user-scope: a reboot is due this run — skipping $UserTask rather than have it cut off mid-upgrade; the next run picks those packages up."
+  } else {
+    try {
+      $uStart = Start-TaskVerified $UserTask
+      if ($uStart.ok) {
+        $userTaskStarted = $true
+        Write-Log INFO "user-scope: started $UserTask (per-user winget packages SYSTEM cannot see)."
+      } else {
+        $m = "user-scope: $UserTask did NOT start — $($uStart.reason). Per-user packages are not being upgraded this run."
+        Write-Log WARN $m; Write-Evt 2031 Warning $m
+      }
+    } catch { Write-Log WARN "user-scope: could not start ${UserTask}: $_" }
   }
+} elseif ($cfg.winget.enabled) {
+  Write-Log INFO 'user-scope: disabled in config (winget.userScope=false) — machine scope only this run.'
 }
 
 Write-Log INFO "===== $Name run end ($runStamp) ====="
@@ -1176,31 +1696,49 @@ try { Stop-Transcript | Out-Null } catch {}
 # ---- self-host handoff ------------------------------------------------------
 # Registered and started only now: everything above (reboot decision, day stamp, history, dialog,
 # transcript) is already committed, so when Restart Manager kills this pwsh — and it will — the run
-# is already complete. The helper waits for THIS process id to exit before touching winget.
-# Skipped when a reboot is imminent: the helper would race the shutdown mid-install. The packages
-# simply stay on the upgrade list and the next run hands them off again.
+# is already complete. The helper waits for THIS process id to exit before touching winget, and for
+# the user-scope pass as well when one is running: that pass runs under pwsh 7, squarely inside the
+# blast radius of the PowerShell upgrade this helper is about to perform, and killing it mid-upgrade
+# loses its packages and its record of them.
 if (@($script:SelfHostPending).Count -gt 0) {
   $shIds = @($script:SelfHostPending | ForEach-Object { $_.id })
-  if ($willReboot) {
-    Write-Log INFO "self-host: reboot imminent — NOT starting $SelfHostTask this run (would race the shutdown). Deferred to the next run: $($shIds -join ', ')"
+  # Skipped only for the HEADLESS reboot, which is unconditional and imminent. When a user is logged
+  # in, $willReboot only means the dialog offers a CANCELLABLE countdown — deferring on that alone
+  # cost a full day every time someone clicked Postpone, on the strength of a reboot that then never
+  # happened. Instead the helper sleeps past the countdown and upgrades if the box is still up; if
+  # the user does restart, it dies with the box and the next run hands the packages off again.
+  if ($result.rebootAction -eq 'reboot') {
+    Write-Log INFO "self-host: headless reboot imminent — NOT starting $SelfHostTask this run (would race the shutdown). Deferred to the next run: $($shIds -join ', ')"
   } else {
+    $shDelay = if ($result.rebootAction -eq 'dialog-countdown') { $graceInteractive + 60 } else { 0 }
+    $shWaitTask = if ($userTaskStarted) { $UserTask } else { '' }
     try {
       $shScript = Join-Path $PSScriptRoot 'SelfHost.ps1'
       if (-not (Test-Path $shScript)) { throw "helper not found at $shScript" }
       # Windows PowerShell 5.1 on purpose — a separate installation, so Restart Manager shutting
       # down 'PowerShell 7' cannot reach it. Never change this to pwsh.exe.
       $shExe  = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-      $shArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Ids {1} -RunDir "{2}" -MainLog "{3}" -EvtSource "{4}" -TaskName "{5}" -WaitForPid {6}' -f `
-                $shScript, ($shIds -join ','), $script:RunDir, $LogFile, $EvtSource, $SelfHostTask, $PID
+      $shArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Ids {1} -RunDir "{2}" -MainLog "{3}" -EvtSource "{4}" -TaskName "{5}" -WaitForPid {6} -WaitForTask "{7}" -InitialDelaySec {8}' -f `
+                $shScript, ($shIds -join ','), $script:RunDir, $LogFile, $EvtSource, $SelfHostTask, $PID, $shWaitTask, $shDelay
       $shAction    = New-ScheduledTaskAction -Execute $shExe -Argument $shArgs
       $shPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+      # 3 hours, not 1: the helper may now sit through the dialog countdown and a full user-scope pass
+      # before it starts its own upgrades, and a task killed at its time limit writes no record.
       $shSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                       -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1) -MultipleInstances IgnoreNew
+                       -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
       Register-ScheduledTask -TaskName $SelfHostTask -Action $shAction -Principal $shPrincipal -Settings $shSettings -Force `
         -Description "$Name one-shot: upgrade packages that own the engine's own runtime, after the engine has exited. Self-deletes." | Out-Null
-      Start-ScheduledTask -TaskName $SelfHostTask -ErrorAction Stop
-      Write-Log INFO "self-host: started $SelfHostTask (Windows PowerShell 5.1, waits for pid $PID) for: $($shIds -join ', ')"
-      Write-Evt 2020 Information "${Name}: handed $(@($shIds).Count) self-hosting package(s) to ${SelfHostTask}: $($shIds -join ', ')"
+      $shStart = Start-TaskVerified $SelfHostTask
+      if ($shStart.ok) {
+        $waits = @("pid $PID") + $(if ($shWaitTask) { @("task $shWaitTask") } else { @() }) + $(if ($shDelay -gt 0) { @("a ${shDelay}s reboot-countdown grace") } else { @() })
+        Write-Log INFO "self-host: started $SelfHostTask (Windows PowerShell 5.1, waits for $($waits -join ' + ')) for: $($shIds -join ', ')"
+        Write-Evt 2020 Information "${Name}: handed $(@($shIds).Count) self-hosting package(s) to ${SelfHostTask}: $($shIds -join ', ')"
+      } else {
+        # The start was a no-op, so nothing was handed anywhere — say that, instead of logging a
+        # handoff and raising 2020 for an upgrade that will never happen.
+        $m = "self-host: $SelfHostTask did NOT start — $($shStart.reason). $($shIds -join ', ') left for the next run."
+        Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+      }
     } catch {
       $m = "self-host: could not start ${SelfHostTask}: $_ — $($shIds -join ', ') left for the next run."
       Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m

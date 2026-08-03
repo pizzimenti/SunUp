@@ -6,22 +6,57 @@ param([switch]$Purge)
 $ErrorActionPreference = 'Continue'
 
 $Name = 'SunUp'
-# Stop the tray process if it's running, then remove all tasks.
-Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# Stop anything of ours that is currently running, THEN remove the tasks. Unregister-ScheduledTask
+# does not terminate a running instance, and the detached helpers are not task instances at all, so
+# without this an uninstall could report success while SelfHost.ps1 went on to upgrade PowerShell 7
+# minutes later -- Restart Manager killing the admin's terminals after they were told SunUp was gone
+# -- and UserScope.ps1 kept upgrading packages against a config dir that no longer exists.
+# Both hosts matter: the tray/dialog/user pass run under pwsh.exe, the self-host helpers under
+# Windows PowerShell 5.1 (powershell.exe). Match on our script names, so no unrelated shell is hit.
+# Match the INSTALLED paths, not bare file names: '*\SelfHost.ps1*' would also match an unrelated
+# C:\tools\SelfHost.ps1, or a developer running another checkout of this repo, and an elevated
+# uninstall would kill it.
+$Bin = "C:\ProgramData\$Name\bin"
+$ourScripts = @('SunUp.ps1', 'SunUp-Tray.ps1', 'Show-UpdateDialog.ps1', 'UserScope.ps1', 'SelfHost.ps1') |
+              ForEach-Object { Join-Path $Bin $_ }
+Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $cl = "$($_.CommandLine)"; @($ourScripts | Where-Object { $cl -like "*$_*" }).Count -gt 0 } |
+  ForEach-Object {
+    Write-Host "  stopping pid $($_.ProcessId) ($($_.Name))"
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
 # SunUp-SelfHost is a one-shot that normally self-deletes; it is listed here in case a run was
-# interrupted between registering it and its own cleanup.
+# interrupted between registering it and its own cleanup. Stop before unregistering: a task that is
+# mid-run survives being unregistered.
 foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-User", "$Name-SelfHost", 'AutoUpdate', 'AutoUpdate-Notify')) {
+  try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
   Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
 }
-Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' (and any legacy AutoUpdate tasks)."
+Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' + '$Name-User' + '$Name-SelfHost' (and any legacy AutoUpdate tasks)."
 
 if ($Purge) {
-  Remove-Item "C:\ProgramData\$Name" -Recurse -Force -ErrorAction SilentlyContinue
+  # dcu-cli refuses to write its scan report into C:\ProgramData (a reserved folder), so the engine
+  # stages it in C:\SunUp\dcu instead -- see Get-DcuReportDir. Only the 'dcu' child is ours:
+  # Get-DcuReportDir creates it inside whatever C:\SunUp already was, so recursively deleting the
+  # PARENT would destroy unrelated data that happened to live there first.
+  $stageRoot = Join-Path $env:SystemDrive $Name
+  $purgePaths = @("C:\ProgramData\$Name", (Join-Path $stageRoot 'dcu'))
+  foreach ($p in $purgePaths) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+  # ...and the parent only when we are the only thing that was ever in it.
+  if ((Test-Path $stageRoot) -and -not @(Get-ChildItem $stageRoot -Force -ErrorAction SilentlyContinue).Count) {
+    Remove-Item $stageRoot -Force -ErrorAction SilentlyContinue
+  }
   foreach ($src in @($Name, 'AutoUpdate')) {
     if ([System.Diagnostics.EventLog]::SourceExists($src)) { Remove-EventLog -Source $src -ErrorAction SilentlyContinue }
   }
-  Write-Host "Purged C:\ProgramData\$Name and event source(s)."
+  # Removal errors above are suppressed (an open handle, a locked log), so report what is actually
+  # gone rather than announcing a purge that did not happen.
+  $left = @($purgePaths | Where-Object { Test-Path $_ })
+  $gone = @($purgePaths | Where-Object { -not (Test-Path $_) })
+  if ($gone.Count -gt 0) { Write-Host "Purged $($gone -join ', ') and event source(s)." }
+  if ($left.Count -gt 0) {
+    Write-Warning "Could NOT remove: $($left -join ', ') — something still holds a handle. Re-run after a reboot, or delete by hand."
+  }
 }
 
 $sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'
