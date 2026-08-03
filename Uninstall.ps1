@@ -35,16 +35,15 @@ foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-User", "$Name-SelfH
 Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' + '$Name-User' + '$Name-SelfHost' (and any legacy AutoUpdate tasks)."
 
 if ($Purge) {
-  # dcu-cli refuses to write its scan report into C:\ProgramData (a reserved folder), so the engine
-  # stages it in C:\SunUp\dcu instead -- see Get-DcuReportDir. Only the 'dcu' child is ours:
-  # Get-DcuReportDir creates it inside whatever C:\SunUp already was, so recursively deleting the
-  # PARENT would destroy unrelated data that happened to live there first.
-  $stageRoot = Join-Path $env:SystemDrive $Name
-  $purgePaths = @("C:\ProgramData\$Name", (Join-Path $stageRoot 'dcu'))
+  # v0.13.x staged Dell scan reports in C:\SunUp (dcu-cli refuses to write into C:\ProgramData).
+  # That integration is gone as of v0.14.0, but an upgraded install may still have the directory, so
+  # clean it up here. Only the 'dcu' child was ever ours: C:\SunUp may pre-date SunUp and hold
+  # unrelated data, so the parent goes only when it is left empty.
+  $legacyStage = Join-Path $env:SystemDrive $Name
+  $purgePaths  = @("C:\ProgramData\$Name", (Join-Path $legacyStage 'dcu'))
   foreach ($p in $purgePaths) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
-  # ...and the parent only when we are the only thing that was ever in it.
-  if ((Test-Path $stageRoot) -and -not @(Get-ChildItem $stageRoot -Force -ErrorAction SilentlyContinue).Count) {
-    Remove-Item $stageRoot -Force -ErrorAction SilentlyContinue
+  if ((Test-Path $legacyStage) -and -not @(Get-ChildItem $legacyStage -Force -ErrorAction SilentlyContinue).Count) {
+    Remove-Item $legacyStage -Force -ErrorAction SilentlyContinue
   }
   foreach ($src in @($Name, 'AutoUpdate')) {
     if ([System.Diagnostics.EventLog]::SourceExists($src)) { Remove-EventLog -Source $src -ErrorAction SilentlyContinue }

@@ -21,11 +21,14 @@ All toggleable in `config.json`, run in one coordinated pass:
 |---|---|---|
 | **Defender** | Antivirus signature definitions | Duration captured per run |
 | **Windows + Microsoft Update** | OS + Office/other MS products | via PSWindowsUpdate; can exclude by title (e.g. pinned `NVIDIA` drivers) |
-| **winget** | Desktop app upgrades | per-package, capturing old→new version, duration, and download size |
-| **Dell Command Update** | Drivers & firmware | **BIOS is reported only, never auto-flashed** |
+| **winget** | Desktop app upgrades | per-package, capturing old→new version, duration, and download size; plus a per-user pass for the HKCU packages SYSTEM cannot see |
 | **PowerShell modules** | PSGallery modules | weekly (`psModules.everyDays`), not daily |
 
 `pip` / `npm` stubs are present but off by default.
+
+Nothing here is vendor- or hardware-specific — every component ships with Windows or with winget, so
+SunUp runs on any Windows box. (v0.14.0 removed the Dell Command Update integration; see the
+CHANGELOG for the evidence behind that.)
 
 ## How it's scheduled
 
@@ -94,10 +97,6 @@ write their own records into that run's dir — `user-winget.json`, `selfhost.js
 `user-selfhost.json` — and the **next** run folds them into its `updates[]`, dialog, history and
 reboot decision, exactly once (marked `ingested`).
 
-`C:\SunUp\dcu` holds the Dell scan report. It is not under `C:\ProgramData` because `dcu-cli`
-refuses to write reports into reserved folders — `C:\ProgramData`, `C:\Windows\Temp` and
-`C:\Users\Public` all make it exit 107 without scanning. `-Purge` removes it.
-
 Plus a `REPORT.md` digest and the Application event log (source `SunUp`: 2000 start, 2001 clean,
 2002 completed with warnings, 2005 reboot, 2006 stale-reboot-pending, 2010 errors, 2011 previous run
 killed mid-run, 2020/2021 self-host handoff, 2030/2031 user-scope pass).
@@ -147,8 +146,6 @@ defaults):
 | `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process. The engine does **not** upgrade these — it hands them to `SelfHost.ps1` (see below) |
 | `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | **unused since v0.12.0**, retained so existing configs load. Passing this via `--custom` did not stop Restart Manager (measured 2026-07-28) |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
-| `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
-| `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted. Categories are mapped onto dcu-cli's own vocabulary (`audio,video,network,storage,input,chipset,others`) first; the report's free text (`Application`, `Serial ATA`, …) is not a valid value and gets the whole apply rejected. If the scan report is missing or unparseable the apply is **skipped entirely**, since the exclusion cannot be enforced without it |
 
 ### Per-user packages (`SunUp-User`)
 
@@ -208,7 +205,6 @@ Manager; nothing short of a reboot-time install avoids it.
 
 - Windows 10/11, PowerShell 7 (`pwsh`).
 - [PSWindowsUpdate](https://www.powershellgallery.com/packages/PSWindowsUpdate) (installed by `Install.ps1`).
-- Optional: Dell Command Update (`dcu-cli`) for hardware updates — skipped cleanly if absent.
 
 ## License
 

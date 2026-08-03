@@ -1,11 +1,12 @@
-# Tests for the crash-reporting, self-hosting-handoff and Dell-exclusion logic. Safe to run anywhere:
-# no live update run, no installs, no reboots, nothing touched outside this folder.
-#   1. the engine parses;
+# Tests for the crash-reporting and self-hosting-handoff logic. Safe to run anywhere: no live update
+# run, no installs, no reboots, nothing touched outside this folder.
+#   1. every shipped script parses;
 #   2. Report-CrashedRuns (lifted from source via AST) flags exactly the dead run dirs, once;
 #   3. self-hosting packages leave the engine's upgrade list, and SelfHost.ps1 really is runnable
 #      by Windows PowerShell 5.1 (parsed by the real 5.1 parser, not pwsh's);
-#   4. the Dell exclusions fail closed;
-#   5. the engine never upgrades a self-hosting package in-process again.
+#   5. the engine never upgrades a self-hosting package in-process again;
+#   7-9. the user-scope pass, the detached-result ingest, and uninstall.
+# (Section 4 covered the Dell/dcu integration, removed in v0.14.0.)
 # Run:  pwsh -File .\tests\Test-SunUp.ps1
 $src = Join-Path (Split-Path $PSScriptRoot -Parent) 'SunUp.ps1'
 $fail = 0
@@ -49,7 +50,7 @@ function Raise-SysSentryAlert { param($Msg)
 }
 $script:Version = 'test'
 
-foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Split-DcuUpdates','ConvertTo-DcuCategory','Parse-DcuReport','Import-DetachedResults') {
+foreach ($name in 'New-RunDirectory','Publish-JsonFile','Test-RunAlive','Report-CrashedRuns','Import-DetachedResults') {
   $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }.GetNewClosure(), $true)
   Check "$name found in source" ($null -ne $fn)
   Invoke-Expression $fn.Extent.Text
@@ -277,158 +278,6 @@ Check 'no lock means NO upgrade, reported as a failed handoff' `
 Check 'the helper waits for the user-scope task as well as the engine pid' ($selfText -match '\$WaitForTask' -and $selfText -match 'Get-ScheduledTask -TaskName \$WaitForTask')
 Check 'the helper can sit out an interactive reboot countdown' ($selfText -match '\$InitialDelaySec' -and $selfText -match 'Start-Sleep -Seconds \$InitialDelaySec')
 Check 'the helper labels its own log/json (so the user pass cannot clobber the SYSTEM one)' ($selfText -match '\$SelfJson = Join-Path \$RunDir \(\$Label')
-
-Write-Host "`n[4] Dell exclusions (the NVIDIA pin, third path)"
-$mk = { param($n, $c) [pscustomobject]@{ name = $n; category = $c; version = '1.0'; bytes = 0 } }
-$dellScan = @(
-  & $mk 'NVIDIA GeForce GTX 1060 Graphics Driver' 'Video'
-  & $mk 'Intel HD Graphics Driver'                'Video'
-  & $mk 'Realtek Audio Driver'                    'Audio'
-  & $mk 'Intel Chipset Device Software'           'Chipset'
-)
-$s = Split-DcuUpdates $dellScan 'NVIDIA|GeForce'
-Check 'the pinned GPU driver is excluded' (($s.excluded | ForEach-Object name) -join ',' -match 'NVIDIA')
-Check 'its device category is dropped from the apply' ($s.categories -notcontains 'video') ($s.categories -join ',')
-Check 'a same-category update is reported as collateral, not silently dropped' (($s.collateral | ForEach-Object name) -join ',' -eq 'Intel HD Graphics Driver')
-Check 'unrelated categories still apply' ((($s.apply | ForEach-Object name) -join ',') -eq 'Realtek Audio Driver,Intel Chipset Device Software')
-Check 'the pinned driver never appears in the apply set' (-not (($s.apply | ForEach-Object name) -match 'NVIDIA'))
-
-$none = Split-DcuUpdates $dellScan 'ThisMatchesNothing'
-Check 'no match means no filtering at all' ($none.apply.Count -eq 4 -and $none.categories.Count -eq 0 -and $none.excluded.Count -eq 0)
-
-# An excluded update with no category gives dcu-cli nothing to filter on — apply nothing rather than
-# risk installing the very thing we promised to skip.
-$uncat = Split-DcuUpdates @((& $mk 'NVIDIA GeForce Driver' ''), (& $mk 'Realtek Audio Driver' 'Audio')) 'NVIDIA'
-Check 'an uncategorized exclusion blocks the whole apply' ($uncat.apply.Count -eq 0)
-Check 'and it is still reported as excluded' ($uncat.excluded.Count -eq 1)
-Check 'empty scan is handled' ((Split-DcuUpdates @() 'NVIDIA').apply.Count -eq 0)
-
-# MIXED scan — the case that defeated the first version of this fail-safe: one excluded update WITH a
-# category and one WITHOUT. $banned is non-empty, so a naive "all of them lack a category" check
-# passes and the uncategorized pinned driver sails through the very filter meant to stop it.
-$mixed = Split-DcuUpdates @(
-  & $mk 'NVIDIA Quadro Driver'      ''        # no category — unfilterable
-  & $mk 'NVIDIA GeForce GTX Driver' 'Video'   # categorized
-  & $mk 'Realtek Audio Driver'      'Audio'
-) 'NVIDIA|GeForce'
-Check 'a MIXED exclusion (one uncategorized) fails closed' ($mixed.apply.Count -eq 0) (($mixed.apply | ForEach-Object name) -join ',')
-Check 'the mixed case names no apply categories' ($mixed.categories.Count -eq 0)
-Check 'the mixed case explains itself' ($mixed.reason -match 'no device category') $mixed.reason
-Check 'the safe update is reported deferred, not lost' (($mixed.collateral | ForEach-Object name) -contains 'Realtek Audio Driver')
-
-# An uncategorized NON-excluded update cannot be selected by -updateDeviceCategory either, so it must
-# be reported as deferred rather than counted as installed.
-$orphan = Split-DcuUpdates @(
-  & $mk 'NVIDIA GeForce GTX Driver' 'Video'
-  & $mk 'Mystery Firmware'          ''
-  & $mk 'Realtek Audio Driver'      'Audio'
-) 'NVIDIA|GeForce'
-Check 'an unselectable update is never counted as applied' (-not (($orphan.apply | ForEach-Object name) -contains 'Mystery Firmware')) (($orphan.apply | ForEach-Object name) -join ',')
-Check 'it is reported as deferred instead' (($orphan.collateral | ForEach-Object name) -contains 'Mystery Firmware')
-Check 'and the categorized survivor still applies' ((($orphan.apply | ForEach-Object name) -join ',') -eq 'Realtek Audio Driver')
-Check 'every applied update has a category to select it by' (@($orphan.apply | Where-Object { -not "$($_.category)".Trim() }).Count -eq 0)
-
-# dcu-cli accepts EXACTLY (audio,video,network,storage,input,chipset,others) for
-# -updateDeviceCategory and rejects the whole command for anything else -- so the apply exits
-# non-zero and installs NOTHING. The report does not speak that vocabulary: the real
-# DCUApplicableUpdates.xml on this box says <category>Application</category>, and Dell also ships
-# categories containing spaces and commas, which a raw `-join ','` would split into extra bogus
-# tokens. Every emitted category must therefore be one of the seven.
-$validCats = 'audio','video','network','storage','input','chipset','others'
-$vocab = Split-DcuUpdates @(
-  & $mk 'NVIDIA GeForce Driver'                 'Video'
-  & $mk 'Dell SupportAssist OS Recovery Plugin' 'Application'                     # the REAL one, caldera 2026-08-02
-  & $mk 'Dell Universal Receiver Firmware'      'Mouse, Keyboard & Input Devices' # commas + spaces
-  & $mk 'Intel Rapid Storage Technology'        'Serial ATA'
-) 'NVIDIA'
-Check 'every emitted category is one dcu-cli accepts' (@($vocab.categories | Where-Object { $validCats -notcontains $_ }).Count -eq 0) ($vocab.categories -join ',')
-Check 'a category containing commas cannot become extra bogus tokens' (($vocab.categories -join ',') -notmatch 'keyboard|devices|serial')
-Check 'Application lands in the others bucket' ($vocab.categories -contains 'others')
-Check 'Serial ATA lands in storage'            ($vocab.categories -contains 'storage')
-Check 'Mouse/Keyboard lands in input'          ($vocab.categories -contains 'input')
-Check 'the excluded video category is still dropped' ($vocab.categories -notcontains 'video')
-Check 'an uncategorized update still maps to nothing (unfilterable, not "others")' ((ConvertTo-DcuCategory '   ') -eq '')
-
-Write-Host "`n[4b] an unreadable Dell scan report must fail CLOSED"
-# An empty parse and a FAILED parse are not the same thing: a truncated/locked/schema-changed report
-# used to come back as an empty array, which reads as "nothing to exclude" -- so nothing was banned,
-# no category restriction was passed, and /applyUpdates ran unrestricted straight over the pin.
-$xmlOk    = Join-Path $PSScriptRoot 'dcu-ok.xml'
-$xmlEmpty = Join-Path $PSScriptRoot 'dcu-empty.xml'
-$xmlBad   = Join-Path $PSScriptRoot 'dcu-bad.xml'
-@'
-<?xml version="1.0"?>
-<updates version="5.7.0" schemaVersion="1.2">
-  <update><release>5CW83</release><name>Dell SupportAssist OS Recovery Plugin</name><version>5.5.16.2</version>
-  <urgency>Recommended</urgency><type>Application</type><category>Application</category><bytes>23151424</bytes></update>
-</updates>
-'@ | Set-Content $xmlOk -Encoding UTF8
-'<?xml version="1.0"?><updates version="5.7.0" schemaVersion="1.2"></updates>' | Set-Content $xmlEmpty -Encoding UTF8
-'<?xml version="1.0"?><updates><update><name>truncated mid-w' | Set-Content $xmlBad -Encoding UTF8
-$okParse = Parse-DcuReport $xmlOk
-Check 'a good report parses to its updates' (@($okParse).Count -eq 1) (@($okParse).Count)
-Check 'and carries the fields the apply needs' ("$($okParse[0].name)" -match 'SupportAssist' -and "$($okParse[0].category)" -eq 'Application')
-$emptyParse = Parse-DcuReport $xmlEmpty
-Check 'an EMPTY report parses to an empty list (not $null)' (($null -ne $emptyParse) -and (@($emptyParse).Count -eq 0)) `
-      ("isNull=$($null -eq $emptyParse) count=$(@($emptyParse).Count) raw='$(Get-Content $xmlEmpty -Raw)'")
-Check 'a TRUNCATED report returns $null, so the caller can fail closed' ($null -eq (Parse-DcuReport $xmlBad))
-Check 'a MISSING report returns $null too' ($null -eq (Parse-DcuReport (Join-Path $PSScriptRoot 'no-such-report.xml')))
-# dcu-cli has a distinct code for "nothing applicable" (500, no report written), so exit 0 means it
-# had something to report. If the parse finds no records in it, the two disagree - a renamed element
-# in a future schema would otherwise read as "nothing to exclude" and run the apply unrestricted.
-$dellSrc = Get-Content $src -Raw
-Check 'exit 0 with no recognized update records is treated as unusable' `
-      ($dellSrc -match '\(@\(\$avail\)\.Count -gt 0\)' -and $dellSrc -match 'no recognized update records')
-
-# dcu-cli refuses to write its report into a reserved folder and exits 107 WITHOUT SCANNING.
-# C:\ProgramData -- where every run dir lives -- is one; measured on caldera on three consecutive
-# runs, all of which then applied nothing while still reporting a clean run.
-$dellText = Get-Content $src -Raw
-Check 'the scan does NOT report into the run dir (C:\ProgramData is reserved)' ($dellText -notmatch '\$reportDir\s*=\s*\$script:RunDir')
-Check 'it reports into a dedicated staging dir instead' ($dellText -match 'function Get-DcuReportDir' -and $dellText -match '-report="\$scanDir"')
-Check 'and the report is still copied into the run dir for the record' ($dellText -match "Copy-Item \`$xmlPath \(Join-Path \`$script:RunDir 'DCUApplicableUpdates\.xml'\)")
-Check 'an unusable scan is an ERROR, so it reaches event 2010 and SysSentry' ($dellText -match "status = 'error'; detail = .scan unusable")
-Check 'a wholly blocked apply is not reported as a clean ok' ($dellText -match "no Dell update can be applied while the exclusion stands")
-# `icacls /inheritance:r /grant` removes only INHERITED entries: an unprivileged process that created
-# C:\SunUp first keeps its own explicit ACE and its OWNERSHIP, and an owner can restore the DACL.
-# Replacing the whole DACL and taking ownership is what actually locks it. (icacls is also a native
-# command whose non-zero exit throws nothing, so the old try/catch could never report a failure.)
-Check 'the staging dir DACL is replaced, not merely un-inherited' ($dellText -match 'SetAccessRuleProtection\(\$true, \$false\)' -and $dellText -match 'SetOwner\(\$admins\)')
-# New-Item -Force REUSES an existing dir, and the run stamp is predictable (daily 08:00 trigger), so
-# a per-run dir pre-created before the parent was ever locked down keeps its creator's ACEs.
-Check 'the per-run staging child is hardened too, not just its ancestors' `
-      ($dellText -match 'function Protect-Directory' -and $dellText -match 'if \(-not \(Protect-Directory \$scanDir\)\)')
-# ...but a C:\SunUp that pre-dates SunUp and holds unrelated files must NOT have its DACL and owner
-# replaced - that would lock its owner out of their own data. Uninstall draws the same line.
-Check 'a pre-existing foreign staging parent is refused, not taken over' `
-      ($dellText -match 'already contains files that are not SunUp' -and $dellText -match '\$foreign = @\(Get-ChildItem \$root')
-Check 'and ownership is taken with it' ($dellText -match "SecurityIdentifier 'S-1-5-32-544'")
-# EVERY ancestor, not just the leaf: C:\SunUp pre-created as a junction leaves C:\SunUp\dcu looking
-# like an ordinary folder while every ACL we set follows the junction to a target the planter owns.
-Check 'a reparse point ANYWHERE in the staging path is refused' `
-      ($dellText -match 'function Test-PathHasReparsePoint' -and $dellText -match 'refusing to scan under it' -and $dellText -match 'if \(Test-PathHasReparsePoint \$Path\) \{ return \$false \}')
-$rpFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-PathHasReparsePoint' }, $true)
-Check 'Test-PathHasReparsePoint found in source' ($null -ne $rpFn)
-if ($rpFn) {
-  Invoke-Expression $rpFn.Extent.Text
-  $rpBase = Join-Path $PSScriptRoot 'rp-probe'
-  $rpReal = Join-Path $rpBase 'real'; $rpLeaf = Join-Path $rpBase 'link\leaf'
-  New-Item -ItemType Directory -Force (Join-Path $rpReal 'leaf') | Out-Null
-  $mk = & cmd /c mklink /J "$rpBase\link" "$rpReal" 2>&1     # junction in an ANCESTOR of the leaf
-  Check 'an ordinary path is accepted' (-not (Test-PathHasReparsePoint (Join-Path $rpReal 'leaf')))
-  if (Test-Path "$rpBase\link") {
-    Check 'a junction in an ANCESTOR is caught, not just the leaf' (Test-PathHasReparsePoint $rpLeaf) "$mk"
-  } else { Check 'junction could not be created (skipped)' $true }
-  Remove-Item $rpBase -Recurse -Force -ErrorAction SilentlyContinue
-}
-# Overlapping runs sharing one staging dir would delete each other's report mid-flight.
-Check 'each run stages its scan in its own subdirectory' ($dellText -match '\$scanDir = Join-Path \$scanRoot \(Split-Path \$script:RunDir -Leaf\)')
-# Returning the dir after a FAILED lockdown would have Comp-Dell trust a report that may still be
-# writable by whoever pre-created the folder - and that report is what keeps the pinned driver out.
-Check 'a failed lockdown fails CLOSED rather than trusting the dir' `
-      ($dellText -match '(?s)could not lock down \$Path.{0,200}return \$false' -and $dellText -match 'if \(-not \(Protect-Directory \$d\)\) \{ return \$null \}')
-Check 'and Comp-Dell turns that into an error, not an apply' ($dellText -match 'if \(-not \$scanRoot\)' -and $dellText -match 'could not be trusted')
-Check 'the report is found by what the scan produced, not an assumed file name' ($dellText -match "Get-ChildItem \`$scanDir -Filter '\*\.xml'")
 
 Write-Host "`n[5] the engine no longer upgrades self-hosting packages in-process"
 # REGRESSION GUARD for the v0.12.0 fix. Three runs died because the engine ran the PowerShell
@@ -712,12 +561,13 @@ Check 'and looks at Windows PowerShell 5.1, where SelfHost runs' ($uninstText -m
 Check 'and stops running task instances before unregistering them' ($uninstText -match 'Stop-ScheduledTask')
 # Removal errors are suppressed, so "Purged …" was printed even when a path survived an open handle.
 Check 'purge reports only what it actually removed' ($uninstText -match 'Could NOT remove' -and $uninstText -match 'Where-Object \{ -not \(Test-Path \$_\) \}')
-# C:\SunUp may have pre-existed with unrelated data: Get-DcuReportDir creates the 'dcu' child inside
-# whatever was already there, so purging the PARENT recursively would destroy someone else's files.
-Check 'purge removes only the dcu subtree, not whatever else lives in C:\SunUp' `
-      ($uninstText -match "Join-Path \`$stageRoot 'dcu'" -and $uninstText -notmatch 'Remove-Item .\$env:SystemDrive.\$Name. -Recurse')
-Check 'and removes the parent only when it is empty' `
-      ($uninstText -match '(?s)Get-ChildItem \$stageRoot -Force.{0,120}Remove-Item \$stageRoot -Force')
+# v0.13.x staged Dell reports in C:\SunUp; that integration is gone, but an UPGRADED install still
+# has the directory, so the cleanup stays. It may also pre-date SunUp and hold unrelated data, so
+# only the 'dcu' child was ever ours and the parent goes only when left empty.
+Check 'purge still cleans up the legacy staging dir' `
+      ($uninstText -match "Join-Path \`$legacyStage 'dcu'" -and $uninstText -notmatch 'Remove-Item .\$env:SystemDrive.\$Name. -Recurse')
+Check 'and removes its parent only when it is empty' `
+      ($uninstText -match '(?s)Get-ChildItem \$legacyStage -Force.{0,140}Remove-Item \$legacyStage -Force')
 
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
@@ -731,7 +581,6 @@ Check 'and removes the parent only when it is empty' `
 } finally {
   if (Test-Path $RunsDir) { Remove-Item $RunsDir -Recurse -Force -ErrorAction SilentlyContinue }
   Remove-Item (Join-Path $PSScriptRoot 'argprobe.ps1') -Force -ErrorAction SilentlyContinue
-  foreach ($f in 'dcu-ok.xml','dcu-empty.xml','dcu-bad.xml') { Remove-Item (Join-Path $PSScriptRoot $f) -Force -ErrorAction SilentlyContinue }
 }
 Write-Host ""
 if ($fail -eq 0) { Write-Host "ALL TESTS PASSED" -ForegroundColor Green } else { Write-Host "$fail TEST(S) FAILED" -ForegroundColor Red; exit 1 }
