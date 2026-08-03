@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 Deploys SunUp to C:\ProgramData\SunUp, ensures its dependencies (PSWindowsUpdate +
-Microsoft Update service, Dell Command Update best-effort), registers the SYSTEM 'SunUp'
+Microsoft Update service), registers the SYSTEM 'SunUp'
 task with three triggers (Daily 08:00, Boot+1h, Resume+1h) and the interactive 'SunUp-Notify'
 dialog task, and refreshes the SysSentry baseline so the tasks don't read as security drift.
 
@@ -102,7 +102,6 @@ if (-not (Test-Path $ConfigFile)) {
   "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs" },
   "defender":      { "enabled": true },
   "psModules":     { "enabled": true, "everyDays": 7 },
-  "dell":          { "enabled": true, "applyTypes": "driver,firmware,utility", "reportTypes": "bios" },
   "pip":           { "enabled": false },
   "npm":           { "enabled": false }
 }
@@ -147,20 +146,6 @@ try {
   Write-Host 'Microsoft Update service registered.'
 } catch { Write-Warning "Could not register Microsoft Update service: $_" }
 
-# ---- Dell Command Update (best-effort; enables the hardware component) -------
-$dcu = @('C:\Program Files\Dell\CommandUpdate\dcu-cli.exe','C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe') |
-       Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $dcu) {
-  Write-Host 'Dell Command Update not found — attempting winget install (best-effort)…'
-  foreach ($id in 'Dell.CommandUpdate.Universal','Dell.CommandUpdate') {
-    try {
-      winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-      if ($LASTEXITCODE -eq 0) { Write-Host "Installed $id"; break }
-    } catch {}
-  }
-  Write-Host '(If install failed, hardware updates are simply skipped — set dell.enabled=false in config.json to silence.)'
-}
-
 # ---- scheduled task: SYSTEM, three triggers ---------------------------------
 $pwsh      = (Get-Command pwsh).Source
 $action    = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Bin\SunUp.ps1`" -Mode Run"
@@ -186,7 +171,7 @@ $tResume.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="Sy
 
 Register-ScheduledTask -TaskName $Task -Action $action -Principal $principal -Settings $settings `
   -Trigger @($tDaily, $tBoot, $tResume) -Force `
-  -Description 'caldera daily update routine (WU/winget/Defender/Dell/PS modules). Daily 08:00 if awake; else +1h after boot/resume. Once per day via lastrun.json stamp.' | Out-Null
+  -Description 'caldera daily update routine (WU/winget/Defender/PS modules). Daily 08:00 if awake; else +1h after boot/resume. Once per day via lastrun.json stamp.' | Out-Null
 Write-Host "Registered task '$Task' (Daily 08:00, Boot+1h, Resume+1h)."
 
 # ---- notify task: runs in the INTERACTIVE USER session to show the dialog ----

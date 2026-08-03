@@ -12,8 +12,10 @@ de-duplicated by a per-day stamp so the box updates exactly once per calendar da
 Whichever fires first does the work; the rest see the stamp and no-op.
 
 Covers (config-toggled): Microsoft Defender signatures, Windows/Microsoft Update,
-winget package upgrades, Dell Command Update drivers/firmware (BIOS reported only),
-and PowerShell modules. One coordinated reboot at the end if anything needs it.
+winget package upgrades, and PowerShell modules. One coordinated reboot at the end if
+anything needs it. Nothing here is vendor- or hardware-specific: every component ships
+with Windows or with winget, so this runs on any Windows box. (v0.14.0 removed the Dell
+Command Update integration — see the CHANGELOG for why.)
 
 LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
   C:\ProgramData\SunUp\
@@ -23,7 +25,7 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         run.log                        this run's curated timeline
         transcript.log                 full Start-Transcript capture (belt + suspenders)
         <component>.log                RAW output of each tool (defender/windowsupdate/
-                                       winget/dell-apply/dell-bios-scan/psmodules)
+                                       winget/psmodules)
         result.json                    structured per-component result for this run
         running.json                   liveness marker (PID + process start) while the run is in
                                        flight; deleted once result.json is written
@@ -48,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.13.1'
+$script:Version = '0.14.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -114,11 +116,6 @@ $DefaultConfig = [ordered]@{
   }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
-  # excludePattern matches an update's NAME from the dcu-cli scan report. It exists so the NVIDIA pin
-  # is enforced on ALL THREE update paths — windowsUpdate.notTitle, winget.excludePattern, and here —
-  # instead of two out of three. dcu-cli cannot filter by name, so a matched update is avoided by
-  # dropping its device category from the apply; see Split-DcuUpdates for what that costs.
-  dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios'; excludePattern = 'NVIDIA|GeForce' }
   pip                = [ordered]@{ enabled = $false }
   npm                = [ordered]@{ enabled = $false }
 }
@@ -679,375 +676,6 @@ function Comp-Winget { param($Cfg)
   @{ status = 'ok'; detail = $detail; reboot = $reboot }
 }
 
-# Parse dcu-cli's `/scan -report` XML into per-update records. The report lists every APPLICABLE
-# update with its name, AVAILABLE version, size (bytes), and type — everything we need for the table
-# EXCEPT the currently-installed (old) version, which dcu-cli does not expose anywhere.
-#
-# Returns $null when the report cannot be READ or PARSED, and an (possibly empty) array when it can.
-# Those two are not the same thing and must never be conflated: a truncated, locked or schema-changed
-# report used to come back as an empty array, which reads as "nothing to exclude" — so the exclusion
-# split found nothing to ban, passed no category restriction, and handed /applyUpdates a completely
-# unrestricted run over the very driver the pin exists to protect. The caller fails closed on $null.
-# (`return ,$out` on purpose: a bare `return @()` unrolls to nothing and would arrive as $null.)
-function Parse-DcuReport { param([string]$XmlPath)
-  if (-not (Test-Path $XmlPath)) { return $null }
-  try { [xml]$r = Get-Content $XmlPath -Raw -ErrorAction Stop } catch { return $null }
-  if (-not $r -or -not $r.DocumentElement) { return $null }
-  $out = @()
-  foreach ($u in $r.SelectNodes('//*[local-name()="update"]')) {
-    $g = { param($n) ($u.ChildNodes | Where-Object { $_.LocalName -eq $n } | Select-Object -First 1).InnerText }
-    $bytes = 0L; [void][long]::TryParse("$(& $g 'bytes')", [ref]$bytes)
-    $out += [pscustomobject]@{
-      release = "$(& $g 'release')"; name = "$(& $g 'name')"; version = "$(& $g 'version')"
-      type    = "$(& $g 'type')";    category = "$(& $g 'category')"; urgency = "$(& $g 'urgency')"; bytes = $bytes
-    }
-  }
-  ,$out    # comma on purpose: a bare `$out` unrolls an empty array to nothing, i.e. to $null — the
-           # one value that means "unreadable" here, which would invert the whole guard.
-}
-
-# Map a scan report's free-text <category> onto the FIXED vocabulary dcu-cli's -updateDeviceCategory
-# accepts. `dcu-cli /applyUpdates -help` (v5.7.0, this box) states plainly:
-#     -updateDeviceCategory - Allows the user to filter updates based on device type.
-#     Expected value(s): (audio,video,network,storage,input,chipset,others)
-# The report does NOT speak that vocabulary. The real DCUApplicableUpdates.xml on caldera carries
-# <category>Application</category>, and Dell also ships categories with spaces and commas in them
-# ("Mouse, Keyboard & Input Devices", "Serial ATA"). Lower-casing the raw text and joining it with
-# commas — what this used to do — produced `-updateDeviceCategory=application`, which dcu-cli rejects
-# outright: the apply exits non-zero and installs NOTHING, for as long as a pinned update keeps the
-# exclusion path alive. Anything unrecognized maps to 'others', dcu-cli's own catch-all bucket.
-# Empty stays empty: an update with no category is UNFILTERABLE, and Split-DcuUpdates fails closed on
-# it rather than guessing a bucket that might not select it.
-function ConvertTo-DcuCategory { param([string]$Raw)
-  $c = "$Raw".Trim().ToLower()
-  if (-not $c) { return '' }
-  switch -Regex ($c) {
-    'audio|sound'                                                { return 'audio'   }
-    'video|graphic|display'                                      { return 'video'   }
-    'network|wireless|wi-?fi|wlan|ethernet|\blan\b|modem|bluetooth' { return 'network' }
-    'storage|serial ?ata|sata|nvme|\bssd\b|hard ?drive|\bdisk\b|raid' { return 'storage' }
-    'input|mouse|keyboard|touch|pointing'                        { return 'input'   }
-    'chipset'                                                    { return 'chipset' }
-    default                                                      { return 'others'  }
-  }
-}
-
-# Decide what a Dell apply may touch, given a name-based exclusion (e.g. a pinned GPU driver).
-#
-# The problem: `dcu-cli /applyUpdates` filters by update TYPE and by DEVICE CATEGORY — never by name.
-# So an excluded update cannot be skipped individually; the only lever is dropping its whole category
-# from this apply. That is a real cost (a legitimate update sharing the category is deferred with it),
-# so it is computed explicitly here and named in the log rather than happening invisibly.
-#
-# Why this exists at all: the NVIDIA pin (GTX 1060 held at 580.97) is enforced on the Windows Update
-# path by notTitle and on the winget path by excludePattern, but the Dell path had NO filter — so a
-# Dell-packaged GeForce driver would have installed straight over the pin.
-#
-# Returns: apply (safe to install), excluded (matched the pattern), collateral (deferred only because
-# they share a category with an excluded update), categories (what to pass to -updateDeviceCategory;
-# EMPTY means "do not apply anything this run" — see below).
-function Split-DcuUpdates { param($Updates, [string]$ExcludePattern)
-  $all = @($Updates)
-  $res = @{ apply = $all; excluded = @(); collateral = @(); categories = @(); reason = '' }
-  if (-not $ExcludePattern -or $all.Count -eq 0) { return $res }
-
-  $res.excluded = @($all | Where-Object { "$($_.name)" -match $ExcludePattern })
-  if ($res.excluded.Count -eq 0) { return $res }
-
-  # Canonical dcu-cli tokens, not raw report text — see ConvertTo-DcuCategory. Both sides of the
-  # decision (what is banned, what may still apply) go through the same mapping, so two updates that
-  # land in the same dcu bucket are treated as sharing a category even when the report words them
-  # differently. That is the conservative direction: it defers more, never applies more.
-  $cat = { param($u) ConvertTo-DcuCategory "$($u.category)" }
-  $rest = @($all | Where-Object { "$($_.name)" -notmatch $ExcludePattern })
-
-  # FAIL CLOSED if ANY excluded update lacks a device category — not merely if they all do. A mixed
-  # scan (one uncategorized NVIDIA entry + one categorized GeForce entry) yields a non-empty banned
-  # list, and the resulting -updateDeviceCategory restriction cannot express "except the one with no
-  # category" — so the pinned driver would sail through the filter that exists to stop it.
-  $uncategorizedExclusions = @($res.excluded | Where-Object { -not (& $cat $_) })
-  if ($uncategorizedExclusions.Count -gt 0) {
-    $res.apply = @(); $res.collateral = $rest; $res.categories = @()
-    $res.reason = "$($uncategorizedExclusions.Count) excluded update(s) carry no device category — nothing can be filtered safely"
-    return $res
-  }
-
-  $banned = @($res.excluded | ForEach-Object { & $cat $_ } | Select-Object -Unique)
-  # An update with no category cannot be SELECTED by -updateDeviceCategory either, so it will not be
-  # installed by this apply — it must therefore be reported as deferred, never left in apply where it
-  # would be recorded as installed. dcu-cli's filter is a whitelist; anything unnameable is out.
-  $res.collateral = @($rest | Where-Object { $c = & $cat $_; (-not $c) -or ($c -in $banned) })
-  $res.apply      = @($rest | Where-Object { $c = & $cat $_; $c -and ($c -notin $banned) })
-  $res.categories = @($res.apply | ForEach-Object { & $cat $_ } | Select-Object -Unique)
-  if ($res.apply.Count -eq 0) { $res.categories = @(); if (-not $res.reason) { $res.reason = 'every remaining update shares a category with an excluded one, or has none' } }
-  $res
-}
-
-# Where dcu-cli is allowed to write its scan report. NOT the run dir: dcu-cli validates -report
-# against a list of RESERVED FOLDERS and refuses to scan at all when the path is one of them, and
-# C:\ProgramData — where every run dir lives — is on it. Measured on caldera (dcu-cli 5.7.0):
-#     C:\ProgramData\SunUp\...   exit 107   "The path provided for option '-report' is a reserved
-#     C:\Windows\Temp\...        exit 107    folder that may not be used."
-#     C:\Users\Public\...        exit 107
-#     C:\SunUp\dcu               exit 0     (full scan, real report)
-# The runs of 2026-07-29, 07-30 and 08-02 all died on that 107 and, with the fail-closed guard below,
-# applied nothing at all while still reporting a clean run. Hence a dedicated staging dir, locked to
-# SYSTEM + Administrators: this report decides which updates may install, so a non-admin able to
-# rewrite it could drop the NVIDIA entry and let the pinned driver through.
-# Is any component of this path a junction or symlink? Checking only the leaf is not enough: an
-# unprivileged user who pre-creates C:\SunUp as a junction to a directory they own leaves the leaf
-# looking like an ordinary folder, while every ACL we set follows the junction to their target — and
-# they can re-point it after we harden it. So walk from the drive root down.
-function Test-PathHasReparsePoint { param([string]$Path)
-  $parts = @("$Path" -split '\\' | Where-Object { $_ })
-  if ($parts.Count -eq 0) { return $false }
-  $cur = $parts[0] + '\'                       # "C:\"
-  for ($i = 1; $i -lt $parts.Count; $i++) {
-    $cur = Join-Path $cur $parts[$i]
-    $it  = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
-    if ($it -and ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-      Write-Log ERROR "dell: $cur is a reparse point — refusing to scan under it."
-      return $true
-    }
-  }
-  $false
-}
-
-# Make one directory admin-only, and prove it. REPLACES the DACL rather than adding to it: the drive
-# root lets any authenticated user create folders, so this path may have been created by an
-# unprivileged process first — and `icacls /inheritance:r /grant` (what this used to do) removes only
-# INHERITED entries, leaving any explicit ACE that creator added AND their ownership, which lets them
-# put the DACL back. A fresh DirectorySecurity carries an empty protected DACL, so Set-Acl drops
-# every other ACE and the owner moves to Administrators in the same call.
-# SIDs, not names, so it is locale-independent (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators).
-# Returns $false if the directory cannot be trusted afterwards — callers must then apply nothing:
-# this report decides which updates may install, and a blocked Dell run is recoverable where an
-# attacker-editable exclusion list is not.
-function Protect-Directory { param([string]$Path)
-  if (Test-PathHasReparsePoint $Path) { return $false }
-  try {
-    $system = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
-    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
-    $sd = New-Object System.Security.AccessControl.DirectorySecurity
-    $sd.SetAccessRuleProtection($true, $false)     # protected; inherited entries discarded
-    foreach ($sid in @($system, $admins)) {
-      $sd.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    }
-    $sd.SetOwner($admins)
-    Set-Acl -Path $Path -AclObject $sd -ErrorAction Stop
-    return $true
-  } catch {
-    Write-Log ERROR "dell: could not lock down $Path ($($_.Exception.Message)) — refusing to use a directory that may be writable by non-admins."
-    return $false
-  }
-}
-
-# Returns $null if the directory cannot be trusted — the caller must then apply nothing.
-function Get-DcuReportDir {
-  $root = Join-Path $env:SystemDrive 'SunUp'
-  $dir  = Join-Path $root 'dcu'
-  $rootExisted = Test-Path $root
-  if (-not $rootExisted) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
-  # Never take over a directory that is not ours. If C:\SunUp pre-dates SunUp and holds unrelated
-  # files, replacing its DACL and owner would lock its owner out of their own data — so refuse it and
-  # say what to do instead. Uninstall's -Purge draws the same line from the other side: it removes
-  # only the dcu child, and the parent only when we left it empty.
-  if ($rootExisted) {
-    $foreign = @(Get-ChildItem $root -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'dcu' })
-    if ($foreign.Count -gt 0) {
-      $names = ($foreign | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', '
-      Write-Log ERROR "dell: $root already contains files that are not SunUp's ($names) — refusing to take ownership of it. Move them elsewhere, or set dell.enabled=false."
-      return $null
-    }
-  }
-  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  foreach ($d in @($root, $dir)) { if (-not (Protect-Directory $d)) { return $null } }
-  # Per-run staging dirs left behind by a crashed run. Cheap to prune, and it keeps the dir readable.
-  Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
-    ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-  $dir
-}
-
-function Comp-Dell { param($Cfg)
-  $dcu = @('C:\Program Files\Dell\CommandUpdate\dcu-cli.exe','C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe') |
-         Where-Object { Test-Path $_ } | Select-Object -First 1
-  if (-not $dcu) { return @{ status = 'skip'; detail = 'dcu-cli not installed (hardware updates skipped)' } }
-
-  # 1. Scan to an XML report FIRST — this is the only source of each update's name, available version
-  #    and size (the apply output carries none of it). One scan covers all types; we partition into
-  #    what we apply (driver/firmware/utility) vs BIOS (report-only). See Get-DcuReportDir for why
-  #    the report cannot be written into the run dir.
-  $scanRoot = Get-DcuReportDir
-  if (-not $scanRoot) {
-    return @{ status = 'error'; detail = 'scan report directory could not be trusted — nothing applied'
-              error = 'the dcu report staging dir is a reparse point or could not be locked down; see sunup.log' }
-  }
-  # A subdirectory PER RUN. The documented `-Mode Run -Force` can overlap a scheduled run, and a
-  # shared staging dir has each of them deleting the other's report mid-flight: one run then finds no
-  # report, calls the scan unusable and skips every Dell update, or worse parses its peer's report.
-  # The subdir inherits the parent's protected SYSTEM + Administrators ACL.
-  $scanDir = Join-Path $scanRoot (Split-Path $script:RunDir -Leaf)
-  try { New-Item -ItemType Directory -Force -Path $scanDir | Out-Null }
-  catch {
-    return @{ status = 'error'; detail = 'could not create the per-run scan staging dir — nothing applied'
-              error = "$($_.Exception.Message)" }
-  }
-  # Harden the CHILD too. -Force reuses an existing directory, and the run stamp is predictable
-  # (yyyy-MM-dd_HHmmss, from a daily 08:00 trigger), so one pre-created before the parent was ever
-  # locked down would keep its creator's explicit ACEs and ownership — leaving them free to rewrite
-  # the report after dcu-cli produces it and before it is parsed.
-  if (-not (Protect-Directory $scanDir)) {
-    return @{ status = 'error'; detail = 'per-run scan staging dir could not be trusted — nothing applied'
-              error = 'could not lock down the per-run dcu staging dir; see sunup.log' }
-  }
-  # Clear the whole staging dir first: a stale report must never pass as this run's scan.
-  Get-ChildItem $scanDir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
-    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
-  $scanOut  = & $dcu /scan -report="$scanDir" -silent 2>&1
-  $scanCode = $LASTEXITCODE
-  Write-CompLog 'dell-bios-scan' $scanOut
-  Write-CompLog 'dell-bios-scan' "scan exit: $scanCode (report dir: $scanDir)"
-  # dcu-cli 5.7.0 (measured on this box, along with the 107s above) takes a DIRECTORY for -report and
-  # writes DCUApplicableUpdates.xml into it; other versions are documented as taking a full .xml path.
-  # Rather than depend on either, take whatever .xml the scan just produced.
-  $report  = Get-ChildItem $scanDir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  $xmlPath = if ($report) { $report.FullName } else { Join-Path $scanDir 'DCUApplicableUpdates.xml' }
-  # Keep the report with the rest of this run's evidence.
-  if (Test-Path $xmlPath) { try { Copy-Item $xmlPath (Join-Path $script:RunDir 'DCUApplicableUpdates.xml') -Force } catch {} }
-
-  # The scan report is the ONLY thing that can tell us an excluded update is applicable — dcu-cli
-  # cannot filter by name, so without a readable AND PARSEABLE report there is no way to keep a
-  # pinned driver out of /applyUpdates. A failed scan, a missing report, or one that will not parse
-  # therefore means DO NOT APPLY, rather than apply everything: an empty parse used to look identical
-  # to "nothing to exclude" and silently removed the guard. Parse-DcuReport returns $null for the
-  # first case and an empty array for the second, which is the whole distinction.
-  # (500 = no applicable updates: a legitimate empty result, for which dcu writes no report at all.)
-  # A structurally EMPTY report at exit 0 counts as unusable too. dcu-cli already has a distinct code
-  # for "nothing is applicable" (500, no report written), so exit 0 means it had something to report —
-  # and if our parse finds no update records in it, the two disagree and the report cannot be trusted
-  # to name a pinned driver. A renamed element in a future schema would otherwise read as "nothing to
-  # exclude" and hand /applyUpdates an unrestricted run: the same fail-open shape as an empty parse.
-  $avail      = Parse-DcuReport $xmlPath
-  $scanUsable = if ($scanCode -eq 500) { $true } else { ($scanCode -eq 0) -and ($null -ne $avail) -and (@($avail).Count -gt 0) }
-  if ($scanCode -eq 500) { $avail = @() }
-  if (-not $scanUsable) {
-    $why = if ($null -eq $avail) { if (Test-Path $xmlPath) { 'report unreadable' } else { 'report missing' } }
-           elseif (@($avail).Count -eq 0) { 'report contains no recognized update records' }
-           else { 'report parsed but the scan failed' }
-    if ("$($Cfg.dell.excludePattern)") {
-      $m = "dcu-cli /scan unusable (exit $scanCode, $why) — skipping the apply so dell.excludePattern cannot be bypassed."
-      Write-Log ERROR "dell: $m"
-      Write-CompLog 'dell-apply' "--- $m ---"
-      # ERROR, not warn: this blocks every Dell driver/firmware update on the box, and only 'error'
-      # reaches event 2010 and SysSentry. The 107 runs above sat in exactly this state for four days
-      # while every run logged "clean".
-      return @{ status = 'error'; detail = "scan unusable (exit $scanCode, $why) — nothing applied, exclusions could not be enforced"; error = 'dcu-cli /scan unusable; see dell-bios-scan.log' }
-    }
-    Write-Log WARN "dell: scan unusable (exit $scanCode, $why); no dell.excludePattern is set, so the apply still runs unfiltered."
-    $avail = @()
-  }
-  $bios    = @($avail | Where-Object { "$($_.type)" -match 'BIOS' })
-  $nonBios = @($avail | Where-Object { "$($_.type)" -notmatch 'BIOS' })   # driver/firmware/application = what we apply
-  Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded). Scan found $($nonBios.Count) non-BIOS + $($bios.Count) BIOS applicable."
-
-  # 1b. Honour dell.excludePattern (the NVIDIA pin lives here as well as on the WU and winget paths).
-  $split     = Split-DcuUpdates $nonBios "$($Cfg.dell.excludePattern)"
-  $catArgs   = @()
-  if ($split.excluded.Count -gt 0) {
-    $names = ($split.excluded | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '
-    Write-Log INFO "dell: skipping $($split.excluded.Count) excluded update(s): $names"
-    Write-CompLog 'dell-apply' "--- excluded by dell.excludePattern ($($Cfg.dell.excludePattern)): $names ---"
-    if ($split.collateral.Count -gt 0) {
-      # dcu-cli cannot exclude by name, so these are deferred purely for sharing a device category
-      # with an excluded update. Say so plainly — a silently skipped driver looks like a missing one.
-      $cn = ($split.collateral | ForEach-Object { "$($_.name)" }) -join '; '
-      Write-Log WARN "dell: also deferring $($split.collateral.Count) update(s) sharing a device category with an excluded one: $cn"
-      Write-CompLog 'dell-apply' "--- deferred (same device category as an excluded update): $cn ---"
-    }
-    if ($split.apply.Count -eq 0) {
-      Write-Log INFO "dell: nothing left to apply once exclusions are honoured — skipping this run.$(if ($split.reason) { " Reason: $($split.reason)." })"
-      $biosOnly = if ($bios.Count -gt 0) { "; BIOS update AVAILABLE ($($bios.Count), not flashed)" } else { '; no BIOS update' }
-      if ($bios.Count -gt 0) {
-        Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
-      }
-      $detail = "nothing applied — all $($nonBios.Count) update(s) excluded or category-deferred$biosOnly"
-      # Two very different situations end up here, and reporting both as 'ok' hid the bad one:
-      #   * every applicable update was ITSELF excluded → the pin did its job, nothing is being held
-      #     back, and a clean status is the truth;
-      #   * updates we WOULD have installed are deferred (collateral), or the split failed closed on
-      #     an uncategorized exclusion → the whole Dell path is blocked for as long as that excluded
-      #     update stays applicable, which must not read as a clean run.
-      if ($split.collateral.Count -gt 0 -or $split.reason) {
-        $blockReason = if ($split.reason) { $split.reason } else { "$($split.collateral.Count) update(s) share a device category with an excluded one" }
-        return @{ status = 'warn'; detail = $detail; error = "no Dell update can be applied while the exclusion stands: $blockReason — see dell-apply.log" }
-      }
-      return @{ status = 'ok'; detail = $detail }
-    }
-    # Belt-and-braces on ConvertTo-DcuCategory: dcu-cli rejects the WHOLE command for an unknown
-    # category value, so a token that ever escapes the mapping must defer the run, not fire an apply
-    # we already know will fail with nothing installed.
-    $validCats = 'audio','video','network','storage','input','chipset','others'
-    $badCats   = @($split.categories | Where-Object { $validCats -notcontains $_ })
-    if ($badCats.Count -gt 0) {
-      $m = "device category $($badCats -join ',') is not one dcu-cli accepts ($($validCats -join ',')) — skipping the apply rather than sending a command that installs nothing."
-      Write-Log WARN "dell: $m"
-      Write-CompLog 'dell-apply' "--- $m ---"
-      return @{ status = 'warn'; detail = "nothing applied — unmappable device category ($($badCats -join ','))"; error = $m }
-    }
-    $catArgs = @("-updateDeviceCategory=$($split.categories -join ',')")
-    Write-CompLog 'dell-apply' "--- restricting apply to device categories: $($split.categories -join ',') ---"
-  }
-
-  # 2. Apply driver/firmware/utility (BIOS excluded), timing the batch.
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $apply = & $dcu /applyUpdates -updateType="$($Cfg.dell.applyTypes)" @catArgs -autoSuspendBitLocker=enable -reboot=disable 2>&1
-  $sw.Stop(); $applyCode = $LASTEXITCODE
-  $applyDur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-  Write-CompLog 'dell-apply' $apply
-  Write-CompLog 'dell-apply' "exit: $applyCode (${applyDur}s)"
-
-  # 3. Interpret dcu-cli's exit code. 0 = applied (no reboot); 1 = applied (reboot required);
-  #    5 = reboot pending from a PRIOR op (nothing applied now); 500 = no applicable updates;
-  #    anything else = surface as a warning (see dell-apply.log).
-  $applied = $applyCode -in 0, 1
-  $reboot  = ($applyCode -eq 1)
-
-  # 4. Record each applied update from the scan report: real name + available (new) version + size.
-  #    When the apply installed our non-BIOS set (exit 0/1), those report entries ARE what installed.
-  #    old stays "—" (dcu exposes no installed version); duration is the batch time (no per-driver timing).
-  if ($applied) {
-    foreach ($u in $split.apply) {
-      $mb = if ($u.bytes -gt 0) { [math]::Round($u.bytes / 1MB, 1) } else { $null }
-      Add-Update -Name $u.name -Source 'Dell' -Old '—' -New $u.version -DurationSec $applyDur -SizeMB $mb
-    }
-  }
-
-  # 5. BIOS: report only — a human decides (unattended flash = brick risk on power loss).
-  if ($bios.Count -gt 0) {
-    Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
-  }
-
-  # 6. Build the status line from the exit code.
-  $skipNote = if ($split.excluded.Count -gt 0 -or $split.collateral.Count -gt 0) {
-    ", $($split.excluded.Count) excluded" + $(if ($split.collateral.Count -gt 0) { " + $($split.collateral.Count) category-deferred" } else { '' })
-  } else { '' }
-  $applyDetail = switch ($applyCode) {
-    0       { "applied $($split.apply.Count) driver/firmware update(s)$skipNote" }
-    1       { "applied $($split.apply.Count) driver/firmware update(s)$skipNote; reboot required" }
-    5       { 'nothing applied (reboot pending from a prior op)' }
-    500     { 'no applicable driver/firmware updates' }
-    default { "dcu exit $applyCode (see dell-apply.log)" }
-  }
-  $biosDetail = if ($bios.Count -gt 0) { "; BIOS update AVAILABLE ($($bios.Count), not flashed)" } else { '; no BIOS update' }
-  $status = if ($applyCode -in 0, 1, 5, 500) { 'ok' } else { 'warn' }
-  $out = @{ status = $status; reboot = $reboot; detail = "$applyDetail$biosDetail" }
-  if ($status -eq 'warn') { $out.error = "dcu-cli exit $applyCode — see dell-apply.log" }
-  $out
-}
-
 function Comp-PSModules {
   $out = Update-Module -Force -Confirm:$false -ErrorAction Continue 2>&1
   Write-CompLog 'psmodules' $out
@@ -1390,7 +1018,6 @@ $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }
 if ($cfg.windowsUpdate.enabled) { $results.Add( (Invoke-Component 'windowsUpdate' { Comp-WindowsUpdate $cfg }) ) }
 if ($cfg.winget.enabled)        { $results.Add( (Invoke-Component 'winget'        { Comp-Winget $cfg }) ) }
-if ($cfg.dell.enabled)          { $results.Add( (Invoke-Component 'dell'          { Comp-Dell $cfg }) ) }
 if ($cfg.psModules.enabled) {
   $psEvery = [int]$cfg.psModules.everyDays; if ($psEvery -le 0) { $psEvery = 7 }
   if (Test-PSModulesDue $psEvery) {
@@ -1584,9 +1211,9 @@ if ($errors.Count -gt 0) {
   Write-Evt 2010 Warning $msg
   Raise-SysSentryAlert $msg
 } elseif ($warns.Count -gt 0) {
-  # A warn is a component that did LESS than it was asked to — a Dell apply blocked by an exclusion,
-  # a package the handoff failed to upgrade. Logging event 2001 "clean" for those made a wholly
-  # blocked update path indistinguishable from a healthy run in the event log.
+  # A warn is a component that did LESS than it was asked to — an incomplete winget upgrade list, a
+  # package the handoff failed to upgrade. Logging event 2001 "clean" for those made a partly blocked
+  # update path indistinguishable from a healthy run in the event log.
   Write-Evt 2002 Warning ("$Name run $runStamp completed with warnings: " + (($warns | ForEach-Object { "$($_.name) — $($_.detail)" }) -join '; '))
 } else {
   Write-Evt 2001 Information "$Name run $runStamp clean: $summary"

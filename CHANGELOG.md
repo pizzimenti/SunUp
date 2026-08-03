@@ -2,6 +2,62 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.14.0] - 2026-08-03
+
+### Removed — the Dell Command Update integration, entirely
+
+SunUp is now **hardware-agnostic**: every remaining component ships with Windows or with winget, so
+it runs on any Windows box rather than on a Dell.
+
+The Dell path was removed on evidence, not taste. Across **34 recorded runs over five weeks** it
+installed **zero** updates:
+
+| Source | Updates delivered |
+|---|---|
+| Defender | 22 |
+| winget | 20 |
+| Windows Update | 5 |
+| winget (user scope) | 1 |
+| **Dell** | **0** |
+
+Every successful Dell run reported the same thing — *"no applicable driver/firmware updates; no BIOS
+update"*. The machine is an Alienware 13 R3 whose BIOS (1.2.4) was **released 2018-04-22**; dcu-cli
+reports nothing newer exists. The only update it ever found is a SupportAssist plugin of type
+`Application`, which `dell.applyTypes` (`driver,firmware,utility`) excludes by design — so even its
+one finding was out of scope.
+
+Against that, the cost was substantial and concentrated in the riskiest code in the project:
+
+- ~370 lines of the engine (`Comp-Dell`, `Split-DcuUpdates`, `ConvertTo-DcuCategory`,
+  `Parse-DcuReport`, `Get-DcuReportDir`, `Protect-Directory`, `Test-PathHasReparsePoint`) and 50 of
+  the 218 test checks.
+- The **entire `C:\SunUp` staging apparatus** — DACL replacement, ownership seizure, reparse-point
+  refusal, foreign-parent refusal, per-run subdirectories — existed *solely* because dcu-cli refuses
+  to write its report into `C:\ProgramData`. That report decided which updates were allowed to
+  install, which made it the most security-sensitive file SunUp touched.
+- Four of the fifteen defects found in the v0.13.0 review were Dell's, including the one that left
+  the whole path dead for four days while reporting clean; roughly a third of the twenty findings
+  from the review rounds that followed were about that staging directory.
+
+It also **removes a class of risk rather than defending against it**: the Dell path was the only
+route by which a Dell-packaged GeForce driver could overwrite the pinned GTX 1060 (580.97). That is
+why the pin needed a third enforcement point at all. With dcu gone the bypass does not exist, and the
+pin rests on two simple name filters (`windowsUpdate.notTitle`, `winget.excludePattern`).
+
+What you lose: nothing tells you if Dell ships a BIOS or firmware update. For this hardware that is
+close to hypothetical. Removing the integration does **not** uninstall Dell Command Update, so
+`dcu-cli /scan` can still be run by hand *where the tool happens to be installed* — but a fresh
+v0.14.0 install no longer bootstraps it, and on caldera itself DCU was subsequently uninstalled
+outright (freeing ~510 MB and one always-running service), so the honest fallback there is Dell's
+support site rather than a local command.
+
+- Config: the `dell` block is gone. An existing `config.json` carrying it still loads (unknown keys
+  are ignored), so no migration is needed.
+- `Install.ps1` no longer attempts to bootstrap Dell Command Update.
+- `Uninstall.ps1 -Purge` still cleans up `C:\SunUp\dcu` from a v0.13.x install, and still removes the
+  parent only when left empty — it may pre-date SunUp and hold unrelated data.
+- Suite is 169 checks (was 218): the 50 Dell/staging checks went with the code they covered.
+
 ## [0.13.1] - 2026-08-02
 
 ### Fixed — the Dell update path had been dead for four days, reporting clean
