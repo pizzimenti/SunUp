@@ -18,10 +18,10 @@ pushing driver, firmware and utility updates through the paths SunUp uses.
 On this box `block` resolves to:
 
 ```
-WU  -NotTitle   : NVIDIA|Dell|Alienware
-winget exclude  : …|Dell\.|Alienware
+WU  -NotTitle   : NVIDIA|^Dell|^Alienware
+winget exclude  : …|^Dell\.|^Dell |^Alienware
 log             : vendorUpdates=block — Dell updates excluded from Windows Update
-                  (title ~ 'Dell|Alienware') and winget (id ~ 'Dell\.|Alienware')
+                  (title ~ '^Dell|^Alienware') and winget (id ~ '^Dell\.|^Dell |^Alienware')
 ```
 
 On a Lenovo the same config line resolves to Lenovo, on a Surface to Surface. Nothing is
@@ -45,8 +45,13 @@ hand-maintained per machine.
 - Policy is **shared with the user-scope pass**, like `excludePattern`: an OEM utility blocked on the
   machine pass would otherwise reinstall itself from HKCU. Both dot-source the same profile table so
   they cannot disagree about what "Dell" means.
-- Suite is 197 checks (was 168), including the Alienware-is-a-Dell case, nine manufacturer strings
-  across vendors, unprofiled and empty-string machines, and a regex-validity check on every profile.
+- **Every pattern alternative is anchored (`^`)**, because these are `-match`ed against winget ids and
+  WU titles: unanchored, `HP\.` matches `PHP.PHP.8.4` and `Framework` matches ".NET Framework 4.8
+  update" — silently reclassifying a legitimate update as OEM junk and skipping it. Both were live
+  until review; a test now asserts anchoring across the whole table, not just those two rows.
+- Suite is 209 checks (was 169), including the Alienware-is-a-Dell case, nine manufacturer strings
+  across vendors, unprofiled and empty-string machines, the PHP and .NET false positives, a
+  regex-validity check on every profile row, and machines where only one CIM query succeeded.
 
 ## [0.14.0] - 2026-08-03
 

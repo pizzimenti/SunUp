@@ -577,6 +577,38 @@ Check 'an unprofiled OEM returns $null (so the caller can report it)' ($null -eq
 Check 'and so does a machine that reports nothing at all' ($null -eq (Get-SystemVendor -Manufacturer '' -Family '' -BiosVendor ''))
 Check 'every profile has all four fields populated' `
       (@($script:SunUpVendorProfiles | Where-Object { -not ($_.name -and $_.match -and $_.wuTitle -and $_.winget) }).Count -eq 0)
+
+# THE FALSE POSITIVE THAT MATTERS. These patterns are -matched against winget ids/names and WU
+# titles, so an UNANCHORED brand word matches anything containing it, and the update is silently
+# classified as OEM junk and skipped. Two that were live before review caught them:
+#   winget  'HP\.'      matched  PHP.PHP.8.4                  -> PHP skipped on any HP
+#   wuTitle 'Framework' matched  ".NET Framework 4.8 update"  -> .NET skipped on a Framework
+$hp = Get-SystemVendor -Manufacturer 'HP' -Family 'EliteBook' -BiosVendor ''
+Check 'PHP is NOT mistaken for an HP utility' (-not ('PHP.PHP.8.4' -match $hp.winget)) "pattern '$($hp.winget)'"
+Check 'nor is PHP Group by name'             (-not ('PHP Group' -match $hp.winget))
+Check 'but real HP packages still match'     (('HP.SupportAssistant' -match $hp.winget) -and ('HP Support Assistant' -match $hp.winget))
+Check 'and real HP firmware titles still match' ('HP Inc. - Firmware - 1.2.3' -match $hp.wuTitle)
+$fw = Get-SystemVendor -Manufacturer 'Framework' -Family 'Laptop 13' -BiosVendor ''
+Check '.NET Framework updates are NOT mistaken for OEM updates' `
+      ((-not ('Microsoft .NET Framework 4.8 update' -match $fw.wuTitle)) -and (-not ('Microsoft.DotNet.Framework.DeveloperPack' -match $fw.winget))) "pattern '$($fw.wuTitle)'"
+Check 'but real Framework updates still match' ('Framework Computer Inc. - Firmware' -match $fw.wuTitle)
+# The general rule, enforced on every row rather than the two we happened to notice.
+$unanchored = @($script:SunUpVendorProfiles | Where-Object {
+  @(@($_.wuTitle -split '\|') + @($_.winget -split '\|') | Where-Object { $_ -notmatch '^\^' }).Count -gt 0
+})
+Check 'EVERY pattern alternative is anchored at the start' ($unanchored.Count -eq 0) (($unanchored | ForEach-Object name) -join ',')
+# A vendor's own name must of course still match its own packages, for every profile.
+$selfMatch = @($script:SunUpVendorProfiles | Where-Object { -not ("$($_.name) Something" -match $_.winget -or "$($_.name).Package" -match $_.winget) })
+Check 'and every vendor still matches its own packages' ($selfMatch.Count -eq 0) (($selfMatch | ForEach-Object name) -join ',')
+
+# One CIM query failing must not discard what the other returned: losing 'Dell Inc.' because
+# Win32_BIOS hiccuped would fail OPEN, enforcing nothing on a machine whose vendor was never in doubt.
+Check 'the CIM queries are independent, not one shared catch' `
+      ((Get-Content (Join-Path $repoRoot 'VendorProfiles.ps1') -Raw) -match '(?s)Win32_ComputerSystem -ErrorAction Stop.{0,220}\} catch \{ \}.{0,200}Win32_BIOS -ErrorAction Stop')
+Check 'a machine with only a manufacturer is still identified' `
+      ((Get-SystemVendor -Manufacturer 'Dell Inc.' -Family '' -BiosVendor '').name -eq 'Dell')
+Check 'and one with only a BIOS vendor is too' `
+      ((Get-SystemVendor -Manufacturer '' -Family '' -BiosVendor 'LENOVO').name -eq 'Lenovo')
 # Every `match` must be a valid regex - a bad one would throw mid-run inside the -match below.
 $badRx = @($script:SunUpVendorProfiles | Where-Object { try { [void]('x' -match $_.match); $false } catch { $true } })
 Check 'every profile pattern is a valid regex' ($badRx.Count -eq 0) (($badRx | ForEach-Object name) -join ',')

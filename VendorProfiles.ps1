@@ -33,21 +33,34 @@ without anybody hand-maintaining a regex per machine.
 
 Adding a vendor is one row. Keep `match` anchored enough not to catch unrelated names (bare 'hp'
 would match plenty), and keep `wuTitle` publisher-shaped rather than a bare brand word.
+
+ANCHOR THE PATTERNS. `wuTitle` and `winget` are tested with `-match` against update titles and
+package ids/names, so an unanchored brand word matches anything CONTAINING it — and the result is a
+legitimate update silently classified as OEM junk and skipped. Two real examples, both caught in
+review before they shipped:
+
+    winget  'HP\.'      matches  PHP.PHP.8.4                 -> PHP upgrades skipped on any HP
+    wuTitle 'Framework' matches  ".NET Framework 4.8 update" -> .NET updates skipped on a Framework
+
+Publishers lead the string in both worlds (winget ids are `Publisher.Product`; WU titles read
+"Dell Inc. - Firmware - 1.2.4"), so every alternative below is anchored with ^ and the collisions
+cannot occur. Same reason the name forms carry a trailing space: '^HP ' matches "HP Support
+Assistant" without matching "HPE".
 #>
 
 $script:SunUpVendorProfiles = @(
-  [pscustomobject]@{ name = 'Dell';      match = 'dell|alienware';          wuTitle = 'Dell|Alienware';        winget = 'Dell\.|Alienware' }
-  [pscustomobject]@{ name = 'Lenovo';    match = 'lenovo|thinkpad|think';   wuTitle = 'Lenovo';                winget = 'Lenovo\.|Lenovo' }
-  [pscustomobject]@{ name = 'HP';        match = 'hewlett|\bhp\b|compaq';   wuTitle = 'HP Inc\.|Hewlett';      winget = 'HP\.|HP Inc' }
-  [pscustomobject]@{ name = 'ASUS';      match = 'asus';                    wuTitle = 'ASUS';                  winget = 'ASUS' }
-  [pscustomobject]@{ name = 'Acer';      match = 'acer';                    wuTitle = 'Acer';                  winget = 'Acer' }
-  [pscustomobject]@{ name = 'MSI';       match = 'micro-star|\bmsi\b';      wuTitle = 'MSI|Micro-Star';        winget = 'MSI\.' }
-  [pscustomobject]@{ name = 'Surface';   match = 'microsoft.*surface|surface'; wuTitle = 'Surface';            winget = 'Microsoft\.Surface' }
-  [pscustomobject]@{ name = 'Samsung';   match = 'samsung';                 wuTitle = 'Samsung';               winget = 'Samsung' }
-  [pscustomobject]@{ name = 'Framework'; match = 'framework';               wuTitle = 'Framework';             winget = 'Framework' }
-  [pscustomobject]@{ name = 'Gigabyte';  match = 'gigabyte';                wuTitle = 'GIGABYTE';              winget = 'GIGABYTE' }
-  [pscustomobject]@{ name = 'Razer';     match = 'razer';                   wuTitle = 'Razer';                 winget = 'Razer' }
-  [pscustomobject]@{ name = 'Dynabook';  match = 'toshiba|dynabook';        wuTitle = 'TOSHIBA|Dynabook';      winget = 'TOSHIBA|Dynabook' }
+  [pscustomobject]@{ name = 'Dell';      match = 'dell|alienware';             wuTitle = '^Dell|^Alienware';           winget = '^Dell\.|^Dell |^Alienware' }
+  [pscustomobject]@{ name = 'Lenovo';    match = 'lenovo|thinkpad|think';      wuTitle = '^Lenovo';                    winget = '^Lenovo' }
+  [pscustomobject]@{ name = 'HP';        match = 'hewlett|\bhp\b|compaq';      wuTitle = '^HP Inc\.|^Hewlett|^HP ';    winget = '^HP\.|^HP |^Hewlett' }
+  [pscustomobject]@{ name = 'ASUS';      match = 'asus';                       wuTitle = '^ASUS';                      winget = '^ASUS' }
+  [pscustomobject]@{ name = 'Acer';      match = 'acer';                       wuTitle = '^Acer';                      winget = '^Acer' }
+  [pscustomobject]@{ name = 'MSI';       match = 'micro-star|\bmsi\b';         wuTitle = '^MSI|^Micro-Star';           winget = '^MSI\.|^Micro-Star' }
+  [pscustomobject]@{ name = 'Surface';   match = 'microsoft.*surface|surface'; wuTitle = '^Surface|^Microsoft.*Surface'; winget = '^Microsoft\.Surface|^Surface' }
+  [pscustomobject]@{ name = 'Samsung';   match = 'samsung';                    wuTitle = '^Samsung';                   winget = '^Samsung' }
+  [pscustomobject]@{ name = 'Framework'; match = 'framework';                  wuTitle = '^Framework';                 winget = '^Framework' }
+  [pscustomobject]@{ name = 'Gigabyte';  match = 'gigabyte';                   wuTitle = '^GIGABYTE';                  winget = '^GIGABYTE' }
+  [pscustomobject]@{ name = 'Razer';     match = 'razer';                      wuTitle = '^Razer';                     winget = '^Razer' }
+  [pscustomobject]@{ name = 'Dynabook';  match = 'toshiba|dynabook';           wuTitle = '^TOSHIBA|^Dynabook';         winget = '^TOSHIBA|^Dynabook' }
 )
 
 # Returns the matching profile, or $null when the OEM is not one we have a profile for. Callers must
@@ -57,12 +70,16 @@ $script:SunUpVendorProfiles = @(
 function Get-SystemVendor {
   param([string]$Manufacturer, [string]$Family, [string]$BiosVendor)
   if (-not $PSBoundParameters.ContainsKey('Manufacturer')) {
+    # Queried INDEPENDENTLY. Sharing one try/catch meant a transient Win32_BIOS failure discarded an
+    # already-retrieved Manufacturer and returned $null — so `block` would quietly enforce nothing on
+    # a machine that had just said "Dell Inc." Whatever is retrievable is used; the BIOS vendor is
+    # supplementary (it is what identifies this box, but plenty of machines need only the first two).
     try {
-      $cs          = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+      $cs           = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
       $Manufacturer = "$($cs.Manufacturer)"
       $Family       = "$($cs.SystemFamily)"
-      $BiosVendor   = "$((Get-CimInstance Win32_BIOS -ErrorAction Stop).Manufacturer)"
-    } catch { return $null }
+    } catch { }
+    try { $BiosVendor = "$((Get-CimInstance Win32_BIOS -ErrorAction Stop).Manufacturer)" } catch { }
   }
   # All three fields together: this box says 'Alienware' in every one of them and 'Dell' in none,
   # while other machines put the useful string in only one.
