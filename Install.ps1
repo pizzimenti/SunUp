@@ -79,6 +79,9 @@ Copy-Item (Join-Path $PSScriptRoot 'SunUp.ps1')            $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Status.ps1')          $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Show-UpdateDialog.ps1') $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'SunUp-Tray.ps1')       $Bin -Force
+# Run by Windows PowerShell 5.1 from a one-shot task, so it survives the Restart Manager shutdown
+# that upgrading PowerShell 7 triggers. See the header of SelfHost.ps1.
+Copy-Item (Join-Path $PSScriptRoot 'SelfHost.ps1')         $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 

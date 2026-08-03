@@ -2,6 +2,65 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.12.0] - 2026-07-28
+
+### Fixed — the engine killed itself upgrading PowerShell, and v0.11.0's fix did not work
+
+- Three consecutive runs (2026-07-22, 2026-07-27, 2026-07-28) died at the same package,
+  `Microsoft.PowerShell 7.6.3.0 -> 7.6.4.0`, leaving no `result.json`, no reboot decision, no
+  summary dialog and no day stamp. Because the day stamp is written at the *end* of a run, the
+  next trigger re-ran and re-died at the same package — a silent retry loop that presented as
+  "updates just aren't running". `lastrun.json` sat at 2026-07-20 for eight days.
+- Cause: the engine runs under `pwsh`, so upgrading PowerShell has Windows Installer's Restart
+  Manager enumerate every process holding files under the install target and shut them down —
+  including the engine that requested the install.
+- **v0.11.0's mitigation did not work.** It passed `MSIRESTARTMANAGERCONTROL=Disable` via winget's
+  `--custom`. The 2026-07-28 run applied those args and RM ran regardless, logging
+  `10002 Shutting down application or service 'PowerShell 7'` and terminating all five `pwsh`
+  processes on the box while the MSI itself returned success (`1033 ... error status: 0`). Whether
+  winget dropped the property or Windows Installer ignored it across the major-upgrade transaction
+  was never established. The deeper flaw was structural: the mitigation had **no feedback loop**, so
+  a silent no-op was indistinguishable from success until the engine died.
+- **New approach — leave the blast radius instead of trying to survive it.** Self-hosting packages
+  are no longer upgraded by the engine at all. `Comp-Winget` splits them out and the engine hands
+  them to a new **`SelfHost.ps1`**, run by a one-shot `SunUp-SelfHost` scheduled task under
+  **Windows PowerShell 5.1** — a separate installation that RM's "shut down PowerShell 7" cannot
+  reach. The helper waits for the engine's PID to exit before touching winget, so the run always
+  completes first. The task self-deletes.
+- The handoff is registered as the engine's last act, and is **skipped when a reboot is imminent**
+  (it would race the shutdown); the packages stay on the upgrade list for the next run.
+- The helper never reboots — the engine owns that decision. A reboot requirement found here is
+  recorded in `selfhost.json` and escalated by the next run's stale-pending-reboot watchdog.
+- **Accepted limitation:** interactive `pwsh` terminals are still killed when PowerShell 7 upgrades.
+  That is Restart Manager, and nothing short of a reboot-time install avoids it.
+- `winget.selfHostInstallerArgs` is retained but unused, so an existing `config.json` still loads.
+- `SelfHost.ps1` is kept strictly ASCII and 5.1-compatible: 5.1 reads a BOM-less file as ANSI, so
+  em dashes in comments broke the parse outright during development. Both constraints are asserted
+  in its header.
+- **Found by the first live handoff test:** `powershell.exe -File` passes every argument as a
+  literal string and cannot bind an array parameter. `-Ids a,b` arrives as the single string
+  `"a,b"`; `-Ids a b` binds only `a` and silently drops the rest. The helper originally declared
+  `[string[]]$Ids`, so winget was handed one glued-together package name and answered *"No installed
+  package found matching input criteria"* — upgrading nothing while every other part of the handoff
+  reported success. It now takes one comma-delimited string and splits it itself, and both binding
+  behaviours are pinned by tests.
+- **Test harness fix:** a terminating error inside a check's *condition* (an invalid regex) unwound
+  past the failure counter to the summary, which printed `ALL TESTS PASSED` while the remaining
+  checks never ran. Unhandled errors now count as failures and say so.
+
+### Fixed — the update-collapse block silently renamed the product
+
+- The duplicate-row collapse assigned `$name` for a row label. PowerShell variable names are
+  **case-insensitive**, and that block runs at **script scope**, so it overwrote the global
+  `$Name = 'SunUp'` with the last collapsed update's product name.
+- Every `$Name` use after that point was wrong: real runs logged
+  `===== Google Chrome run end =====` (2026-07-18) and raised event 2001 as
+  `Tailscale run 2026-07-28_231314 clean: ...` (2026-07-28). It only triggered on runs with 2+
+  updates, so it read as random corruption rather than a variable collision.
+- Renamed to `$rowName`. Pinned by a test that lifts the real block out of the source, runs it, and
+  asserts `$Name` survives — verified by mutation (reintroducing `$name` fails the test).
+- Suite is 83 checks.
+
 ## [0.11.0] - 2026-07-27
 
 ### Fixed — the NVIDIA pin was enforced on two of three update paths, not three

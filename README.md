@@ -133,11 +133,34 @@ defaults):
 | `notify.historyMaxRows` | `500` | cap on history rows |
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
 | `winget.excludePattern` | (regex) | skip pinned/self-updating/per-user apps |
-| `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process: upgraded last, with Restart Manager disabled |
-| `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | extra installer args (via `--custom`) for those packages, so the MSI can't terminate SunUp mid-run — attached only when the package publishes an `msi`/`wix`/`burn` installer, and retried without them if the upgrade rejects them |
+| `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process. The engine does **not** upgrade these — it hands them to `SelfHost.ps1` (see below) |
+| `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | **unused since v0.12.0**, retained so existing configs load. Passing this via `--custom` did not stop Restart Manager (measured 2026-07-28) |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
 | `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted |
+
+### Upgrading PowerShell itself
+
+The engine runs under `pwsh`. Upgrading `Microsoft.PowerShell` makes Windows Installer's Restart
+Manager shut down every process holding files in the install target — including the engine asking
+for the install. Three runs died this way before it was diagnosed, each leaving no `result.json`,
+no reboot decision and no day stamp; because the stamp is written at the *end* of a run, the next
+trigger simply re-ran and re-died. It presented as "updates aren't running".
+
+Trying to disable Restart Manager from inside the engine (`MSIRESTARTMANAGERCONTROL=Disable` via
+winget's `--custom`) **did not work** — RM ran anyway. So the engine no longer tries to survive it:
+
+- `Comp-Winget` splits out packages matching `winget.selfHostPattern` and upgrades everything else.
+- As its last act, the engine registers and starts the one-shot **`SunUp-SelfHost`** task, which
+  runs `SelfHost.ps1` under **Windows PowerShell 5.1** — a separate installation RM cannot reach.
+- The helper waits for the engine's PID to exit, then upgrades. The run is already complete, so a
+  kill costs nothing. Results land in `selfhost.log` / `selfhost.json` in the run dir. The task
+  self-deletes.
+- If a reboot is already imminent the handoff is skipped (it would race the shutdown) and the
+  packages are picked up next run.
+
+**Your open `pwsh` terminals will still be killed** when PowerShell 7 upgrades. That is Restart
+Manager; nothing short of a reboot-time install avoids it.
 
 ## Requirements
 
