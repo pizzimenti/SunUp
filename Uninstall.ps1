@@ -40,18 +40,28 @@ if ($Purge) {
   # clean it up here. Only the 'dcu' child was ever ours: C:\SunUp may pre-date SunUp and hold
   # unrelated data, so the parent goes only when it is left empty.
   $legacyStage = Join-Path $env:SystemDrive $Name
-  $purgePaths  = @("C:\ProgramData\$Name", (Join-Path $legacyStage 'dcu'))
-  foreach ($p in $purgePaths) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+  # TRACKED, not merely attempted. The report below is built from this list, so a removal that is
+  # not in it cannot be reported as having failed — and every Remove-Item here suppresses its errors,
+  # which is exactly why the reporting exists.
+  $attempted = [System.Collections.Generic.List[string]]::new()
+  foreach ($p in @("C:\ProgramData\$Name", (Join-Path $legacyStage 'dcu'))) {
+    Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+    $attempted.Add($p)
+  }
+  # The parent only when we left it empty. Added to the tracked list ONLY when removal was actually
+  # attempted, so a parent deliberately left alone (it holds someone else's data) is not reported as
+  # a failure — while one we tried and failed to remove is.
   if ((Test-Path $legacyStage) -and -not @(Get-ChildItem $legacyStage -Force -ErrorAction SilentlyContinue).Count) {
     Remove-Item $legacyStage -Force -ErrorAction SilentlyContinue
+    $attempted.Add($legacyStage)
   }
   foreach ($src in @($Name, 'AutoUpdate')) {
     if ([System.Diagnostics.EventLog]::SourceExists($src)) { Remove-EventLog -Source $src -ErrorAction SilentlyContinue }
   }
   # Removal errors above are suppressed (an open handle, a locked log), so report what is actually
   # gone rather than announcing a purge that did not happen.
-  $left = @($purgePaths | Where-Object { Test-Path $_ })
-  $gone = @($purgePaths | Where-Object { -not (Test-Path $_) })
+  $left = @($attempted | Where-Object { Test-Path $_ })
+  $gone = @($attempted | Where-Object { -not (Test-Path $_) })
   if ($gone.Count -gt 0) { Write-Host "Purged $($gone -join ', ') and event source(s)." }
   if ($left.Count -gt 0) {
     Write-Warning "Could NOT remove: $($left -join ', ') — something still holds a handle. Re-run after a reboot, or delete by hand."

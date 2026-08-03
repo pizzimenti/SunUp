@@ -567,7 +567,11 @@ Check 'purge reports only what it actually removed' ($uninstText -match 'Could N
 Check 'purge still cleans up the legacy staging dir' `
       ($uninstText -match "Join-Path \`$legacyStage 'dcu'" -and $uninstText -notmatch 'Remove-Item .\$env:SystemDrive.\$Name. -Recurse')
 Check 'and removes its parent only when it is empty' `
-      ($uninstText -match '(?s)Get-ChildItem \$legacyStage -Force.{0,140}Remove-Item \$legacyStage -Force')
+      ($uninstText -match '(?s)Get-ChildItem \$legacyStage -Force.{0,240}Remove-Item \$legacyStage -Force')
+# The report is built from the tracked list, so a removal missing from it cannot be reported as
+# failed - the parent would silently read as purged while it was still sitting there.
+Check 'every attempted removal is tracked, so a failure cannot read as success' `
+      ($uninstText -match '\$attempted\.Add\(\$legacyStage\)' -and $uninstText -match '\$left = @\(\$attempted' -and $uninstText -match '\$gone = @\(\$attempted')
 
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)

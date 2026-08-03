@@ -45,15 +45,18 @@ why the pin needed a third enforcement point at all. With dcu gone the bypass do
 pin rests on two simple name filters (`windowsUpdate.notTitle`, `winget.excludePattern`).
 
 What you lose: nothing tells you if Dell ships a BIOS or firmware update. For this hardware that is
-close to hypothetical, and `dcu-cli /scan` remains available to run by hand — the tool is left
-installed, only SunUp's integration is gone.
+close to hypothetical. Removing the integration does **not** uninstall Dell Command Update, so
+`dcu-cli /scan` can still be run by hand *where the tool happens to be installed* — but a fresh
+v0.14.0 install no longer bootstraps it, and on caldera itself DCU was subsequently uninstalled
+outright (freeing ~510 MB and one always-running service), so the honest fallback there is Dell's
+support site rather than a local command.
 
 - Config: the `dell` block is gone. An existing `config.json` carrying it still loads (unknown keys
   are ignored), so no migration is needed.
 - `Install.ps1` no longer attempts to bootstrap Dell Command Update.
 - `Uninstall.ps1 -Purge` still cleans up `C:\SunUp\dcu` from a v0.13.x install, and still removes the
   parent only when left empty — it may pre-date SunUp and hold unrelated data.
-- Suite is 168 checks (was 218): the 50 Dell/staging checks went with the code they covered.
+- Suite is 169 checks (was 218): the 50 Dell/staging checks went with the code they covered.
 
 ## [0.13.1] - 2026-08-02
 
