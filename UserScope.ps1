@@ -33,15 +33,18 @@ POLICY IS SHARED, DELIBERATELY
 ------------------------------
 excludePattern comes from the same config.json the engine reads, so an app excluded from the
 machine pass is excluded here too, and there is exactly one place to change it. selfHostPattern is
-honoured as well: those packages own a runtime and are the SYSTEM handoff's job (see SelfHost.ps1),
-never this pass's.
+honoured as well: those packages own a runtime, so this pass does not upgrade them in-process — it
+hands them to SelfHost.ps1, launched here as a detached Windows PowerShell 5.1 process. They cannot
+go to the SYSTEM handoff, because what shows up in THIS list is HKCU-registered and SYSTEM cannot
+see it at all; saying they were "left to the SYSTEM handoff" simply meant nobody upgraded them.
 
 This script never reboots. The engine owns that decision and has already made it by the time this
-runs; a reboot requirement found here is recorded and surfaced by the next run's watchdog.
+runs; a reboot requirement found here is recorded in user-winget.json and folded into the next
+engine run (Import-DetachedResults), which acts on it.
 
 KNOWN LIMITATION: the summary dialog's payload is written by the engine BEFORE this runs, so
-packages upgraded here appear in the logs, the event log and user-winget.json, but not in that
-run's dialog. They show up in the following run's 30-day history.
+packages upgraded here cannot appear in that run's dialog. The next run ingests user-winget.json
+and shows them in its own dialog and history.
 #>
 param(
   # Normally discovered (newest run dir). Overridable for testing.
@@ -77,6 +80,22 @@ function Write-Raw { param($Lines)
 }
 function Write-Evt { param([int]$Id, [string]$Type, [string]$Msg)
   try { Write-EventLog -LogName Application -Source $EvtSource -EventId $Id -EntryType $Type -Message $Msg -ErrorAction Stop } catch {}
+}
+# Publish so a reader only ever sees this file WHOLE. The engine ingests this record on its next run,
+# and Set-Content truncates its destination before writing: a reader that catches the file mid-write
+# gets invalid JSON, treats the record as unreadable, and this pass's upgrades, failures and reboot
+# request are lost. Write to .tmp, prove it parses, then rename — the rename is the publish.
+function Publish-Json { param($Object, [string]$Path)
+  $tmp = "$Path.tmp"
+  try {
+    ($Object | ConvertTo-Json -Depth 6) | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+    $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json    # prove it is complete
+    Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
+    return $true
+  } catch {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $false
+  }
 }
 function Raise-SysSentryAlert { param([string]$Msg)
   $f = 'C:\ProgramData\SysSentry\ALERTS.md'
@@ -119,13 +138,24 @@ function Parse-Upgrades { param([string[]]$Lines)
 $excl = 'NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs'
 $selfPat = 'Microsoft\.PowerShell|Microsoft\.DesktopAppInstaller'
 $enabled = $true
-try {
-  $cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-  if ($cfg.winget.PSObject.Properties.Name -contains 'excludePattern' -and "$($cfg.winget.excludePattern)") { $excl = "$($cfg.winget.excludePattern)" }
-  if ($cfg.winget.PSObject.Properties.Name -contains 'selfHostPattern' -and "$($cfg.winget.selfHostPattern)") { $selfPat = "$($cfg.winget.selfHostPattern)" }
-  if ($cfg.winget.PSObject.Properties.Name -contains 'enabled') { $enabled = [bool]$cfg.winget.enabled }
-  if ($cfg.winget.PSObject.Properties.Name -contains 'userScope') { $enabled = $enabled -and [bool]$cfg.winget.userScope }
-} catch { Write-Both 'WARN' "could not read config ($_) - using built-in defaults" }
+# Test-Path + -ErrorAction Stop on purpose. Get-Content's "file not found" and "file in use" are
+# NON-TERMINATING under $ErrorActionPreference='Continue', so the catch below never ran: $cfg was
+# silently left $null, every check fell through to the built-in defaults, and an admin who set
+# "userScope": false or "enabled": false had it ignored while the "could not read config" warning
+# that was supposed to say so was never written. The engine's own Get-Config guards with Test-Path
+# for exactly this reason, and the rest of the repo passes -ErrorAction Stop to Get-Content.
+if (-not (Test-Path $ConfigFile)) {
+  Write-Both 'WARN' "config not found at $ConfigFile - using built-in defaults"
+} else {
+  try {
+    $cfg = Get-Content $ConfigFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (-not $cfg -or -not $cfg.winget) { throw 'no winget section in config.json' }
+    if ($cfg.winget.PSObject.Properties.Name -contains 'excludePattern' -and "$($cfg.winget.excludePattern)") { $excl = "$($cfg.winget.excludePattern)" }
+    if ($cfg.winget.PSObject.Properties.Name -contains 'selfHostPattern' -and "$($cfg.winget.selfHostPattern)") { $selfPat = "$($cfg.winget.selfHostPattern)" }
+    if ($cfg.winget.PSObject.Properties.Name -contains 'enabled') { $enabled = [bool]$cfg.winget.enabled }
+    if ($cfg.winget.PSObject.Properties.Name -contains 'userScope') { $enabled = $enabled -and [bool]$cfg.winget.userScope }
+  } catch { Write-Both 'WARN' "could not read config ($_) - using built-in defaults" }
+}
 
 if (-not $enabled) { Write-Both 'INFO' 'winget user-scope pass disabled in config - nothing to do'; return }
 
@@ -162,12 +192,51 @@ $pending = @($all | Where-Object {
 })
 
 if ($skipped.Count) { Write-Both 'INFO' "skipped $($skipped.Count) excluded package(s): $(($skipped | ForEach-Object { $_.id }) -join ', ')" }
-if ($self.Count)    { Write-Both 'INFO' "left $($self.Count) self-hosting package(s) to the SYSTEM handoff: $(($self | ForEach-Object { $_.id }) -join ', ')" }
+
+# ---- self-hosting packages: a REAL handoff, not a claimed one ----------------
+# These own the runtime this pass runs in (pwsh 7) or winget itself, so upgrading one here has
+# Restart Manager shut 'PowerShell 7' down and kill this process mid-pass. They cannot be left to the
+# SYSTEM handoff either: what lands here is HKCU-registered, which SYSTEM cannot see at all -- the
+# whole premise of this script. Logging "left N self-hosting package(s) to the SYSTEM handoff" (what
+# this used to do) meant nobody upgraded them, ever, while the log said they were taken care of.
+# So hand them off the way the engine does: the same helper, run by WINDOWS POWERSHELL 5.1 (a
+# separate install, outside Restart Manager's blast radius) as THIS user (so HKCU is visible),
+# waiting for this process to exit first. It writes user-selfhost.json, which the next engine run
+# folds into its own results.
+if ($self.Count) {
+  $selfIds = ($self | ForEach-Object { $_.id }) -join ', '
+  $helper  = Join-Path $PSScriptRoot 'SelfHost.ps1'
+  if (-not (Test-Path $helper)) {
+    $m = "cannot hand off $($self.Count) self-hosting package(s) - helper missing at $helper : $selfIds"
+    Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+  } else {
+    try {
+      $ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+      $hArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Ids {1} -RunDir "{2}" -MainLog "{3}" -EvtSource "{4}" -Label user-selfhost -NoTask -WaitForPid {5} -WaitTimeoutSec 3600' -f `
+               $helper, (($self | ForEach-Object { $_.id }) -join ','), $RunDir, $LogFile, $EvtSource, $PID
+      # -PassThru and a short look afterwards: Start-Process only reports that the HOST launched.
+      # SelfHost.ps1 begins with #Requires -RunAsAdministrator, so a non-elevated child exits
+      # immediately, writes no user-selfhost.json, and this would otherwise log a successful handoff
+      # for an upgrade nobody performed - the very shape this release exists to remove. On the happy
+      # path the helper is still waiting for this process's PID, so it cannot have exited.
+      $proc = Start-Process -FilePath $ps51 -ArgumentList $hArgs -WindowStyle Hidden -PassThru
+      Start-Sleep -Seconds 3
+      if ($proc -and $proc.HasExited) {
+        $m = "self-host helper exited immediately (code $($proc.ExitCode)) - $selfIds NOT upgraded (SelfHost.ps1 requires elevation)"
+        Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+      } else {
+        Write-Both 'INFO' "handed $($self.Count) self-hosting package(s) to a detached Windows PowerShell 5.1 helper (it upgrades them once this pass exits): $selfIds"
+      }
+    } catch {
+      $m = "could not start the self-host helper for $selfIds - $_"
+      Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+    }
+  }
+}
 
 if (-not $pending.Count) {
   Write-Both 'INFO' 'up to date - nothing to upgrade in user scope'
-  [ordered]@{ finishedLocal=(Get-Date).ToString('o'); user=$env:USERNAME; ok=0; failed=0; skipped=$skipped.Count; rebootRequired=$false; results=@() } |
-    ConvertTo-Json -Depth 6 | Set-Content $UserJson -Encoding UTF8
+  [void](Publish-Json ([ordered]@{ finishedLocal=(Get-Date).ToString('o'); user=$env:USERNAME; ok=0; failed=0; skipped=$skipped.Count; rebootRequired=$false; results=@() }) $UserJson)
   Write-Evt 2030 'Information' 'SunUp user-scope pass: up to date.'
   return
 }
@@ -196,15 +265,17 @@ foreach ($p in $pending) {
   $results += [ordered]@{ id=$p.id; name=$p.name; old=$p.old; new=$p.new; exitCode=('0x{0:X8}' -f [int]$code); ok=$isOk; durationSec=[math]::Round($sw.Elapsed.TotalSeconds,1) }
 }
 
-[ordered]@{
-  finishedLocal  = (Get-Date).ToString('o')
-  user           = $env:USERNAME
-  ok             = $ok
-  failed         = $fail
-  skipped        = $skipped.Count
-  rebootRequired = $rebootRequired
-  results        = $results
-} | ConvertTo-Json -Depth 6 | Set-Content $UserJson -Encoding UTF8
+if (-not (Publish-Json ([ordered]@{
+      finishedLocal  = (Get-Date).ToString('o')
+      user           = $env:USERNAME
+      ok             = $ok
+      failed         = $fail
+      skipped        = $skipped.Count
+      rebootRequired = $rebootRequired
+      results        = $results
+    }) $UserJson)) {
+  Write-Both 'WARN' "could not write $UserJson - this pass's results will not reach the next engine run"
+}
 
 if ($fail -gt 0) {
   $m = "SunUp user-scope pass: $ok upgraded, $fail failed. See $UserLog"
