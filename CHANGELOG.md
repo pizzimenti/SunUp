@@ -2,6 +2,52 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.15.0] - 2026-08-03
+
+### Added — `vendorUpdates`, a generic OEM policy that detects the machine it is on
+
+v0.14.0 removed a *Dell-specific* integration. This adds the generic thing that was actually wanted:
+a single switch that keeps **this machine's OEM** — whichever one that turns out to be — from
+pushing driver, firmware and utility updates through the paths SunUp uses.
+
+```jsonc
+"vendorUpdates": "allow"   // default: OEM updates arrive like any other
+"vendorUpdates": "block"   // exclude this machine's OEM from Windows Update AND winget
+```
+
+On this box `block` resolves to:
+
+```
+WU  -NotTitle   : NVIDIA|Dell|Alienware
+winget exclude  : …|Dell\.|Alienware
+log             : vendorUpdates=block — Dell updates excluded from Windows Update
+                  (title ~ 'Dell|Alienware') and winget (id ~ 'Dell\.|Alienware')
+```
+
+On a Lenovo the same config line resolves to Lenovo, on a Surface to Surface. Nothing is
+hand-maintained per machine.
+
+- **Detection is a pattern table, not an equality check, and that is not pedantry.** Measured here:
+  `Manufacturer`, `SystemFamily` and the BIOS vendor **all report `Alienware`, and none report
+  `Dell`** — so the obvious `-match 'Dell'` concludes "not a Dell" on an actual Dell and silently
+  blocks nothing. `Get-SystemVendor` matches a pattern against all three fields joined. Profiles
+  ship for Dell/Alienware, Lenovo, HP, ASUS, Acer, MSI, Surface, Samsung, Framework, Gigabyte,
+  Razer and Toshiba/Dynabook; adding one is a single row in `VendorProfiles.ps1`.
+- **It blocks the paths that actually deliver.** OEM firmware arrives through Windows Update titled
+  with the publisher (`Dell Inc. - Firmware - 1.2.4`), and OEM utilities arrive through winget with
+  the publisher as an id prefix (`Dell.CommandUpdate`, `Lenovo.Vantage`). Both are filtered.
+- **Deliberately not "run the OEM's updater".** That is what v0.14.0 deleted after it delivered
+  nothing in 34 runs while carrying the project's most security-sensitive code; a generic version
+  would multiply that across vendors nobody can test.
+- **A block that cannot be enforced is reported, never silent.** An OEM matching no profile, or a
+  missing `VendorProfiles.ps1`, logs a WARN naming the manufacturer string — the case where a user
+  who asked for blocking is most likely to be wrongly reassured.
+- Policy is **shared with the user-scope pass**, like `excludePattern`: an OEM utility blocked on the
+  machine pass would otherwise reinstall itself from HKCU. Both dot-source the same profile table so
+  they cannot disagree about what "Dell" means.
+- Suite is 197 checks (was 168), including the Alienware-is-a-Dell case, nine manufacturer strings
+  across vendors, unprofiled and empty-string machines, and a regex-validity check on every profile.
+
 ## [0.14.0] - 2026-08-03
 
 ### Removed — the Dell Command Update integration, entirely

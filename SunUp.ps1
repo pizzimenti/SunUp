@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.14.0'
+$script:Version = '0.15.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -77,6 +77,13 @@ $script:RunDir = $null   # set in Run mode once we create the per-run dir
 $script:RunLog = $null
 $script:SelfHostPending = @()   # self-hosting packages Comp-Winget handed off (see the end of Run mode)
 
+# OEM update policy, resolved in Run mode. Defaults to "block nothing" so every component can read it
+# unconditionally — and so a missing VendorProfiles.ps1 degrades to today's behaviour rather than to
+# an exception mid-run. Resolve-VendorPolicy reports the degradation; it is never silent.
+$script:VendorPolicy = @{ block = $false; vendor = $null; wuTitle = ''; winget = ''; note = '' }
+$VendorProfileScript = Join-Path $PSScriptRoot 'VendorProfiles.ps1'
+if (Test-Path $VendorProfileScript) { . $VendorProfileScript }
+
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
   # ifRequired = reboot only when a component THIS run actually reported reboot=true (the smart default);
@@ -94,6 +101,13 @@ $DefaultConfig = [ordered]@{
   # (greyed out, below the current run); historyCollapse keeps only the latest per package so
   # daily Defender-signature bumps don't flood the list.
   notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500 }
+  # OEM driver/firmware/utility updates, on whatever machine this happens to be.
+  #   allow (default) — no change; the OEM's updates arrive like any other.
+  #   block           — identify this machine's OEM at run time (see VendorProfiles.ps1) and exclude
+  #                     its updates from BOTH delivering paths: Windows Update titles and winget ids.
+  # Deliberately not "run the OEM's own updater": v0.14.0 deleted that for Dell after it delivered
+  # nothing in 34 runs while carrying the project's most security-sensitive code.
+  vendorUpdates      = 'allow'
   windowsUpdate      = [ordered]@{ enabled = $true; notTitle = 'NVIDIA' }
   # Skip pinned drivers, self-updating Claude, load-bearing per-user/Electron apps whose uninstaller
   # refuses to run while the app is open (LM Studio :1234 API, Spotify, etc.), and UWP *framework*
@@ -412,6 +426,35 @@ function Save-StampMerged { param($Obj, [bool]$Booted)
   }
 }
 
+# ---- OEM update policy ------------------------------------------------------
+# Resolved once per run and reported, never applied silently: a user who set `block` and got nothing
+# blocked (unknown OEM, or the profile table failed to load) must be told, not left assuming.
+# Returns @{ block=$bool; vendor=<profile or $null>; wuTitle=''; winget=''; note='' }.
+function Resolve-VendorPolicy { param($Cfg)
+  $out = @{ block = $false; vendor = $null; wuTitle = ''; winget = ''; note = '' }
+  $mode = "$($Cfg.vendorUpdates)"
+  if ($mode -ne 'block') { return $out }
+  if (-not (Get-Command Get-SystemVendor -ErrorAction SilentlyContinue)) {
+    $out.note = 'vendorUpdates=block but VendorProfiles.ps1 did not load — no OEM updates are being blocked'
+    return $out
+  }
+  $v = Get-SystemVendor
+  if (-not $v) {
+    $mfr = try { "$((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer)" } catch { 'unknown' }
+    $out.note = "vendorUpdates=block but this machine's OEM ('$mfr') matches no profile — nothing is being blocked; add a row to VendorProfiles.ps1"
+    return $out
+  }
+  $out.block = $true; $out.vendor = $v; $out.wuTitle = $v.wuTitle; $out.winget = $v.winget
+  $out.note  = "vendorUpdates=block — $($v.name) updates excluded from Windows Update (title ~ '$($v.wuTitle)') and winget (id ~ '$($v.winget)')"
+  $out
+}
+
+# Merge a vendor pattern into a configured exclusion pattern. Either may be empty; the result is a
+# regex alternation, or '' when there is nothing to exclude at all.
+function Join-ExcludePattern { param([string]$Configured, [string]$Vendor)
+  @($Configured, $Vendor) | Where-Object { "$_".Trim() } | ForEach-Object { "$_" } | Join-String -Separator '|'
+}
+
 # ---- winget path resolver (SYSTEM can't see the per-user PATH shim) ----------
 function Resolve-Winget {
   $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -488,7 +531,10 @@ function Comp-WindowsUpdate { param($Cfg)
   $buildKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
   $beforeBuild = try { $b = Get-ItemProperty $buildKey -ErrorAction Stop; "$($b.CurrentBuildNumber).$($b.UBR)" } catch { $null }
   $params = @{ MicrosoftUpdate = $true; AcceptAll = $true; Install = $true; IgnoreReboot = $true }
-  if ($Cfg.windowsUpdate.notTitle) { $params.NotTitle = $Cfg.windowsUpdate.notTitle }
+  # The OEM's own driver/firmware arrives here as well as through its updater — WU titles them with
+  # the publisher ("Dell Inc. - Firmware - 1.2.4") — so vendorUpdates=block filters this path too.
+  $notTitle = Join-ExcludePattern "$($Cfg.windowsUpdate.notTitle)" $script:VendorPolicy.wuTitle
+  if ($notTitle) { $params.NotTitle = $notTitle }
   $sw  = [System.Diagnostics.Stopwatch]::StartNew()
   $res = @(Get-WindowsUpdate @params -Verbose -ErrorAction Stop 4>&1)
   $sw.Stop(); $instDur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
@@ -596,7 +642,9 @@ function Comp-Winget { param($Cfg)
   Write-CompLog 'winget' ("list exit: 0x{0:X8}" -f ([int]$listCode))
   if ($listCode -ne 0) { Write-Log WARN "winget: upgrade-list exited 0x$(([int]$listCode).ToString('X8')) — result may be incomplete" }
   $pending = Parse-WingetUpgrades ([string[]]($listRaw -split "`r?`n"))
-  $excl = $Cfg.winget.excludePattern
+  # OEM utilities (Dell.CommandUpdate, Lenovo.Vantage, …) ship through winget, so vendorUpdates=block
+  # covers this path as well as Windows Update.
+  $excl = Join-ExcludePattern "$($Cfg.winget.excludePattern)" $script:VendorPolicy.winget
   $skipCount = 0
   if ($excl) {
     $skipped = @($pending | Where-Object { $_.name -match $excl -or $_.id -match $excl })
@@ -1013,6 +1061,14 @@ Write-Evt 2000 Information "$Name run started ($today) — logs in $script:RunDi
 # Never let crash DETECTION be the thing that crashes the run — that would recreate the exact silent
 # failure it exists to report, one day later. Its internals are individually guarded; this is the belt.
 try { Report-CrashedRuns } catch { Write-Log WARN "crashed-run check failed (continuing): $($_.Exception.Message)" }
+
+# Resolve the OEM policy before any component runs, and say what it resolved to — including when it
+# resolved to "nothing", which is the case a user who asked for blocking most needs to hear about.
+$script:VendorPolicy = Resolve-VendorPolicy $cfg
+if ($script:VendorPolicy.note) {
+  if ($script:VendorPolicy.block) { Write-Log INFO  "vendor: $($script:VendorPolicy.note)" }
+  else                            { Write-Log WARN  "vendor: $($script:VendorPolicy.note)" }
+}
 
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }

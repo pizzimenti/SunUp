@@ -159,6 +159,24 @@ if (-not (Test-Path $ConfigFile)) {
 
 if (-not $enabled) { Write-Both 'INFO' 'winget user-scope pass disabled in config - nothing to do'; return }
 
+# vendorUpdates is SHARED policy, like excludePattern: an OEM utility blocked on the machine pass
+# must be blocked here too, or it simply reinstalls itself from the user's scope. The profile table
+# is dot-sourced (not reimplemented) so the two passes can never disagree about what "Dell" means;
+# if it cannot be loaded, say so rather than quietly enforcing nothing.
+$vendorPat = ''
+if ("$($cfg.vendorUpdates)" -eq 'block') {
+  $vp = Join-Path $PSScriptRoot 'VendorProfiles.ps1'
+  if (Test-Path $vp) {
+    . $vp
+    $v = Get-SystemVendor
+    if ($v) { $vendorPat = $v.winget; Write-Both 'INFO' "vendorUpdates=block - also excluding $($v.name) packages (id ~ '$($v.winget)')" }
+    else    { Write-Both 'WARN' 'vendorUpdates=block but this OEM matches no profile - no vendor packages excluded in user scope' }
+  } else {
+    Write-Both 'WARN' "vendorUpdates=block but $vp is missing - no vendor packages excluded in user scope"
+  }
+}
+if ($vendorPat) { $excl = @($excl, $vendorPat | Where-Object { $_ }) -join '|' }
+
 Write-Both 'INFO' "starting (user=$env:USERNAME, run dir $(Split-Path $RunDir -Leaf))"
 
 $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
