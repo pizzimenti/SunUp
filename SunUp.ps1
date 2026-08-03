@@ -42,7 +42,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.10.1'
+$script:Version = '0.11.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -99,7 +99,11 @@ $DefaultConfig = [ordered]@{
   }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
-  dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios' }
+  # excludePattern matches an update's NAME from the dcu-cli scan report. It exists so the NVIDIA pin
+  # is enforced on ALL THREE update paths — windowsUpdate.notTitle, winget.excludePattern, and here —
+  # instead of two out of three. dcu-cli cannot filter by name, so a matched update is avoided by
+  # dropping its device category from the apply; see Split-DcuUpdates for what that costs.
+  dell               = [ordered]@{ enabled = $true; applyTypes = 'driver,firmware,utility'; reportTypes = 'bios'; excludePattern = 'NVIDIA|GeForce' }
   pip                = [ordered]@{ enabled = $false }
   npm                = [ordered]@{ enabled = $false }
 }
@@ -673,6 +677,53 @@ function Parse-DcuReport { param([string]$XmlPath)
   $out
 }
 
+# Decide what a Dell apply may touch, given a name-based exclusion (e.g. a pinned GPU driver).
+#
+# The problem: `dcu-cli /applyUpdates` filters by update TYPE and by DEVICE CATEGORY — never by name.
+# So an excluded update cannot be skipped individually; the only lever is dropping its whole category
+# from this apply. That is a real cost (a legitimate update sharing the category is deferred with it),
+# so it is computed explicitly here and named in the log rather than happening invisibly.
+#
+# Why this exists at all: the NVIDIA pin (GTX 1060 held at 580.97) is enforced on the Windows Update
+# path by notTitle and on the winget path by excludePattern, but the Dell path had NO filter — so a
+# Dell-packaged GeForce driver would have installed straight over the pin.
+#
+# Returns: apply (safe to install), excluded (matched the pattern), collateral (deferred only because
+# they share a category with an excluded update), categories (what to pass to -updateDeviceCategory;
+# EMPTY means "do not apply anything this run" — see below).
+function Split-DcuUpdates { param($Updates, [string]$ExcludePattern)
+  $all = @($Updates)
+  $res = @{ apply = $all; excluded = @(); collateral = @(); categories = @(); reason = '' }
+  if (-not $ExcludePattern -or $all.Count -eq 0) { return $res }
+
+  $res.excluded = @($all | Where-Object { "$($_.name)" -match $ExcludePattern })
+  if ($res.excluded.Count -eq 0) { return $res }
+
+  $cat = { param($u) "$($u.category)".Trim().ToLower() }
+  $rest = @($all | Where-Object { "$($_.name)" -notmatch $ExcludePattern })
+
+  # FAIL CLOSED if ANY excluded update lacks a device category — not merely if they all do. A mixed
+  # scan (one uncategorized NVIDIA entry + one categorized GeForce entry) yields a non-empty banned
+  # list, and the resulting -updateDeviceCategory restriction cannot express "except the one with no
+  # category" — so the pinned driver would sail through the filter that exists to stop it.
+  $uncategorizedExclusions = @($res.excluded | Where-Object { -not (& $cat $_) })
+  if ($uncategorizedExclusions.Count -gt 0) {
+    $res.apply = @(); $res.collateral = $rest; $res.categories = @()
+    $res.reason = "$($uncategorizedExclusions.Count) excluded update(s) carry no device category — nothing can be filtered safely"
+    return $res
+  }
+
+  $banned = @($res.excluded | ForEach-Object { & $cat $_ } | Select-Object -Unique)
+  # An update with no category cannot be SELECTED by -updateDeviceCategory either, so it will not be
+  # installed by this apply — it must therefore be reported as deferred, never left in apply where it
+  # would be recorded as installed. dcu-cli's filter is a whitelist; anything unnameable is out.
+  $res.collateral = @($rest | Where-Object { $c = & $cat $_; (-not $c) -or ($c -in $banned) })
+  $res.apply      = @($rest | Where-Object { $c = & $cat $_; $c -and ($c -notin $banned) })
+  $res.categories = @($res.apply | ForEach-Object { & $cat $_ } | Select-Object -Unique)
+  if ($res.apply.Count -eq 0) { $res.categories = @(); if (-not $res.reason) { $res.reason = 'every remaining update shares a category with an excluded one, or has none' } }
+  $res
+}
+
 function Comp-Dell { param($Cfg)
   $dcu = @('C:\Program Files\Dell\CommandUpdate\dcu-cli.exe','C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe') |
          Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -682,16 +733,57 @@ function Comp-Dell { param($Cfg)
   #    and size (the apply output carries none of it). One scan covers all types; we partition into
   #    what we apply (driver/firmware/utility) vs BIOS (report-only).
   $reportDir = $script:RunDir
-  $scanOut = & $dcu /scan -report="$reportDir" -silent 2>&1
+  $scanOut  = & $dcu /scan -report="$reportDir" -silent 2>&1
+  $scanCode = $LASTEXITCODE
   Write-CompLog 'dell-bios-scan' $scanOut
-  $avail   = Parse-DcuReport (Join-Path $reportDir 'DCUApplicableUpdates.xml')
+  Write-CompLog 'dell-bios-scan' "scan exit: $scanCode"
+  $xmlPath = Join-Path $reportDir 'DCUApplicableUpdates.xml'
+  # The scan report is the ONLY thing that can tell us an excluded update is applicable — dcu-cli
+  # cannot filter by name, so without a readable report there is no way to keep a pinned driver out
+  # of /applyUpdates. A failed or missing scan therefore means DO NOT APPLY, rather than apply
+  # everything: an empty parse used to look identical to "nothing to exclude" and silently removed
+  # the guard. (500 = no applicable updates, a legitimate empty result with no report to read.)
+  $scanUsable = ($scanCode -in 0, 500) -and (Test-Path $xmlPath)
+  if (-not $scanUsable -and "$($Cfg.dell.excludePattern)" -and $scanCode -ne 500) {
+    $m = "dcu-cli /scan failed (exit $scanCode, report $(if (Test-Path $xmlPath) { 'present' } else { 'missing' })) — skipping the apply so dell.excludePattern cannot be bypassed."
+    Write-Log WARN "dell: $m"
+    Write-CompLog 'dell-apply' "--- $m ---"
+    return @{ status = 'warn'; detail = "scan failed (exit $scanCode) — nothing applied, exclusions could not be enforced"; error = 'dcu-cli /scan unusable; see dell-bios-scan.log' }
+  }
+  $avail   = Parse-DcuReport $xmlPath
   $bios    = @($avail | Where-Object { "$($_.type)" -match 'BIOS' })
   $nonBios = @($avail | Where-Object { "$($_.type)" -notmatch 'BIOS' })   # driver/firmware/application = what we apply
   Write-CompLog 'dell-apply' "dcu-cli: $dcu`nApplying: $($Cfg.dell.applyTypes) (BIOS excluded). Scan found $($nonBios.Count) non-BIOS + $($bios.Count) BIOS applicable."
 
+  # 1b. Honour dell.excludePattern (the NVIDIA pin lives here as well as on the WU and winget paths).
+  $split     = Split-DcuUpdates $nonBios "$($Cfg.dell.excludePattern)"
+  $catArgs   = @()
+  if ($split.excluded.Count -gt 0) {
+    $names = ($split.excluded | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '
+    Write-Log INFO "dell: skipping $($split.excluded.Count) excluded update(s): $names"
+    Write-CompLog 'dell-apply' "--- excluded by dell.excludePattern ($($Cfg.dell.excludePattern)): $names ---"
+    if ($split.collateral.Count -gt 0) {
+      # dcu-cli cannot exclude by name, so these are deferred purely for sharing a device category
+      # with an excluded update. Say so plainly — a silently skipped driver looks like a missing one.
+      $cn = ($split.collateral | ForEach-Object { "$($_.name)" }) -join '; '
+      Write-Log WARN "dell: also deferring $($split.collateral.Count) update(s) sharing a device category with an excluded one: $cn"
+      Write-CompLog 'dell-apply' "--- deferred (same device category as an excluded update): $cn ---"
+    }
+    if ($split.apply.Count -eq 0) {
+      Write-Log INFO "dell: nothing left to apply once exclusions are honoured — skipping this run.$(if ($split.reason) { " Reason: $($split.reason)." })"
+      $biosOnly = if ($bios.Count -gt 0) { "; BIOS update AVAILABLE ($($bios.Count), not flashed)" } else { '; no BIOS update' }
+      if ($bios.Count -gt 0) {
+        Raise-SysSentryAlert ("Dell BIOS update available ({0}, not auto-applied): {1}" -f $bios.Count, (($bios | ForEach-Object { "$($_.name) $($_.version)" }) -join '; '))
+      }
+      return @{ status = 'ok'; detail = "nothing applied — all $($nonBios.Count) update(s) excluded or category-deferred$biosOnly" }
+    }
+    $catArgs = @("-updateDeviceCategory=$($split.categories -join ',')")
+    Write-CompLog 'dell-apply' "--- restricting apply to device categories: $($split.categories -join ',') ---"
+  }
+
   # 2. Apply driver/firmware/utility (BIOS excluded), timing the batch.
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $apply = & $dcu /applyUpdates -updateType="$($Cfg.dell.applyTypes)" -autoSuspendBitLocker=enable -reboot=disable 2>&1
+  $apply = & $dcu /applyUpdates -updateType="$($Cfg.dell.applyTypes)" @catArgs -autoSuspendBitLocker=enable -reboot=disable 2>&1
   $sw.Stop(); $applyCode = $LASTEXITCODE
   $applyDur = [math]::Round($sw.Elapsed.TotalSeconds, 1)
   Write-CompLog 'dell-apply' $apply
@@ -707,7 +799,7 @@ function Comp-Dell { param($Cfg)
   #    When the apply installed our non-BIOS set (exit 0/1), those report entries ARE what installed.
   #    old stays "—" (dcu exposes no installed version); duration is the batch time (no per-driver timing).
   if ($applied) {
-    foreach ($u in $nonBios) {
+    foreach ($u in $split.apply) {
       $mb = if ($u.bytes -gt 0) { [math]::Round($u.bytes / 1MB, 1) } else { $null }
       Add-Update -Name $u.name -Source 'Dell' -Old '—' -New $u.version -DurationSec $applyDur -SizeMB $mb
     }
@@ -719,9 +811,12 @@ function Comp-Dell { param($Cfg)
   }
 
   # 6. Build the status line from the exit code.
+  $skipNote = if ($split.excluded.Count -gt 0 -or $split.collateral.Count -gt 0) {
+    ", $($split.excluded.Count) excluded" + $(if ($split.collateral.Count -gt 0) { " + $($split.collateral.Count) category-deferred" } else { '' })
+  } else { '' }
   $applyDetail = switch ($applyCode) {
-    0       { "applied $($nonBios.Count) driver/firmware update(s)" }
-    1       { "applied $($nonBios.Count) driver/firmware update(s); reboot required" }
+    0       { "applied $($split.apply.Count) driver/firmware update(s)$skipNote" }
+    1       { "applied $($split.apply.Count) driver/firmware update(s)$skipNote; reboot required" }
     5       { 'nothing applied (reboot pending from a prior op)' }
     500     { 'no applicable driver/firmware updates' }
     default { "dcu exit $applyCode (see dell-apply.log)" }

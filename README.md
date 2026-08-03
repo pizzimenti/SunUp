@@ -137,6 +137,7 @@ defaults):
 | `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | extra installer args (via `--custom`) for those packages, so the MSI can't terminate SunUp mid-run — attached only when the package publishes an `msi`/`wix`/`burn` installer, and retried without them if the upgrade rejects them |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
 | `dell.applyTypes` / `dell.reportTypes` | `driver,firmware,utility` / `bios` | what Dell applies vs only reports |
+| `dell.excludePattern` | `NVIDIA\|GeForce` | skip Dell updates whose name matches (preserves pinned drivers, same policy as the WU and winget paths). dcu-cli cannot filter by name, so the matched update's whole device category is dropped from that apply — anything deferred with it is logged and counted |
 
 ## Requirements
 
