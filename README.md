@@ -140,6 +140,7 @@ defaults):
 | `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |
 | `notify.historyMaxRows` | `500` | cap on history rows |
+| `vendorUpdates` | `"allow"` | `block` keeps **this machine's OEM** from pushing driver/firmware/utility updates, on both delivering paths (Windows Update titles + winget ids). The OEM is detected at run time, so the same setting blocks Dell on a Dell and Lenovo on a Lenovo — see `VendorProfiles.ps1`. A block that can't be enforced (unrecognized OEM) is logged, never silent |
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
 | `winget.excludePattern` | (regex) | skip pinned/self-updating apps — applied to **both** the machine and user passes |
 | `winget.userScope` | `true` | also upgrade per-user (HKCU) packages via `SunUp-User` (see below) |

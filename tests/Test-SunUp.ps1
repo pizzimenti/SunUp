@@ -23,7 +23,7 @@ Check 'SunUp.ps1 parses with no errors' ($errs.Count -eq 0) ($errs | Out-String)
 # Every script that ships. A syntax error in one of these is invisible until the task that runs it
 # fails silently in production -- UserScope.ps1 and Uninstall.ps1 had no parse coverage at all.
 $repoRoot = Split-Path $PSScriptRoot -Parent
-foreach ($f in 'SelfHost.ps1','UserScope.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1') {
+foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1') {
   $p = Join-Path $repoRoot $f
   $e = $null
   if (Test-Path $p) {
@@ -545,6 +545,97 @@ Check 'the engine folds them in BEFORE deciding about rebooting' `
       ($engineText2 -match '(?s)\$detached = Import-DetachedResults.*\$rebootRequiredByRun = @\(\$results')
 Check 'and reports them as a component, so a failure is not invisible' ($engineText2 -match "name        = 'handoff'")
 Check 'a run with warnings no longer logs event 2001 clean' ($engineText2 -match 'Write-Evt 2002 Warning')
+
+Write-Host "`n[10] OEM detection and the vendorUpdates policy (v0.15.0)"
+# THE CASE THAT DEFEATS THE OBVIOUS IMPLEMENTATION: this box reports 'Alienware' in Manufacturer,
+# SystemFamily AND BIOS vendor, and 'Dell' in none of them. A `-match 'Dell'` check would have
+# concluded "not a Dell" on an actual Dell, and silently blocked nothing.
+. (Join-Path $repoRoot 'VendorProfiles.ps1')
+Check 'Get-SystemVendor is loadable standalone (no engine dependency)' ($null -ne (Get-Command Get-SystemVendor -ErrorAction SilentlyContinue))
+$alien = Get-SystemVendor -Manufacturer 'Alienware' -Family 'Alienware' -BiosVendor 'Alienware'
+Check 'an Alienware is recognized as Dell (measured on caldera: no field says "Dell")' ($alien -and $alien.name -eq 'Dell') "got '$($alien.name)'"
+Check 'and carries both delivering-path patterns' ($alien.wuTitle -match 'Dell' -and $alien.winget -match 'Dell')
+$cases = @(
+  @{ mfr = 'Dell Inc.';               fam = 'Latitude';    expect = 'Dell'      }
+  @{ mfr = 'LENOVO';                  fam = 'ThinkPad T14'; expect = 'Lenovo'   }
+  @{ mfr = 'HP';                      fam = 'EliteBook';   expect = 'HP'        }
+  @{ mfr = 'Hewlett-Packard';         fam = '';            expect = 'HP'        }
+  @{ mfr = 'ASUSTeK COMPUTER INC.';   fam = 'ROG';         expect = 'ASUS'      }
+  @{ mfr = 'Micro-Star International'; fam = 'GS66';       expect = 'MSI'       }
+  @{ mfr = 'Microsoft Corporation';   fam = 'Surface';     expect = 'Surface'   }
+  @{ mfr = 'Framework';               fam = 'Laptop 13';   expect = 'Framework' }
+  @{ mfr = 'Acer';                    fam = 'Swift';       expect = 'Acer'      }
+)
+foreach ($c in $cases) {
+  $got = Get-SystemVendor -Manufacturer $c.mfr -Family $c.fam -BiosVendor ''
+  Check "  '$($c.mfr)' -> $($c.expect)" ($got -and $got.name -eq $c.expect) "got '$($got.name)'"
+}
+# An OEM with no profile must return $null so the caller can SAY it cannot enforce, rather than
+# applying an empty pattern and reporting success.
+$unknown = Get-SystemVendor -Manufacturer 'Some Whitebox Ltd' -Family '' -BiosVendor 'American Megatrends'
+Check 'an unprofiled OEM returns $null (so the caller can report it)' ($null -eq $unknown)
+Check 'and so does a machine that reports nothing at all' ($null -eq (Get-SystemVendor -Manufacturer '' -Family '' -BiosVendor ''))
+Check 'every profile has all four fields populated' `
+      (@($script:SunUpVendorProfiles | Where-Object { -not ($_.name -and $_.match -and $_.wuTitle -and $_.winget) }).Count -eq 0)
+
+# THE FALSE POSITIVE THAT MATTERS. These patterns are -matched against winget ids/names and WU
+# titles, so an UNANCHORED brand word matches anything containing it, and the update is silently
+# classified as OEM junk and skipped. Two that were live before review caught them:
+#   winget  'HP\.'      matched  PHP.PHP.8.4                  -> PHP skipped on any HP
+#   wuTitle 'Framework' matched  ".NET Framework 4.8 update"  -> .NET skipped on a Framework
+$hp = Get-SystemVendor -Manufacturer 'HP' -Family 'EliteBook' -BiosVendor ''
+Check 'PHP is NOT mistaken for an HP utility' (-not ('PHP.PHP.8.4' -match $hp.winget)) "pattern '$($hp.winget)'"
+Check 'nor is PHP Group by name'             (-not ('PHP Group' -match $hp.winget))
+Check 'but real HP packages still match'     (('HP.SupportAssistant' -match $hp.winget) -and ('HP Support Assistant' -match $hp.winget))
+Check 'and real HP firmware titles still match' ('HP Inc. - Firmware - 1.2.3' -match $hp.wuTitle)
+$fw = Get-SystemVendor -Manufacturer 'Framework' -Family 'Laptop 13' -BiosVendor ''
+Check '.NET Framework updates are NOT mistaken for OEM updates' `
+      ((-not ('Microsoft .NET Framework 4.8 update' -match $fw.wuTitle)) -and (-not ('Microsoft.DotNet.Framework.DeveloperPack' -match $fw.winget))) "pattern '$($fw.wuTitle)'"
+Check 'but real Framework updates still match' ('Framework Computer Inc. - Firmware' -match $fw.wuTitle)
+# The general rule, enforced on every row rather than the two we happened to notice.
+$unanchored = @($script:SunUpVendorProfiles | Where-Object {
+  @(@($_.wuTitle -split '\|') + @($_.winget -split '\|') | Where-Object { $_ -notmatch '^\^' }).Count -gt 0
+})
+Check 'EVERY pattern alternative is anchored at the start' ($unanchored.Count -eq 0) (($unanchored | ForEach-Object name) -join ',')
+# A vendor's own name must of course still match its own packages, for every profile.
+$selfMatch = @($script:SunUpVendorProfiles | Where-Object { -not ("$($_.name) Something" -match $_.winget -or "$($_.name).Package" -match $_.winget) })
+Check 'and every vendor still matches its own packages' ($selfMatch.Count -eq 0) (($selfMatch | ForEach-Object name) -join ',')
+
+# One CIM query failing must not discard what the other returned: losing 'Dell Inc.' because
+# Win32_BIOS hiccuped would fail OPEN, enforcing nothing on a machine whose vendor was never in doubt.
+Check 'the CIM queries are independent, not one shared catch' `
+      ((Get-Content (Join-Path $repoRoot 'VendorProfiles.ps1') -Raw) -match '(?s)Win32_ComputerSystem -ErrorAction Stop.{0,220}\} catch \{ \}.{0,200}Win32_BIOS -ErrorAction Stop')
+Check 'a machine with only a manufacturer is still identified' `
+      ((Get-SystemVendor -Manufacturer 'Dell Inc.' -Family '' -BiosVendor '').name -eq 'Dell')
+Check 'and one with only a BIOS vendor is too' `
+      ((Get-SystemVendor -Manufacturer '' -Family '' -BiosVendor 'LENOVO').name -eq 'Lenovo')
+# Every `match` must be a valid regex - a bad one would throw mid-run inside the -match below.
+$badRx = @($script:SunUpVendorProfiles | Where-Object { try { [void]('x' -match $_.match); $false } catch { $true } })
+Check 'every profile pattern is a valid regex' ($badRx.Count -eq 0) (($badRx | ForEach-Object name) -join ',')
+
+# The policy resolves to something reportable, and is wired into BOTH delivering paths.
+$rvFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Resolve-VendorPolicy' }, $true)
+Check 'Resolve-VendorPolicy found in source' ($null -ne $rvFn)
+if ($rvFn) {
+  Invoke-Expression $rvFn.Extent.Text
+  $allow = Resolve-VendorPolicy ([pscustomobject]@{ vendorUpdates = 'allow' })
+  Check 'allow blocks nothing and says nothing' ((-not $allow.block) -and -not $allow.note)
+  $block = Resolve-VendorPolicy ([pscustomobject]@{ vendorUpdates = 'block' })
+  Check 'block on this box resolves to Dell' ($block.block -and $block.vendor.name -eq 'Dell') $block.note
+  Check 'and explains itself in one line' ($block.note -match 'Windows Update' -and $block.note -match 'winget')
+}
+$jeFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Join-ExcludePattern' }, $true)
+if ($jeFn) {
+  Invoke-Expression $jeFn.Extent.Text
+  Check 'patterns merge into one alternation' ((Join-ExcludePattern 'NVIDIA' 'Dell\.') -eq 'NVIDIA|Dell\.')
+  Check 'an empty vendor pattern leaves the configured one alone' ((Join-ExcludePattern 'NVIDIA' '') -eq 'NVIDIA')
+  Check 'an empty configured pattern still applies the vendor one' ((Join-ExcludePattern '' 'Dell\.') -eq 'Dell\.')
+  Check 'both empty yields nothing to exclude' ((Join-ExcludePattern '' '') -eq '')
+}
+Check 'the policy filters Windows Update titles' ($engineText2 -match '\$notTitle = Join-ExcludePattern')
+Check 'and winget ids'                          ($engineText2 -match '\$excl = Join-ExcludePattern')
+Check 'and the user-scope pass honours it too'  ($userText -match "vendorUpdates.*-eq 'block'" -and $userText -match 'Get-SystemVendor')
+Check 'a block that cannot be enforced is a WARN, not silence' ($engineText2 -match 'Write-Log WARN  "vendor: ')
 
 Write-Host "`n[9] uninstall really stops what it unregisters"
 # Unregister-ScheduledTask does not terminate a running instance, and the detached helpers are not

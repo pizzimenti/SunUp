@@ -84,6 +84,9 @@ Copy-Item (Join-Path $PSScriptRoot 'SunUp-Tray.ps1')       $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'SelfHost.ps1')         $Bin -Force
 # Runs as the interactive user: SYSTEM cannot see HKCU-registered packages at all.
 Copy-Item (Join-Path $PSScriptRoot 'UserScope.ps1')        $Bin -Force
+# OEM identification for the vendorUpdates policy. Dot-sourced by BOTH the engine and the user pass,
+# so the two can never disagree about what this machine's vendor is.
+Copy-Item (Join-Path $PSScriptRoot 'VendorProfiles.ps1')   $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
@@ -97,6 +100,7 @@ if (-not (Test-Path $ConfigFile)) {
   "rebootGraceInteractiveSec": 300,
   "pendingRebootAlertDays": 3,
   "keepRuns": 30,
+  "vendorUpdates": "allow",
   "notify":        { "enabled": true, "historyDays": 30, "historyCollapse": true, "historyMaxRows": 500 },
   "windowsUpdate": { "enabled": true, "notTitle": "NVIDIA" },
   "winget":        { "enabled": true, "pinIds": [], "excludePattern": "NVIDIA|GeForce|Claude|Anthropic|ElementLabs|LM ?Studio|Spotify|Discord|Slack|Teams|VCLibs" },
