@@ -2,6 +2,41 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.13.0] - 2026-07-28
+
+### Added — the per-user packages the engine structurally could not see
+
+- winget resolves installed packages **per user**. The engine runs as SYSTEM, so anything
+  registered under **HKCU** is invisible to it — not skipped, not failed, simply absent from
+  `winget upgrade`. Measured on caldera: SYSTEM's list and the interactive user's list were
+  **disjoint**.
+- Six of the user's seven packages — Deno, yt-dlp FFmpeg, fzf, ripgrep, Rufus, Sysinternals —
+  matched **nothing** in `excludePattern`. They were never a policy decision; SunUp had simply
+  never updated them. ripgrep was sitting at 15.1.0 against 15.2.0.
+- The distinction matters because `excludePattern`'s comment reasons that per-user apps "are HKCU
+  so SYSTEM never sees them", treating invisibility as equivalent to exclusion. That is true for
+  apps that self-update or refuse to install while running (Claude, Spotify, Discord, Slack, Teams,
+  LM Studio) and false for ordinary CLI tools.
+- New **`UserScope.ps1`**, run by a new **`SunUp-User`** task on the same principal as the notify
+  and tray tasks (Interactive, RunLevel Highest) — no new security posture. The engine starts it at
+  the end of a run, and only when a user is logged on (an Interactive task cannot run otherwise);
+  a headless run leaves those packages for the next run that has a session.
+- **Policy is shared, deliberately:** `excludePattern` and `selfHostPattern` are read from the same
+  `config.json` the engine uses, so there is one policy and one place to change it. LM Studio stays
+  excluded in user scope; self-hosting packages remain the SYSTEM handoff's job. New
+  `winget.userScope` (default `true`) disables the pass without touching those patterns.
+- Results land in the same run dir (`user-winget.log` / `user-winget.json`) plus events 2030/2031.
+- **Known limitation:** the summary dialog's payload is written by the engine *before* this runs, so
+  packages upgraded here appear in the logs and event log but not that run's dialog. They show up in
+  the next run's 30-day history.
+- The parser reads winget's **fixed-width table by column position**, copied from the engine's
+  `Parse-WingetUpgrades`. A split-on-2+-spaces parser was written first and **dropped 3 of the 7
+  real rows** — winget pads columns to a fixed width, so a value that fills its column is followed
+  by exactly one space ("Sysinternals Suite" and "LM Studio 0.4.16+2" fill the 18-char Name column;
+  yt-dlp's `N-124716-...` fills Version). It failed by silently dropping rows, so the pass would
+  have upgraded a subset and reported success. Caught by testing against the real captured output.
+- Suite is 97 checks.
+
 ## [0.12.0] - 2026-07-28
 
 ### Fixed — the engine killed itself upgrading PowerShell, and v0.11.0's fix did not work

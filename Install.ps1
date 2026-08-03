@@ -82,6 +82,8 @@ Copy-Item (Join-Path $PSScriptRoot 'SunUp-Tray.ps1')       $Bin -Force
 # Run by Windows PowerShell 5.1 from a one-shot task, so it survives the Restart Manager shutdown
 # that upgrading PowerShell 7 triggers. See the header of SelfHost.ps1.
 Copy-Item (Join-Path $PSScriptRoot 'SelfHost.ps1')         $Bin -Force
+# Runs as the interactive user: SYSTEM cannot see HKCU-registered packages at all.
+Copy-Item (Join-Path $PSScriptRoot 'UserScope.ps1')        $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
@@ -202,6 +204,24 @@ $nLogon     = New-ScheduledTaskTrigger -AtLogOn -User $nUser
 Register-ScheduledTask -TaskName $NotifyTask -Action $nAction -Principal $nPrincipal -Settings $nSettings -Trigger $nLogon -Force `
   -Description 'Shows the SunUp summary dialog (and owns the restart countdown) in the interactive user session. Fired on demand by the engine; AtLogon shows a not-yet-seen cycle (e.g. post-reboot). Self-gates on notify\latest-updates.json pendingShow.' | Out-Null
 Write-Host "Registered task '$NotifyTask' (interactive, on-demand + AtLogon) as $nUser."
+
+# ---- user-scope winget task: the packages SYSTEM structurally cannot see -----
+# winget resolves installed packages PER USER, so anything registered under HKCU is invisible to
+# the SYSTEM engine — not skipped, absent. Measured 2026-07-28: the two lists were disjoint, and
+# six of the user's packages (Deno, yt-dlp FFmpeg, fzf, ripgrep, Rufus, Sysinternals) matched
+# nothing in excludePattern, i.e. they had never been updated by SunUp at all.
+# Same principal as the notify/tray tasks (Interactive, RunLevel Highest) — no new posture. Takes
+# no arguments: it discovers the newest run dir itself, so this action can be registered once.
+# On-demand only, no trigger: the engine starts it at the end of a run, and only when a user is
+# logged on (an Interactive task cannot run otherwise).
+$UserTask   = "$Name-User"
+$uAction    = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\UserScope.ps1`""
+$uPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Highest
+$uSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName $UserTask -Action $uAction -Principal $uPrincipal -Settings $uSettings -Force `
+  -Description 'Upgrades the per-user (HKCU) winget packages the SYSTEM engine cannot see. Shares winget.excludePattern with the engine. Fired on demand at the end of a run when a user is logged on.' | Out-Null
+Write-Host "Registered task '$UserTask' (interactive, on-demand) as $nUser."
 
 # ---- tray task: persistent system-tray presence in the interactive session ---
 # AtLogon, single-instance (IgnoreNew + the script's own mutex), never times out. RunLevel Highest

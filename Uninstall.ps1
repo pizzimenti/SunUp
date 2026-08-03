@@ -11,7 +11,7 @@ Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyCon
   Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 # SunUp-SelfHost is a one-shot that normally self-deletes; it is listed here in case a run was
 # interrupted between registering it and its own cleanup.
-foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-SelfHost", 'AutoUpdate', 'AutoUpdate-Notify')) {
+foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-User", "$Name-SelfHost", 'AutoUpdate', 'AutoUpdate-Notify')) {
   Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
 }
 Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' (and any legacy AutoUpdate tasks)."
