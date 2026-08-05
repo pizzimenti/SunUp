@@ -17,8 +17,12 @@ no-ops:
   actually meant "keep the last row in *file order*". Benign for the normal append-only path, but a
   detached result imported late could beat a newer row and pin a stale version in the list.
 
-Rows are now `[pscustomobject]`, which property binding sees, fixing both sorts (and the JSON
-payload shape is unchanged). The list launches newest-first again.
+Rows are now `[pscustomobject]`, which property binding sees, so both sorts actually run. And they
+sort on a new `stamp` field carrying the full `runStamp` (`yyyy-MM-dd_HHmmss`, falling back to the
+date for pre-runStamp lines) rather than the date-only `when`: with dates alone, two same-day runs
+tie and the stable sort degrades to file order again — the detached-import edge above in miniature.
+`when` stays date-only for the dialog's When column; the extra payload field is ignored by the
+dialog's name-based bindings. The list launches newest-first again.
 
 ## [0.15.0] - 2026-08-03
 

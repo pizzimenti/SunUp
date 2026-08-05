@@ -929,8 +929,10 @@ function Get-LatestResult {
 # Past-N-day update history for the dialog. The dialog runs non-elevated and can't read logs\,
 # so the engine (SYSTEM) reads history.jsonl here and the result is embedded in the notify payload.
 # Each history.jsonl line is a full run object carrying date/runStamp/updates[]. Returns flat rows
-# {when,name,source,old,new,durationSec,sizeMB}, newest-first, capped at MaxRows. Collapse keeps only
-# the latest occurrence per name|source (so daily Defender-signature bumps don't flood the list).
+# {when,stamp,name,source,old,new,durationSec,sizeMB}, newest-first, capped at MaxRows. Collapse
+# keeps only the latest occurrence per name|source (so daily Defender-signature bumps don't flood
+# the list). Sorts use stamp (full runStamp), not when (date only): same-day runs must not tie, or
+# "latest" degrades to file order — which a late-imported detached result can put out of sequence.
 function Get-UpdateHistory {
   param([int]$Days = 30, [bool]$Collapse = $true, [string]$ExcludeRunStamp, [int]$MaxRows = 500)
   if (-not (Test-Path $HistoryFile)) { return @() }
@@ -946,13 +948,14 @@ function Get-UpdateHistory {
     foreach ($u in $run.updates) {
       # [pscustomobject], NOT a hashtable: Sort-Object property binding silently no-ops on
       # dictionary keys, which left this list in Group-Object's alphabetical order.
-      $rows.Add([pscustomobject]@{ when = $run.date; name = $u.name; source = $u.source; old = $u.old; new = $u.new; durationSec = $u.durationSec; sizeMB = $u.sizeMB })
+      $stamp = if ($run.runStamp) { "$($run.runStamp)" } else { "$($run.date)" }
+      $rows.Add([pscustomobject]@{ when = $run.date; stamp = $stamp; name = $u.name; source = $u.source; old = $u.old; new = $u.new; durationSec = $u.durationSec; sizeMB = $u.sizeMB })
     }
   }
   if ($Collapse) {
-    $rows = @($rows | Group-Object { "$($_.name)|$($_.source)" } | ForEach-Object { $_.Group | Sort-Object when | Select-Object -Last 1 })
+    $rows = @($rows | Group-Object { "$($_.name)|$($_.source)" } | ForEach-Object { $_.Group | Sort-Object stamp | Select-Object -Last 1 })
   }
-  @($rows | Sort-Object when -Descending | Select-Object -First $MaxRows)
+  @($rows | Sort-Object stamp -Descending | Select-Object -First $MaxRows)
 }
 
 if ($Mode -eq 'Status') {
