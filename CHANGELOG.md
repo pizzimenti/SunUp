@@ -2,6 +2,28 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.15.1] - 2026-08-05
+
+### Fixed — the dialog's history list was alphabetical by package, not newest-first
+
+`Get-UpdateHistory` built its rows as `[ordered]` hashtables, and `Sort-Object -Property` does not
+bind to dictionary *keys* — only to real properties like `Count`. Both of its sorts were silent
+no-ops:
+
+- The final `Sort-Object when -Descending` did nothing, so the list shipped in whatever order the
+  collapse step left it — and `Group-Object` emits groups sorted by key, i.e. **alphabetical by
+  `name|source`**. The dialog rendered ".NET → fzf → Git → … → winghostty" with dates interleaved.
+- The collapse's inner `Sort-Object when | Select-Object -Last 1` ("keep the latest per package")
+  actually meant "keep the last row in *file order*". Benign for the normal append-only path, but a
+  detached result imported late could beat a newer row and pin a stale version in the list.
+
+Rows are now `[pscustomobject]`, which property binding sees, so both sorts actually run. And they
+sort on a new `stamp` field carrying the full `runStamp` (`yyyy-MM-dd_HHmmss`, falling back to the
+date for pre-runStamp lines) rather than the date-only `when`: with dates alone, two same-day runs
+tie and the stable sort degrades to file order again — the detached-import edge above in miniature.
+`when` stays date-only for the dialog's When column; the extra payload field is ignored by the
+dialog's name-based bindings. The list launches newest-first again.
+
 ## [0.15.0] - 2026-08-03
 
 ### Added — `vendorUpdates`, a generic OEM policy that detects the machine it is on
