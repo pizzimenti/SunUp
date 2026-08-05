@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.15.0'
+$script:Version = '0.15.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -944,7 +944,9 @@ function Get-UpdateHistory {
     $d = try { [datetime]::ParseExact("$($run.date)", 'yyyy-MM-dd', $null) } catch { continue }
     if ($d -lt $cutoff) { continue }
     foreach ($u in $run.updates) {
-      $rows.Add([ordered]@{ when = $run.date; name = $u.name; source = $u.source; old = $u.old; new = $u.new; durationSec = $u.durationSec; sizeMB = $u.sizeMB })
+      # [pscustomobject], NOT a hashtable: Sort-Object property binding silently no-ops on
+      # dictionary keys, which left this list in Group-Object's alphabetical order.
+      $rows.Add([pscustomobject]@{ when = $run.date; name = $u.name; source = $u.source; old = $u.old; new = $u.new; durationSec = $u.durationSec; sizeMB = $u.sizeMB })
     }
   }
   if ($Collapse) {
