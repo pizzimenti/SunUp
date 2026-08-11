@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.15.1'
+$script:Version = '0.16.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -83,6 +83,30 @@ $script:SelfHostPending = @()   # self-hosting packages Comp-Winget handed off (
 $script:VendorPolicy = @{ block = $false; vendor = $null; wuTitle = ''; winget = ''; note = '' }
 $VendorProfileScript = Join-Path $PSScriptRoot 'VendorProfiles.ps1'
 if (Test-Path $VendorProfileScript) { . $VendorProfileScript }
+
+# Reboot detection, shared verbatim with the tray so the two can never disagree about whether this
+# box needs restarting (before v0.16.0 they each had their own copy, and both were wrong the same
+# way). See RebootState.ps1 for why a bare PendingFileRenameOperations check is not a reboot signal.
+$RebootStateScript = Join-Path $PSScriptRoot 'RebootState.ps1'
+if (Test-Path $RebootStateScript) { . $RebootStateScript }
+else {
+  # Degraded, not fatal — same principle as VendorProfiles above: a partially-updated bin must not
+  # take down a whole run. The fallback keeps only the signals that need no classification, so it
+  # errs toward under-reporting rather than resurrecting the temp-file false positive.
+  function Get-RebootState {
+    param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
+    $src = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+                   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+      if (Test-Path $p) { $src.Add('degraded') ; break }
+    }
+    if ($RunRequired)     { $src.Add('run') }
+    if ($HandoffRequired) { $src.Add('handoff') }
+    [pscustomobject]@{ Required = ($src.Count -gt 0); Sources = @($src); Labels = @('Restart needed')
+                       Reasons = @('RebootState.ps1 is missing — reduced detection'); Advisory = @()
+                       CheckedUtc = (Get-Date).ToUniversalTime() }
+  }
+}
 
 # ---- config -----------------------------------------------------------------
 $DefaultConfig = [ordered]@{
@@ -465,17 +489,10 @@ function Resolve-Winget {
   return $null
 }
 
-# ---- pending-reboot detection ----------------------------------------------
-function Test-PendingReboot {
-  $paths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-  )
-  foreach ($p in $paths) { if (Test-Path $p) { return $true } }
-  $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-  if ($pfro) { return $true }
-  return $false
-}
+# Pending-reboot detection lives in RebootState.ps1 (dot-sourced at the top) — `Get-RebootState`.
+# It replaced a local Test-PendingReboot that answered $true for ANY PendingFileRenameOperations
+# entry, including the delete-on-boot an application queues for its own temp files. That single
+# boolean is why this box reported rebootPending=true continuously from 2026-08-04.
 
 # ---- component runner: uniform timing + error capture + raw log -------------
 # Each component scriptblock writes its raw output via Write-CompLog and returns
@@ -971,7 +988,12 @@ if ($Mode -eq 'Status') {
     Write-Host ("  Next run      : {0}" -f $info.NextRunTime)
   }
   Write-Host ("  Last update   : {0}" -f $(if ($stamp) { $stamp.date } else { '(never)' }))
-  Write-Host ("  Reboot now    : {0}" -f (Test-PendingReboot))
+  # Fold in a carried run-signal reboot: an MSI 3010 / winget restart exit code sets no OS flag at
+  # all, so the registry on its own would answer "no" for a box that really is waiting to restart.
+  $rb = Get-RebootState -HandoffRequired ([bool]($stamp -and $stamp.handoffRebootPending))
+  Write-Host ("  Reboot now    : {0}{1}" -f $rb.Required, $(if ($rb.Labels.Count) { " ($($rb.Labels -join ', '))" } else { '' }))
+  foreach ($r in $rb.Reasons)  { Write-Host ("                    - {0}" -f $r) }
+  foreach ($a in $rb.Advisory) { Write-Host ("                    ~ ignored: {0}" -f $a) }
   if ($res) {
     Write-Host ("  Last run      : {0}  ({1}s, forced={2})" -f $res.date, $res.durationSec, $res.forced)
     Write-Host  "  Components    :"
@@ -1146,8 +1168,18 @@ if ($detached.upgraded -gt 0 -or $detached.failed -gt 0 -or $handoffReboot) {
   Add-Report ("- handoff: **{0}** {1}" -f $dStatus, $dDetail)
 }
 
-$rebootPending       = Test-PendingReboot                                  # global state (info/Status only)
 $rebootRequiredByRun = @($results | Where-Object reboot).Count -gt 0        # did THIS run's updates ask for it?
+# ONE classified verdict for the whole run. It folds the OS servicing signals together with this
+# run's own component signals (an ingested handoff is already one of $results, so it arrives here
+# through $rebootRequiredByRun rather than separately). Everything downstream — the policy switch,
+# the watchdog, result.json, the dialog payload and the tray — keys off this, so they cannot drift.
+$rebootState   = Get-RebootState -RunRequired $rebootRequiredByRun
+$rebootPending = $rebootState.Required
+# Log the reasoning, not just the verdict: when this says "reboot pending" a human must be able to
+# find out WHAT is asking, and when it dismisses a signal that must be on the record too.
+foreach ($r in $rebootState.Reasons)  { Write-Log INFO "reboot: $r" }
+foreach ($a in $rebootState.Advisory) { Write-Log INFO "reboot: ignored — $a" }
+if (-not $rebootPending) { Write-Log INFO 'reboot: nothing outstanding.' }
 $errors  = @($results | Where-Object status -eq 'error')
 $warns   = @($results | Where-Object status -eq 'warn')
 $endUtc  = (Get-Date).ToUniversalTime()
@@ -1200,12 +1232,17 @@ $result = [ordered]@{
   forced        = [bool]$Force
   rebootPending       = $rebootPending
   rebootRequiredByRun = $rebootRequiredByRun
+  rebootSources       = @($rebootState.Sources)   # cbs / windowsUpdate / pendingRename / run / …
+  rebootReasons       = @($rebootState.Reasons)   # the same sentences the run log carries
+  rebootIgnored       = @($rebootState.Advisory)  # signals seen and dismissed, kept for audit
   rebootAction        = 'none'
   components          = $results
   updates             = @($script:Updates)
 }
 # What triggers the reboot depends on rebootPolicy (see $DefaultConfig for the three values):
-#   always     — any OS-level pending flag ($rebootPending); blunt, catches PnP/driver flags too
+#   always     — anything Get-RebootState confirms ($rebootPending): OS servicing signals as well as
+#                this run's own. No longer the blunt option it was — v0.16.0 stopped a queued temp-file
+#                deletion from counting, which under this policy would have restarted the box for it
 #   ifRequired — only when THIS run's components reported reboot=true ($rebootRequiredByRun)
 #   never      — never auto-reboot
 # Ownership: user logged in → the dialog owns a cancellable countdown; headless → the engine
@@ -1234,18 +1271,36 @@ $result | ConvertTo-Json -Depth 8 -Compress | Add-Content $HistoryFile
 $h = @(Get-Content $HistoryFile); if ($h.Count -gt 365) { $h[-365..-1] | Set-Content $HistoryFile }
 
 # ---- stale pending-reboot watchdog (guards the ifRequired blind spot) --------
-# When we leave a pending flag that no run required, track how long it has persisted (carried in the
-# stamp) and alert ONCE past pendingRebootAlertDays — so a genuinely-needed reboot can't sit forever
-# unnoticed. Rebooting now, or the flag clearing on its own, resets the tracker (pendingSince=null).
+# When we leave a pending state that no run required, track how long it has persisted (carried in
+# the stamp) and alert ONCE past pendingRebootAlertDays — so a genuinely-needed reboot can't sit
+# forever unnoticed. The tracker resets when the state clears and, as of v0.16.0, when the box has
+# BOOTED since the last run.
+#
+# That second reset is not a refinement; it is the difference between this watchdog working and not.
+# The old code reset only on observing $rebootPending false, which quietly assumes a pending signal
+# survives until a restart consumes it. A SELF-RENEWING signal breaks that assumption outright: it
+# is re-armed minutes into every boot, no run ever catches it clear, and pendingSince ratchets
+# backwards forever. That is precisely how this box came to report a 7-day-old pending reboot on
+# 2026-08-11 despite having restarted on both 08-08 and 08-11 — and the alert, being once-only,
+# then stayed latched. A boot satisfies every reboot outstanding before it, so anything still
+# pending afterwards is by definition NEW and must be dated from the boot, not from before it.
 $pendingSince = $null; $pendingAlerted = $false
 if ($rebootPending -and -not $willReboot) {
-  $pendingSince   = if ($stamp -and $stamp.pendingSince) { "$($stamp.pendingSince)" } else { (Get-Date).ToString('o') }
-  $pendingAlerted = [bool]($stamp -and $stamp.pendingAlerted)
+  $carryTracker   = [bool]($stamp -and $stamp.pendingSince -and -not $bootedSinceLastRun)
+  if (-not $carryTracker -and $bootedSinceLastRun -and $stamp -and $stamp.pendingSince) {
+    Write-Log INFO 'reboot: the box has booted since the last run — the stale-reboot timer starts again from now.'
+  }
+  $pendingSince   = if ($carryTracker) { "$($stamp.pendingSince)" } else { (Get-Date).ToString('o') }
+  $pendingAlerted = [bool]($carryTracker -and $stamp.pendingAlerted)
   $alertDays = if ($cfg.PSObject.Properties.Name -contains 'pendingRebootAlertDays') { [double]$cfg.pendingRebootAlertDays } else { 3 }
   if ($alertDays -gt 0 -and -not $pendingAlerted) {
     $ageDays = try { ((Get-Date) - [datetime]::Parse($pendingSince, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).TotalDays } catch { 0 }
     if ($ageDays -ge $alertDays) {
-      $m = "Reboot has been pending {0:N1} days but no run required it (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient." -f $ageDays
+      # Name what is asking. "A reboot is pending" with no attribution is what made the old alert
+      # impossible to act on: there was no way to tell a real servicing hold from a false positive.
+      $why = if ($rebootState.Labels.Count) { ' (' + ($rebootState.Labels -join ', ') + ')' } else { '' }
+      $m = ("Reboot has been pending {0:N1} days but no run required it" -f $ageDays) + $why +
+           " (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient."
       Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-SysSentryAlert $m
       $pendingAlerted = $true
     }

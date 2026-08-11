@@ -664,6 +664,111 @@ Check 'and removes its parent only when it is empty' `
 Check 'every attempted removal is tracked, so a failure cannot read as success' `
       ($uninstText -match '\$attempted\.Add\(\$legacyStage\)' -and $uninstText -match '\$left = @\(\$attempted' -and $uninstText -match '\$gone = @\(\$attempted')
 
+Write-Host "`n[11] reboot state (v0.16.0)"
+# PendingFileRenameOperations is a work queue for smss.exe, not a reboot signal. Treating any entry
+# in it as one is what pinned rebootPending=true on this box continuously from 2026-08-04: Claude
+# Code queues a delete-on-boot for a temp file it unpacks minutes into every startup.
+. (Join-Path $repoRoot 'RebootState.ps1')
+Check 'RebootState.ps1 exposes the shared entry points' `
+      ((Get-Command Get-RebootState -ErrorAction SilentlyContinue) -and (Get-Command Test-PfroEntrySignificant -ErrorAction SilentlyContinue))
+
+# --- pair parsing -------------------------------------------------------------
+$pairs = ConvertFrom-PfroValue @('*1\??\C:\Users\b\AppData\Local\Temp\.abc-0.node', '',
+                                 '\??\C:\Windows\WinSxS\Temp\a.dll', '!\??\C:\Windows\System32\a.dll')
+Check 'a REG_MULTI_SZ value parses into source/destination pairs' ($pairs.Count -eq 2) "got $($pairs.Count)"
+Check 'the \??\ prefix and the * / ! markers are stripped from both halves' `
+      ($pairs[0].Source -eq 'C:\Users\b\AppData\Local\Temp\.abc-0.node' -and $pairs[1].Destination -eq 'C:\Windows\System32\a.dll') `
+      "$($pairs[0].Source) / $($pairs[1].Destination)"
+# An odd-length value is a source with no destination element at all; smss.exe deletes it, so a
+# parser that silently dropped the unpaired tail would lose a real signal.
+$odd = ConvertFrom-PfroValue @('\??\C:\Windows\Temp\x.tmp')
+Check 'an odd-length value yields a delete, not a dropped entry' ($odd.Count -eq 1 -and $odd[0].Destination -eq '')
+
+# --- classification -----------------------------------------------------------
+# The exact entry that fired the false watchdog alert on this box.
+Check 'a delete-on-boot under a user temp dir is NOT a reboot signal' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Users\bradley\AppData\Local\Temp\.78eefce1f7f6b7d6-0.node'; Destination='' })))
+Check 'nor is one under C:\Windows\Temp' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\Temp\tmp1234.tmp'; Destination='' })))
+# The engine runs as SYSTEM, whose TEMP is C:\Windows\TEMP. Classifying against $env:TEMP would
+# therefore miss every entry left by an interactive user -- which is all of the ones that matter.
+Check 'a temp path is recognised for ANY user, not just the one we run as' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='D:\Users\someone.else\AppData\Local\Temp\x.node'; Destination='' })))
+# ...and the signals that must still count.
+Check 'a rename INTO a destination is a reboot signal' `
+      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\WinSxS\Temp\a.dll'; Destination='C:\Windows\System32\a.dll' }))
+Check 'a delete outside any temp directory is a reboot signal' `
+      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files\Vendor\driver.sys'; Destination='' }))
+# Fails OPEN by design: a spurious sunset icon costs a glance, a missed servicing reboot leaves the
+# box half-patched. Anything unrecognised must land on the noisy side, never the silent one.
+Check 'an unrecognisable entry counts as significant (fails open)' `
+      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='not-a-path'; Destination='' }))
+
+# --- the verdict --------------------------------------------------------------
+$st = Get-RebootState -RunRequired $true
+Check 'a run-signal reboot is Required even with no OS flag set' ($st.Required -and ($st.Sources -contains 'run'))
+Check 'the verdict carries reasons and labels, not just a boolean' ($st.Reasons.Count -gt 0 -and $st.Labels.Count -gt 0)
+$live = Get-RebootState
+Check 'Get-RebootState returns a well-formed verdict for the live machine' `
+      (($live.PSObject.Properties.Name -contains 'Required') -and ($live.Sources -is [array]) -and ($live.Advisory -is [array]))
+
+# --- exactly one implementation ------------------------------------------------
+# The point of the refactor. Two copies of the detector is how the engine and the tray came to be
+# wrong in the same way, independently, and stayed that way.
+$trayText    = Get-Content (Join-Path $repoRoot 'SunUp-Tray.ps1') -Raw
+$engineText3 = Get-Content $src -Raw
+Check 'neither the engine nor the tray defines its own pending-reboot test' `
+      (($engineText3 -notmatch 'function Test-PendingReboot') -and ($trayText -notmatch 'function Test-PendingReboot'))
+Check 'both dot-source the shared RebootState.ps1' `
+      (($engineText3 -match "Join-Path .*'RebootState\.ps1'") -and ($trayText -match "Join-Path .*'RebootState\.ps1'"))
+Check 'Install.ps1 deploys it alongside them' `
+      ((Get-Content (Join-Path $repoRoot 'Install.ps1') -Raw) -match "Copy-Item .*'RebootState\.ps1'")
+
+# --- the watchdog ratchet -------------------------------------------------------
+# pendingSince used to reset only on observing the state clear. Against a signal that re-arms itself
+# minutes into every boot no run ever sees it clear, so the tracker ratcheted backwards forever --
+# alerting on 2026-08-11 about a reboot "pending since 08-04" across two intervening restarts.
+Check 'the stale-reboot tracker resets when the box has booted since the last run' `
+      ($engineText3 -match '\$carryTracker\s*=\s*\[bool\]\(\$stamp -and \$stamp\.pendingSince -and -not \$bootedSinceLastRun\)')
+Check 'and the once-only alert latch resets with it' `
+      ($engineText3 -match '\$pendingAlerted = \[bool\]\(\$carryTracker -and \$stamp\.pendingAlerted\)')
+Check 'the alert names what is asking for the restart' ($engineText3 -match '\$why = if \(\$rebootState\.Labels\.Count\)')
+Check 'the run records which signals fired, for audit' `
+      ($engineText3 -match 'rebootSources\s*=\s*@\(\$rebootState\.Sources\)' -and $engineText3 -match 'rebootIgnored\s*=\s*@\(\$rebootState\.Advisory\)')
+
+# --- the tray -------------------------------------------------------------------
+Check 'the tray has a distinct sunset icon, not a second shade of the sun' `
+      ($trayText -match 'function New-SunsetIcon' -and $trayText -match '\$script:iconSunset = New-SunsetIcon')
+Check 'the sunset icon is what shows when a restart is needed' `
+      ($trayText -match 'if \(\$rb\.Required\) \{ \$script:iconSunset \} else \{ \$script:iconNormal \}')
+Check 'the tray also counts reboots SunUp itself caused (those set no OS flag)' `
+      ($trayText -match '(?s)function Get-TrayRebootState.{0,600}\$p\.rebootRequired.{0,240}handoffRebootPending')
+
+# The icons must actually DRAW. A bad GDI+ argument here throws at logon, inside a tray process with
+# nowhere to report it -- the icon simply never appears, which is indistinguishable from "not running".
+$trayAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'SunUp-Tray.ps1'), [ref]$null, [ref]$null)
+foreach ($fnName in 'ConvertTo-TrayIcon','New-SunIcon','New-SunsetIcon') {
+  $fnAst = $trayAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fnName }.GetNewClosure(), $true)
+  Check "$fnName is defined in the tray" ($null -ne $fnAst)
+  if ($fnAst) { . ([scriptblock]::Create($fnAst.Extent.Text)) }
+}
+try {
+  Add-Type -AssemblyName System.Drawing
+  $i1 = New-SunIcon; $i2 = New-SunsetIcon
+  Check 'both icons render without a GDI+ error' ($i1.Width -gt 0 -and $i2.Width -gt 0)
+  $b1 = $i1.ToBitmap(); $b2 = $i2.ToBitmap()
+  # Same canvas, different pixels -- catches a "sunset" that silently drew as a plain sun.
+  $diff = 0
+  for ($y = 0; $y -lt 32; $y += 2) { for ($x = 0; $x -lt 32; $x += 2) {
+    if ($b1.GetPixel($x, $y).ToArgb() -ne $b2.GetPixel($x, $y).ToArgb()) { $diff++ } } }
+  Check 'the sunset icon is visibly different from the sun' ($diff -gt 40) "differing sampled pixels: $diff"
+  # A setting sun is EMPTY where a full sun has its top ray: the shapes differ, not just the palette.
+  Check 'the sunset draws nothing where the sun has its top ray' `
+        (($b2.GetPixel(16, 2).A -eq 0) -and ($b1.GetPixel(16, 4).A -gt 0)) `
+        "sunset alpha $($b2.GetPixel(16,2).A), sun alpha $($b1.GetPixel(16,4).A)"
+  $b1.Dispose(); $b2.Dispose()
+} catch { Check 'both icons render without a GDI+ error' $false $_.Exception.Message }
+
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
   # unwound straight past the counter to the summary, which then printed ALL TESTS PASSED -- while

@@ -2,7 +2,8 @@
 SunUp-Tray.ps1 — a persistent system-tray presence for SunUp.
 
 Windows has no `systemctl`/service-manager face for a scheduled task, so this gives SunUp one:
-a tray icon (sun; amber when a reboot is pending) with a right-click menu —
+a tray icon (a full sun; a sun setting behind the horizon when a restart is needed) with a
+right-click menu —
   * a header line: last run + result, next scheduled run
   * Run now            (triggers the SYSTEM SunUp task)
   * Show last summary   (re-opens the summary dialog)
@@ -33,14 +34,21 @@ $script:mutex = New-Object System.Threading.Mutex($false, 'Local\SunUpTray')
 if (-not $Validate -and -not $script:mutex.WaitOne(0)) { exit 0 }
 
 # ---- state readers ----------------------------------------------------------
-function Test-PendingReboot {
-  try {
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { return $true }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { return $true }
-    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations) { return $true }
-  } catch {}
-  $false
+# Reboot detection is shared verbatim with the engine (RebootState.ps1, deployed alongside this
+# script in bin\). The tray used to carry its own copy, which reported a pending reboot for ANY
+# queued file operation — an application deleting its own temp file included — so on this box the
+# icon sat in its alert state permanently and stopped meaning anything. See RebootState.ps1.
+$RebootStateScript = Join-Path $PSScriptRoot 'RebootState.ps1'
+if (Test-Path $RebootStateScript) { . $RebootStateScript }
+else {
+  # Degraded: show the state only for reboots SunUp itself knows it caused. Better a missed OS
+  # signal than a permanently-lit icon, which is the failure mode being retired here.
+  function Get-RebootState { param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
+    [pscustomobject]@{ Required = ($RunRequired -or $HandoffRequired); Sources = @(); Labels = @('Updates installed')
+                       Reasons = @(); Advisory = @(); CheckedUtc = (Get-Date).ToUniversalTime() } }
+  function Test-BootedSince { param($Utc) $false }
 }
+
 function Get-RebootPolicy {
   try { (Get-Content $Cfg -Raw | ConvertFrom-Json).rebootPolicy } catch { 'ifRequired' }
 }
@@ -50,29 +58,92 @@ function Get-LastRun {
 function Get-NextRun {
   try { (Get-ScheduledTask -TaskName $Name -ErrorAction Stop | Get-ScheduledTaskInfo).NextRunTime } catch { $null }
 }
+function Get-Payload {
+  try { Get-Content $Payload -Raw | ConvertFrom-Json } catch { $null }
+}
 
-# ---- icon (drawn at runtime; amber when a reboot is pending) -----------------
-function New-SunIcon { param([bool]$Alert)
+# The reboots SunUp itself causes never reach the registry: an MSI 3010 or a winget restart exit
+# code is recorded in the run payload and nowhere else. So the tray reading only the registry meant
+# the one case where a restart was certainly needed — SunUp having just installed something that
+# asked for one — was the case the icon could not show. Both halves are folded in here.
+# A restart the run asked for is retired by an actual boot, mirroring the dialog's own pre/post
+# test; Test-BootedSince answers $false when it cannot tell, so the state stays visible on doubt.
+function Get-TrayRebootState {
+  $runOutstanding = $false
+  $p = Get-Payload
+  if ($p -and $p.rebootRequired) { $runOutstanding = -not (Test-BootedSince $p.runEndUtc) }
+  $lr = Get-LastRun
+  if ($lr -and $lr.handoffRebootPending) { $runOutstanding = $true }
+  Get-RebootState -HandoffRequired $runOutstanding
+}
+
+# ---- icons (drawn at runtime; no asset files to deploy) ---------------------
+# Two states that differ in SHAPE, not merely in hue: a full sun when there is nothing outstanding,
+# and a sun setting behind the horizon when a restart is needed. The previous pair were both full
+# suns separated by one shade of amber (255,201,64 vs 255,170,0) — a distinction that survives
+# neither the 16px the tray actually renders at nor a light/dark taskbar behind it.
+function ConvertTo-TrayIcon {
+  param([System.Drawing.Bitmap]$Bmp)
+  $h = $Bmp.GetHicon()
+  $ico = [System.Drawing.Icon]::FromHandle($h)
+  $Bmp.Dispose()
+  $ico
+}
+
+function New-SunIcon {
   $bmp = New-Object System.Drawing.Bitmap 32, 32
   $g = [System.Drawing.Graphics]::FromImage($bmp)
   $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
   $g.Clear([System.Drawing.Color]::Transparent)
-  $col = if ($Alert) { [System.Drawing.Color]::FromArgb(255, 170, 0) } else { [System.Drawing.Color]::FromArgb(255, 201, 64) }
+  $col   = [System.Drawing.Color]::FromArgb(255, 201, 64)
   $brush = New-Object System.Drawing.SolidBrush $col
   $pen   = New-Object System.Drawing.Pen $col, 2.6
+  $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+  $pen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
   for ($a = 0; $a -lt 360; $a += 45) {
     $r = [math]::PI * $a / 180
     $g.DrawLine($pen, (16 + 9.5 * [math]::Cos($r)), (16 + 9.5 * [math]::Sin($r)), (16 + 14.5 * [math]::Cos($r)), (16 + 14.5 * [math]::Sin($r)))
   }
   $g.FillEllipse($brush, 8, 8, 16, 16)
-  $g.Dispose()
-  $hicon = $bmp.GetHicon()
-  $ico = [System.Drawing.Icon]::FromHandle($hicon)
-  $bmp.Dispose()
-  $ico
+  $pen.Dispose(); $brush.Dispose(); $g.Dispose()
+  ConvertTo-TrayIcon $bmp
 }
-$script:iconNormal = New-SunIcon $false
-$script:iconAlert  = New-SunIcon $true
+
+# Sunset: the disc sits ON the horizon with everything below it clipped away, rays fanning upward
+# only, amber falling to dusk orange down the face. The clip is what sells the shape — an unclipped
+# disc with a rule drawn across it just reads as a sun with a line through it.
+function New-SunsetIcon {
+  $bmp = New-Object System.Drawing.Bitmap 32, 32
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+  $g.Clear([System.Drawing.Color]::Transparent)
+  $horizon = 22.0; $cx = 16.0; $cy = 22.0; $rad = 8.0
+  $warm = [System.Drawing.Color]::FromArgb(255, 176, 59)
+  $dusk = [System.Drawing.Color]::FromArgb(232, 93, 42)
+
+  $g.SetClip((New-Object System.Drawing.RectangleF 0, 0, 32, $horizon))
+  $disc = New-Object System.Drawing.RectangleF ($cx - $rad), ($cy - $rad), (2 * $rad), (2 * $rad)
+  $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush $disc, $warm, $dusk, 90.0
+  $g.FillEllipse($grad, $disc)
+  $penRay = New-Object System.Drawing.Pen $warm, 2.4
+  $penRay.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+  $penRay.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+  # Screen Y grows DOWNWARD, so 270 degrees points straight up: 210..330 fans across the upper
+  # hemisphere only. Rays below the horizon would be clipped anyway, but drawing none is cheaper.
+  foreach ($a in 210, 250, 290, 330) {
+    $r = [math]::PI * $a / 180
+    $g.DrawLine($penRay, ($cx + 10.5 * [math]::Cos($r)), ($cy + 10.5 * [math]::Sin($r)), ($cx + 14.5 * [math]::Cos($r)), ($cy + 14.5 * [math]::Sin($r)))
+  }
+  $g.ResetClip()
+  $penH = New-Object System.Drawing.Pen $dusk, 2.6
+  $penH.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+  $penH.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+  $g.DrawLine($penH, 2.5, $horizon, 29.5, $horizon)
+  $penH.Dispose(); $penRay.Dispose(); $grad.Dispose(); $g.Dispose()
+  ConvertTo-TrayIcon $bmp
+}
+$script:iconNormal = New-SunIcon
+$script:iconSunset = New-SunsetIcon
 
 # ---- tray icon + menu -------------------------------------------------------
 $script:notify = New-Object System.Windows.Forms.NotifyIcon
@@ -95,15 +166,21 @@ $script:notify.ContextMenuStrip = $menu
 
 # Refresh the dynamic bits (header, next run, auto-reboot checkmark, icon/tooltip).
 function Update-Tray {
-  $pending = Test-PendingReboot
+  $rb = Get-TrayRebootState
   $lr = Get-LastRun
   $nr = Get-NextRun
   $lastTxt = if ($lr) { "Last run: $($lr.date)" } else { 'Last run: (never)' }
   $miHeader.Text = "SunUp — $lastTxt"
   $miNext.Text   = if ($nr) { "Next run: $($nr.ToString('ddd HH:mm'))" } else { 'Next run: (unscheduled)' }
   $miReboot.Checked = ((Get-RebootPolicy) -ne 'never')   # checked = auto-reboot enabled (ifRequired or always)
-  $script:notify.Icon = if ($pending) { $script:iconAlert } else { $script:iconNormal }
-  $tip = "SunUp`n$lastTxt" + $(if ($pending) { "`nReboot pending" } else { '' })
+  $script:notify.Icon = if ($rb.Required) { $script:iconSunset } else { $script:iconNormal }
+  # Say WHAT is asking, not just that something is. "Restart needed" alone gave no way to tell a
+  # real servicing hold from the false positive this release exists to remove.
+  $tip = "SunUp`n$lastTxt"
+  if ($rb.Required) {
+    $why = if ($rb.Labels.Count) { $rb.Labels -join ', ' } else { 'reason unavailable' }
+    $tip += "`nRestart needed — $why"
+  }
   if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 127) }   # NotifyIcon tooltip hard limit
   $script:notify.Text = $tip
 }
@@ -172,7 +249,8 @@ try { if (Test-Path $Payload) { $script:lastSeenRun = (Get-Content $Payload -Raw
 Update-Tray
 
 if ($Validate) {
-  Write-Host "validate OK: tray built (icon $($script:iconNormal.Width)px, $($menu.Items.Count) menu items)"
+  $rbv = Get-TrayRebootState
+  Write-Host "validate OK: tray built (icons $($script:iconNormal.Width)px sun + $($script:iconSunset.Width)px sunset, $($menu.Items.Count) menu items; restart needed = $($rbv.Required)$(if ($rbv.Labels.Count) { " [$($rbv.Labels -join ', ')]" }))"
   $script:notify.Visible = $false; $script:notify.Dispose()
   exit 0
 }
