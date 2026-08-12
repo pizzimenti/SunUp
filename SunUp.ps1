@@ -50,13 +50,14 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.16.0'
+$script:Version = '0.17.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
 $Name          = 'SunUp'
 $TaskName      = $Name                 # SYSTEM engine task
-$NotifyTask    = "$Name-Notify"        # interactive dialog task
+$NotifyTask    = "$Name-Notify"
+$RestartTask   = "$Name-Restart"                                # owns the countdown (WinPS 5.1 toast)        # interactive dialog task
 $SelfHostTask  = "$Name-SelfHost"      # one-shot task for packages that own the engine's own runtime
 $UserTask      = "$Name-User"          # interactive task for per-user (HKCU) packages SYSTEM can't see
 $Root          = "C:\ProgramData\$Name"
@@ -70,6 +71,7 @@ $StampFile     = Join-Path $Root 'lastrun.json'
 $PSModStamp    = Join-Path $Root 'psmodules-lastrun.json'       # psModules runs weekly, not daily
 $NotifyDir     = Join-Path $Root 'notify'                       # user-writable (Install grants Modify)
 $NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
+$NotifyRestart = Join-Path $NotifyDir 'restart-state.json'      # proof a restart was issued; survives the boot
 $EvtSource     = $Name
 $SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
 
@@ -93,6 +95,60 @@ else {
   # Degraded, not fatal — same principle as VendorProfiles above: a partially-updated bin must not
   # take down a whole run. The fallback keeps only the signals that need no classification, so it
   # errs toward under-reporting rather than resurrecting the temp-file false positive.
+  #
+  # As of v0.17.0 this block must also carry the timestamp helpers, because the engine now writes
+  # every persisted timestamp through them. A fallback that defined only Get-RebootState would let
+  # the run reach Save-StampMerged and die on a missing Get-SunUpTimestamp — turning "one file is
+  # stale in bin" into "no run completed at all", which is the opposite of degrading gracefully.
+  $script:SunUpEpochOrigin = New-Object datetime 1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+  function ConvertTo-UtcTime { param($Value, [switch]$AllowFuture)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [long] -or $Value -is [int]) { return $script:SunUpEpochOrigin.AddSeconds([double]$Value) }
+    try {
+      $p = [datetime]::Parse("$Value", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+      if ($p.Kind -eq [System.DateTimeKind]::Unspecified) { $p = [datetime]::SpecifyKind($p, [System.DateTimeKind]::Local) }
+      return $p.ToUniversalTime()
+    } catch { return $null }
+  }
+  function Get-SunUpTimestamp { param($At)
+    $d = if ($null -eq $At) { Get-Date } elseif ($At -is [datetime]) { $At } else { ConvertTo-UtcTime $At }
+    if ($null -eq $d) { return '' }
+    if ($d.Kind -eq [System.DateTimeKind]::Utc) { $d = $d.ToLocalTime() }
+    elseif ($d.Kind -eq [System.DateTimeKind]::Unspecified) { $d = [datetime]::SpecifyKind($d, [System.DateTimeKind]::Local) }
+    $d.ToString('o')
+  }
+  function Get-SunUpEpoch { param($At)
+    $u = if ($null -eq $At) { (Get-Date).ToUniversalTime() } else { ConvertTo-UtcTime $At }
+    if ($null -eq $u) { return $null }
+    [long][math]::Floor(($u - $script:SunUpEpochOrigin).TotalSeconds)
+  }
+  function Get-BootLocal { try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { $null } }
+  function Get-BootUtc   { $b = Get-BootLocal; if ($null -eq $b) { $null } else { $b.ToUniversalTime() } }
+  function Get-BootEpoch { $u = Get-BootUtc; if ($null -eq $u) { $null } else { [long][math]::Floor(($u - $script:SunUpEpochOrigin).TotalSeconds) } }
+  function Test-SameBoot { param($RecordedEpoch, $CurrentEpoch)
+    if ($null -eq $RecordedEpoch) { return $true }
+    $cur = if ($null -eq $CurrentEpoch) { Get-BootEpoch } else { $CurrentEpoch }
+    if ($null -eq $cur) { return $true }
+    try { ([math]::Abs([long]$cur - [long]$RecordedEpoch) -le 120) } catch { $true }
+  }
+  function Test-BootedSince { param($Utc)
+    $t = ConvertTo-UtcTime $Utc; if ($null -eq $t) { return $false }
+    $b = Get-BootUtc; if ($null -eq $b) { return $false }
+    ($b -gt $t)
+  }
+  function Get-RebootConsequence { param([string[]]$Sources)
+    if (-not $Sources -or @($Sources).Count -eq 0) { return @() }
+    @('Windows reported that it needs to restart to finish applying an update.')
+  }
+  # Degraded Get-RebootState above only ever reports 'degraded'/'run'/'handoff', none of which are
+  # servicing signals, so the pre-flight skip simply never fires without the shared file. Erring
+  # toward doing the work is right: a redundant install costs minutes, a suppressed one costs the
+  # update entirely.
+  function Get-ServicingSignals { param([string[]]$Sources)
+    if (-not $Sources) { return @() }
+    @($Sources | Where-Object { @('cbs','cbsInProgress','cbsPackages','windowsUpdate','wuPostReboot') -contains $_ })
+  }
   function Get-RebootState {
     param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
     $src = [System.Collections.Generic.List[string]]::new()
@@ -124,7 +180,15 @@ $DefaultConfig = [ordered]@{
   # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
   # (greyed out, below the current run); historyCollapse keeps only the latest per package so
   # daily Defender-signature bumps don't flood the list.
-  notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500 }
+  # explain: how the restart toast gets its "why does this matter" line.
+  #   off  (default) — the deterministic consequence table in RebootState.ps1. Offline, instant,
+  #                    no key, no network, and it always says something true.
+  #   auto           — additionally ask Claude for a plain-language sentence about what is actually
+  #                    at risk until the restart, cached per KB/package in notify\why-cache.json so
+  #                    each update is researched once ever. Strictly an ENHANCEMENT: it is bounded by
+  #                    a timeout and every failure falls back to the table, because a restart warning
+  #                    must never wait on a network call.
+  notify             = [ordered]@{ enabled = $true; historyDays = 30; historyCollapse = $true; historyMaxRows = 500; explain = 'off' }
   # OEM driver/firmware/utility updates, on whatever machine this happens to be.
   #   allow (default) — no change; the OEM's updates arrive like any other.
   #   block           — identify this machine's OEM at run time (see VendorProfiles.ps1) and exclude
@@ -209,9 +273,43 @@ $script:Report = [System.Collections.Generic.List[string]]::new()
 function Add-Report { param($Msg) $script:Report.Add($Msg) }
 
 # Per-item updates that actually changed something — feeds the Win11 summary dialog.
+#
+# -Meta is optional and OMITTED ENTIRELY when empty, so history.jsonl and the dialog's table are
+# byte-for-byte what they were. It exists because Windows Update hands us a paragraph of publisher
+# description, a severity and a support URL per update, and until v0.17.0 every one of those was
+# read and thrown away — leaving the restart notification able to say only "a restart is required",
+# never what for. The toast explains itself out of this.
 $script:Updates = [System.Collections.Generic.List[object]]::new()
-function Add-Update { param($Name, $Source, $Old, $New, $DurationSec, $SizeMB)
-  $script:Updates.Add([ordered]@{ name=$Name; source=$Source; old=$Old; new=$New; durationSec=$DurationSec; sizeMB=$SizeMB })
+function Add-Update { param($Name, $Source, $Old, $New, $DurationSec, $SizeMB, $Meta)
+  $u = [ordered]@{ name=$Name; source=$Source; old=$Old; new=$New; durationSec=$DurationSec; sizeMB=$SizeMB }
+  if ($Meta -and @($Meta.Keys).Count -gt 0) { $u.meta = $Meta }
+  $script:Updates.Add($u)
+}
+
+# Pull the metadata off a WUA update object without letting a missing member abort the run: these
+# are COM objects behind a PSWindowsUpdate wrapper, and which properties exist varies by update
+# type and by Windows build. Everything here is best-effort by design — this is explanatory text,
+# never a decision input, so a blank field costs a less specific sentence and nothing else.
+function Get-WuMeta {
+  param($U)
+  $m = [ordered]@{}
+  function _first { param($v) if ($null -eq $v) { return $null }
+    if ($v -is [string]) { return $v }
+    try { $a = @($v); if ($a.Count -gt 0) { return "$($a[0])" } } catch {}
+    "$v" }
+  try { if ($U.KB)          { $m.kb       = "$($U.KB)" } } catch {}
+  try { if ($U.MsrcSeverity){ $m.severity = "$($U.MsrcSeverity)" } } catch {}
+  try {
+    $d = "$($U.Description)"
+    # Trimmed hard: this is a toast line and a prompt input, not documentation. The full text is a
+    # click away via the support URL.
+    if ($d) { $m.description = if ($d.Length -gt 600) { $d.Substring(0, 600) + '...' } else { $d } }
+  } catch {}
+  try { $url = _first $U.MoreInfoUrls; if ($url) { $m.moreInfoUrl = $url } } catch {}
+  try { if ($U.SupportUrl)  { $m.supportUrl = "$($U.SupportUrl)" } } catch {}
+  try { $c = @($U.Categories | ForEach-Object { "$($_.Name)" } | Where-Object { $_ }); if ($c.Count) { $m.categories = @($c) } } catch {}
+  try { if ($null -ne $U.RebootRequired) { $m.rebootRequired = [bool]$U.RebootRequired } } catch {}
+  $m
 }
 
 # Is a real user logged into an interactive desktop? Decides who owns the reboot
@@ -293,10 +391,11 @@ function Test-RunAlive { param([string]$Dir)
   if (-not $p) { return $false }                                             # owner is gone
   if ($m.processName -and "$($p.ProcessName)" -ne "$($m.processName)") { return $false }   # PID recycled
   try {
-    if ($m.processStartUtc) {
-      $claimed = [datetime]::Parse("$($m.processStartUtc)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $claimedStart = if ($m.processStart) { $m.processStart } else { $m.processStartUtc }
+    if ($claimedStart) {
+      $claimed = ConvertTo-UtcTime $claimedStart
       # Same PID, same image, but started at a different moment = a recycled PID, not our run.
-      if (($claimed - $p.StartTime.ToUniversalTime()).Duration().TotalSeconds -gt 2) { return $false }
+      if ($claimed -and ($claimed - $p.StartTime.ToUniversalTime()).Duration().TotalSeconds -gt 2) { return $false }
     }
   } catch { }   # start time unreadable: PID and image still match, so assume ALIVE — never cry crash on a live peer
   $true
@@ -388,19 +487,16 @@ function Raise-SysSentryAlert { param($Msg)
 # ---- per-day stamp ----------------------------------------------------------
 function Get-Stamp { if (Test-Path $StampFile) { try { Get-Content $StampFile -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
 
-# Normalize a stamp timestamp to UTC whatever form it arrives in. ConvertFrom-Json parses an
-# ISO-8601 string into a [datetime], so a value written as '…Z' comes BACK as a DateTime and
-# interpolates as culture-formatted local wall time ("08/03/2026 06:18:05") — which never equals the
-# round-trip string it was written from. Comparing those as strings made the stamp verification
-# below report a phantom concurrent write on every single run: three writes and a misleading warning
-# each time, which is precisely the kind of false signal this release exists to remove. Caught by
-# running the engine, not by reading it.
-function ConvertTo-UtcTime { param($Value)
-  if ($null -eq $Value -or "$Value" -eq '') { return $null }
-  if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
-  try { return ([datetime]::Parse("$Value", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() }
-  catch { return $null }
-}
+# ConvertTo-UtcTime used to be defined right here, and that was the whole problem. v0.13.2 wrote it
+# to fix the stamp verification (ConvertFrom-Json parses an ISO-8601 string back into a [datetime],
+# whose interpolated form is culture-formatted local wall time and never equals the round-trip
+# string it was written from), and it worked — for the engine. Show-UpdateDialog.ps1 had the same
+# bug in the same release and did not get the same fix, because the fix lived in a file it does not
+# read. Nine months later that cost three restarts in seventy minutes.
+#
+# So it now lives in RebootState.ps1, dot-sourced above, alongside Get-SunUpTimestamp (the matching
+# writer) and Get-BootEpoch/Test-SameBoot. One implementation, five consumers, asserted by the test
+# suite — which also asserts that this file contains no [datetime]::Parse of its own.
 function Save-Stamp { param($Obj) try { $Obj | ConvertTo-Json -Depth 8 | Set-Content $StampFile } catch { Write-Log WARN "could not write stamp: $_" } }
 
 # Save the stamp as a read-modify-write under the ingest lock, merging the two fields a CONCURRENT
@@ -565,14 +661,27 @@ function Comp-WindowsUpdate { param($Cfg)
   # installed update that's exact; for several it's the shared batch total — labeled as such in docs.
   $buildMoved = $beforeBuild -and $afterBuild -and ($beforeBuild -ne $afterBuild)
   foreach ($u in ($items | Where-Object Result -eq 'Installed')) {
-    $mb = if ($u.Size) { try { [math]::Round(([double]$u.Size)/1MB,1) } catch { $null } } else { $null }
+    # NO SIZE for Windows Update rows, deliberately. PSWindowsUpdate's Size is the WUA
+    # MaxDownloadSize, which is a worst-case figure for the whole BUNDLE -- every architecture,
+    # language and variant -- not what this machine actually transferred. Measured 2026-08-12: it
+    # reported 93,184 MB for the August cumulative and 1,489 MB for a Defender signature update
+    # that is roughly a tenth of that. The dialog and history duly told the user SunUp had
+    # installed "93,368 MB" of updates, which is not a rounding error, it is fiction.
+    #
+    # An honest blank beats a confident wrong number, and the duration column still conveys the
+    # weight of the run. The raw figure is kept in meta as an upper bound for forensics, and
+    # winget rows still carry a real size because those are HEAD-probed from the actual download.
+    $maxMb = if ($u.Size) { try { [math]::Round(([double]$u.Size)/1MB, 1) } catch { $null } } else { $null }
+    $mb = $null
     $kb = if ($u.KB) { "$($u.KB)" } else { 'installed' }
     $title = "$($u.Title)"
+    $meta = Get-WuMeta $u
+    if ($null -ne $maxMb) { $meta.maxDownloadMB = $maxMb }
     # OS-level updates carry the build transition; everything else shows its KB.
     if ($buildMoved -and $title -match 'Cumulative Update|Feature Update|Windows 1[01]|Servicing Stack') {
-      Add-Update -Name $title -Source 'Windows Update' -Old $beforeBuild -New $afterBuild -DurationSec $instDur -SizeMB $mb
+      Add-Update -Name $title -Source 'Windows Update' -Old $beforeBuild -New $afterBuild -DurationSec $instDur -SizeMB $mb -Meta $meta
     } else {
-      Add-Update -Name $title -Source 'Windows Update' -Old '—' -New $kb -DurationSec $instDur -SizeMB $mb
+      Add-Update -Name $title -Source 'Windows Update' -Old '—' -New $kb -DurationSec $instDur -SizeMB $mb -Meta $meta
     }
   }
   # Did any update we just installed ask for a reboot? Prefer the per-update flag; fall
@@ -889,9 +998,7 @@ function Import-DetachedResults { param($Since, $BootedUtc)
       # file written AFTER the cursor a wall-clock stamp that reads as earlier, and this branch would
       # then consume a brand-new record unread — once a year, silently, which is the worst kind.
       $written = try { (Get-Item $p -ErrorAction Stop).LastWriteTimeUtc } catch { $null }
-      if (-not $written) {
-        try { $written = ([datetime]::Parse("$($j.finishedLocal)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() } catch { }
-      }
+      if (-not $written) { $written = ConvertTo-UtcTime $j.finishedLocal }
       $sinceUtc = if ($Since) { $Since.ToUniversalTime() } else { $null }
       if ($sinceUtc -and $written -and $written -le $sinceUtc) {
         Write-Log INFO "handoff: $($d.Name)\$($f.name) predates the last run ($written UTC) — marking it consumed without counting it."
@@ -1070,8 +1177,11 @@ try {
   $me = Get-Process -Id $PID -ErrorAction Stop
   $markerOk = Publish-JsonFile ([ordered]@{
     pid = $PID; processName = $me.ProcessName
-    processStartUtc = $me.StartTime.ToUniversalTime().ToString('o')
-    host = $env:COMPUTERNAME; startedLocal = (Get-Date).ToString('o')
+    # processStart, not processStartUtc: a 'Z' string is the one format that does not survive being
+    # read back carelessly, and Test-RunAlive above compares this against a live process start time
+    # to spot a recycled PID. Getting that wrong by an offset would declare a live run dead.
+    processStart = (Get-SunUpTimestamp $me.StartTime)
+    host = $env:COMPUTERNAME; startedLocal = (Get-SunUpTimestamp)
   }) $script:RunMarker
 } catch { }
 if (-not $markerOk) {
@@ -1097,9 +1207,66 @@ if ($script:VendorPolicy.note) {
   else                            { Write-Log WARN  "vendor: $($script:VendorPolicy.note)" }
 }
 
+# ---- pre-flight: is a servicing restart ALREADY outstanding? ----------------
+# Asked BEFORE any component runs, which is the entire point. Until v0.17.0 Get-RebootState was
+# consulted only afterwards, to decide whether to restart — nothing ever asked whether the work was
+# necessary in the first place.
+#
+# Measured 2026-08-12. Windows Update's own orchestrator installed KB5120708 and KB5121003 the
+# previous evening and left the box waiting, which the CBS Setup log timestamps exactly:
+#
+#   08-11 21:45:40  A reboot is necessary before package KB5121003 can be changed to the Installed state.
+#
+# Ten hours later this engine reinstalled both of them:
+#
+#   08-12 08:04:08  Initiating changes for package KB5121003. Current state is Installed. Target state is Installed.
+#
+# That happens because the WU agent reports an installed-but-pending-restart update as NOT
+# INSTALLED, so it offers it again — and -IgnoreReboot lets us take the offer. It cost 242 seconds,
+# and the run then told the user it had installed 93 GB of updates that were already on the disk.
+#
+# Far worse, it set rebootRequiredByRun. Under the default ifRequired policy that flag is the ONLY
+# thing that triggers a restart: a pre-existing pending state alone never does, which the 08-11 run
+# proves (rebootPending=True, rebootRequiredByRun=False, no restart). So redoing finished work is
+# what escalated "pending, nag in three days" into "restarting in five minutes" — and the countdown
+# it armed is the one that then looped three times.
+#
+# So while a servicing restart is outstanding, this engine's job is to GET THE BOX RESTARTED, not
+# to install more on top. That is Windows' own model, and it makes the skip self-limiting: it lasts
+# until the restart, one cycle at most.
+#
+# Servicing signals ONLY. A queued temp-file deletion (pendingRename) must never suppress the update
+# pass — that is the false positive v0.16.0 exists to disarm, and it is what the 08-11 run's pending
+# state actually was.
+$preRebootState = Get-RebootState
+$preServicing   = @(Get-ServicingSignals $preRebootState.Sources)
+# Under rebootPolicy=never no restart is ever coming, so skipping would mean these updates are never
+# installed at all — the pass would be suppressed every day, forever, and genuinely new security
+# updates would pile up unapplied. Redundant work beats no work: install anyway.
+$skipWuForPending = ($preServicing.Count -gt 0) -and ("$($cfg.rebootPolicy)" -ne 'never')
+
 $results = [System.Collections.Generic.List[object]]::new()
 if ($cfg.defender.enabled)      { $results.Add( (Invoke-Component 'defender'      { Comp-Defender }) ) }
-if ($cfg.windowsUpdate.enabled) { $results.Add( (Invoke-Component 'windowsUpdate' { Comp-WindowsUpdate $cfg }) ) }
+if ($cfg.windowsUpdate.enabled) {
+  if ($skipWuForPending) {
+    $why = "a servicing restart is already pending ($($preServicing -join ', '))"
+    $m = "windowsUpdate: skipped — $why. Updates installed earlier are waiting to be committed; re-running them would reinstall finished work and manufacture a restart request. Restart to finish, then the next run installs anything new."
+    Write-Log INFO $m
+    foreach ($r in $preRebootState.Reasons) { Write-Log INFO "windowsUpdate: pre-flight — $r" }
+    Write-Evt 2007 Information "${Name}: Windows Update pass skipped — a restart is pending to finish updates already installed."
+    Add-Report "- Windows Update: skipped — $why"
+    # reboot = $true on purpose. We did not install anything, but we deliberately DEFERRED work
+    # until the restart happens, so the restart is required by this run's decision — which is what
+    # keeps the skip from becoming permanent.
+    $results.Add([ordered]@{
+      name = 'windowsUpdate'; status = 'skip'
+      detail = 'restart pending — updates already installed are waiting to be committed'
+      error = $null; reboot = $true; durationSec = 0; log = 'windowsupdate.log'
+    })
+  } else {
+    $results.Add( (Invoke-Component 'windowsUpdate' { Comp-WindowsUpdate $cfg }) )
+  }
+}
 if ($cfg.winget.enabled)        { $results.Add( (Invoke-Component 'winget'        { Comp-Winget $cfg }) ) }
 if ($cfg.psModules.enabled) {
   $psEvery = [int]$cfg.psModules.everyDays; if ($psEvery -le 0) { $psEvery = 7 }
@@ -1117,9 +1284,7 @@ if ($cfg.psModules.enabled) {
 # up in this run's dialog and history, a failure they hit is reported, and a reboot they asked for is
 # actually acted on instead of being dropped on the floor.
 $lastRunEnd = $null
-if ($stamp -and $stamp.finishedLocal) {
-  try { $lastRunEnd = [datetime]::Parse("$($stamp.finishedLocal)", $null, [System.Globalization.DateTimeStyles]::RoundtripKind) } catch { }
-}
+if ($stamp -and $stamp.finishedLocal) { $lastRunEnd = ConvertTo-UtcTime $stamp.finishedLocal }
 # The cursor is the moment the LAST run's ingest scan began — not when that run finished. A helper
 # that writes its JSON after the scan has passed its directory but before the stamp is saved has a
 # timestamp inside that gap: measured against the run's end it looks old and would be consumed
@@ -1225,8 +1390,10 @@ $result = [ordered]@{
   date          = $today
   runStamp      = $runStamp
   runDir        = $script:RunDir
-  startUtc      = $startUtc.ToString('o')
-  endUtc        = $endUtc.ToString('o')
+  # Local-with-offset, not 'Z'. These are forensics a human reads during an incident, and the offset
+  # makes them unambiguous without making them unreadable. See RebootState.ps1 on the writer contract.
+  startLocal    = (Get-SunUpTimestamp $startUtc)
+  endLocal      = (Get-SunUpTimestamp $endUtc)
   durationSec   = $durSec
   version       = $script:Version
   forced        = [bool]$Force
@@ -1290,11 +1457,16 @@ if ($rebootPending -and -not $willReboot) {
   if (-not $carryTracker -and $bootedSinceLastRun -and $stamp -and $stamp.pendingSince) {
     Write-Log INFO 'reboot: the box has booted since the last run — the stale-reboot timer starts again from now.'
   }
-  $pendingSince   = if ($carryTracker) { "$($stamp.pendingSince)" } else { (Get-Date).ToString('o') }
+  # Get-SunUpTimestamp, not "$($stamp.pendingSince)". ConvertFrom-Json already turned that field
+  # back into a [datetime], so interpolating it wrote culture text ("08/12/2026 09:27:47") into the
+  # stamp — silently degrading a round-trippable field into a culture-dependent one on the FIRST
+  # carry, after which the value's meaning depends on the locale of whoever reads it next.
+  $pendingSince   = if ($carryTracker) { Get-SunUpTimestamp $stamp.pendingSince } else { Get-SunUpTimestamp }
   $pendingAlerted = [bool]($carryTracker -and $stamp.pendingAlerted)
   $alertDays = if ($cfg.PSObject.Properties.Name -contains 'pendingRebootAlertDays') { [double]$cfg.pendingRebootAlertDays } else { 3 }
   if ($alertDays -gt 0 -and -not $pendingAlerted) {
-    $ageDays = try { ((Get-Date) - [datetime]::Parse($pendingSince, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)).TotalDays } catch { 0 }
+    $since   = ConvertTo-UtcTime $pendingSince
+    $ageDays = if ($since) { ((Get-Date).ToUniversalTime() - $since).TotalDays } else { 0 }
     if ($ageDays -ge $alertDays) {
       # Name what is asking. "A reboot is pending" with no attribution is what made the old alert
       # impossible to act on: there was no way to tell a real servicing hold from a false positive.
@@ -1312,11 +1484,18 @@ if ($rebootPending -and -not $willReboot) {
 # after that point is still unread and must stay ingestable. Advanced ONLY when the scan actually
 # ran: an ingest aborted because a concurrent engine held the lock examined nothing, and moving the
 # cursor anyway would have the next run write off every record that already existed as stale.
-$nextCursor = if ($detached.scanned) { $ingestScanAt.ToString('o') } elseif ($stamp) { "$($stamp.ingestCursor)" } else { '' }
+#
+# Both arms go through Get-SunUpTimestamp. The carry arm used to be "$($stamp.ingestCursor)", which
+# interpolated a [datetime] ConvertFrom-Json had already deserialized and wrote culture text back to
+# disk; the next run then read that as an Unspecified local time and added the offset, putting the
+# cursor SEVEN HOURS IN THE FUTURE — which would consume-unread every detached helper record written
+# in that window, losing its upgrades and its reboot request silently. And the scan arm emitted a
+# 'Z' string, the exact format that does not survive a careless read.
+$nextCursor = if ($detached.scanned) { Get-SunUpTimestamp $ingestScanAt } elseif ($stamp) { Get-SunUpTimestamp $stamp.ingestCursor } else { '' }
 if (-not $detached.scanned) { Write-Log INFO 'handoff: ingest did not run — leaving the cursor where it was.' }
 # handoffRebootPending: survives until a boot is actually observed, so postponing the dialog's
 # countdown cannot lose a reboot a detached pass asked for.
-Save-StampMerged ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-Date).ToString('o'); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted; handoffRebootPending = $handoffReboot; ingestCursor = $nextCursor }) $bootedSinceLastRun
+Save-StampMerged ([ordered]@{ date = $today; runStamp = $runStamp; runDir = $script:RunDir; finishedLocal = (Get-SunUpTimestamp); rebootPending = $rebootPending; pendingSince = $pendingSince; pendingAlerted = $pendingAlerted; handoffRebootPending = $handoffReboot; ingestCursor = $nextCursor }) $bootedSinceLastRun
 
 $summary = ($results | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
 Write-Log INFO "Components: $summary  (total ${durSec}s)"
@@ -1353,21 +1532,78 @@ $histDays     = if ($cfg.notify.historyDays)     { [int]$cfg.notify.historyDays 
 $histCollapse = if ($cfg.notify.PSObject.Properties.Name -contains 'historyCollapse') { [bool]$cfg.notify.historyCollapse } else { $true }
 $histMaxRows  = if ($cfg.notify.historyMaxRows)  { [int]$cfg.notify.historyMaxRows }  else { 500 }
 $history = @(Get-UpdateHistory -Days $histDays -Collapse $histCollapse -ExcludeRunStamp $runStamp -MaxRows $histMaxRows)
+#
+# Which components actually asked for the restart -- so the toast can name the update instead of
+# saying "something". The reboot signal lives at COMPONENT level, not per-update: Add-Update never
+# receives it, so this is the honest granularity available today.
+$rebootFrom = @($results | Where-Object { $_.reboot } | ForEach-Object { $_.name })
 $payload = [ordered]@{
+  schemaVersion      = 1                    # absent = written by <=v0.16.0; see Get-RestartDisplayState
   title              = if (@($script:Updates).Count -gt 0) { 'Updates installed' } else { 'Update check complete' }
+  runStamp           = $runStamp            # ties this payload to notify\restart-state.json
   runDate            = (Get-Date).ToString('yyyy-MM-dd HH:mm')
   totalDurationSec   = $durSec
   totalSizeMB        = if ($totalSize) { [math]::Round($totalSize, 1) } else { $null }
-  rebootRequired      = $willReboot         # engine's authoritative "a reboot is intended" signal
+  rebootRequired      = $willReboot         # POST-POLICY intent: "a reboot is going to happen"
+  rebootPending       = $rebootPending      # the OS verdict: "a reboot is NEEDED" -- not the same thing
   rebootRequiredByRun = $rebootRequiredByRun # true = run-signal reboot (may set no OS pending flag)
-  runEndUtc           = $endUtc.ToString('o') # dialog compares to LastBootUpTime to flip pre/post
+  runEnd              = (Get-SunUpTimestamp $endUtc)   # local-with-offset; survives a careless read
+  runEndEpoch         = (Get-SunUpEpoch $endUtc)       # an int cannot be coerced into a date at all
+  # Deprecated alias, kept ONE version so a tray still running the previous build understands this
+  # payload. Note it is no longer 'Z'-formatted: v0.16.0's Test-BootedSince routes it through the
+  # type guard either way, so the same instant reads correctly there.
+  runEndUtc           = (Get-SunUpTimestamp $endUtc)
+  bootEpochAtRun      = (Get-BootEpoch)     # lets a consumer detect a boot without a CIM call
   rebootCountdownSec  = $graceInteractive
+  rebootPolicy        = "$($cfg.rebootPolicy)"
+  rebootAction        = $result.rebootAction
+  rebootFrom          = $rebootFrom
+  rebootSources       = @($rebootState.Sources)
+  rebootLabels        = @($rebootState.Labels)    # short forms, sized for a toast line
+  rebootReasons       = @($rebootState.Reasons)   # full sentences, for the dialog and logs
+  rebootIgnored       = @($rebootState.Advisory)
+  # Plain language, deliberately: "the machine still has the problem they fix" beats quoting a CVE.
+  whyPlain            = @(Get-RebootConsequence -Sources $rebootState.Sources)
+  # Carried in the payload rather than read from config by the toast: the toast runs non-elevated
+  # and config.json is admin-only, so this is the engine telling it what it is allowed to do.
+  explain             = $(if ($cfg.notify.PSObject.Properties.Name -contains 'explain') { "$($cfg.notify.explain)" } else { 'off' })
   pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
   history            = $history             # past-Ndays updates, greyed below the current run
 }
 try { New-Item -ItemType Directory -Force -Path $NotifyDir | Out-Null } catch {}
-try { $payload | ConvertTo-Json -Depth 6 | Set-Content $NotifyPayload } catch { Write-Log WARN "notify payload: $_" }
+
+# Arm the restart record for THIS run, before the payload that references it. Whoever ends up
+# executing the restart (the toast, the dialog, or this engine when headless) rewrites it with
+# outcome='issued' and the boot it is leaving; until then it stands as "a restart is expected for
+# run X and has not been issued". A stale record from a previous run is harmless -- every consumer
+# matches on runStamp first -- but rewriting it each run keeps the file honest rather than
+# archaeological.
+if ($willReboot) {
+  $armed = [ordered]@{
+    schemaVersion      = 1
+    runStamp           = $runStamp
+    requestedBy        = 'engine'
+    trigger            = if ($interactive) { 'armed-interactive' } else { 'armed-headless' }
+    outcome            = 'armed'
+    executedLocal      = $null
+    executedEpoch      = $null
+    bootAtRequestEpoch = (Get-BootEpoch)
+    bootAtRequestLocal = (Get-SunUpTimestamp (Get-BootLocal))
+    method             = $null
+    sunupVersion       = $script:Version
+  }
+  if (-not (Publish-JsonFile $armed $NotifyRestart)) { Write-Log WARN 'restart record: could not arm.' }
+} elseif (Test-Path $NotifyRestart) {
+  # No restart intended this run. Leave the record in place -- it may still be the evidence that the
+  # LAST run's restart happened, which is what the post-reboot summary reads.
+  Write-Log INFO 'restart record: no restart intended this run; leaving the previous record for the summary.'
+}
+
+# Publish-JsonFile, not Set-Content: a torn write still passes Test-Path, and the dialog runs with
+# $ErrorActionPreference='Stop', so a truncated payload killed it before it drew anything -- no
+# window, no error, no trace. The user just never got a summary.
+if (-not (Publish-JsonFile $payload $NotifyPayload)) { Write-Log WARN 'notify payload: could not publish.' }
 
 # ---- coordinated reboot -----------------------------------------------------
 if ($willReboot -and $interactive) {
@@ -1396,8 +1632,24 @@ else { Write-Log INFO 'No reboot required.' }
 # runs leave pendingShow=true so the SunUp-Notify logon trigger shows it at next sign-in
 # (also how the post-reboot summary appears). StopExisting makes a newer cycle replace it.
 if ($notifyEnabled -and $interactive) {
-  try { Start-ScheduledTask -TaskName $NotifyTask -ErrorAction Stop; Write-Log INFO "Launched $NotifyTask dialog." }
-  catch { Write-Log WARN "could not start ${NotifyTask}: $_" }
+  if ($willReboot) {
+    # The toast owns the countdown as of v0.17.0, so start IT and not the dialog. Starting both
+    # would put two countdowns on one run, racing each other to restart the box -- and only one of
+    # them can be the thing the user is looking at.
+    #
+    # It is fire-and-forget (Start-ScheduledTask returns no exit code), so the FALLBACK LIVES IN THE
+    # TOAST: if it cannot show a toast it starts the dialog itself before exiting. The knowledge of
+    # whether a toast appeared belongs to the process that tried to show one.
+    try { Start-ScheduledTask -TaskName $RestartTask -ErrorAction Stop; Write-Log INFO "Launched $RestartTask (restart toast owns the ${graceInteractive}s countdown)." }
+    catch {
+      Write-Log WARN "could not start ${RestartTask}: $_ — falling back to the summary dialog's countdown."
+      try { Start-ScheduledTask -TaskName $NotifyTask -ErrorAction Stop; Write-Log INFO "Launched $NotifyTask dialog (fallback)." }
+      catch { Write-Log WARN "could not start ${NotifyTask} either: $_" }
+    }
+  } else {
+    try { Start-ScheduledTask -TaskName $NotifyTask -ErrorAction Stop; Write-Log INFO "Launched $NotifyTask dialog." }
+    catch { Write-Log WARN "could not start ${NotifyTask}: $_" }
+  }
 }
 
 # ---- user-scope winget pass --------------------------------------------------
@@ -1490,9 +1742,33 @@ if (@($script:SelfHostPending).Count -gt 0) {
 }
 
 # Headless reboot LAST (after logs/transcript flushed). Interactive reboot is the dialog's job.
+# Same rule as the dialog: record it BEFORE issuing it, and if the record cannot be written, do not
+# issue it. A restart nothing can prove happened is one the next logon will try to repeat.
+# Note this arm is optimistic by design -- shutdown /t is abortable, so a user running 'shutdown /a'
+# leaves an 'issued' record on an unchanged boot, which is precisely the awaitingRestart state: the
+# summary then says a restart was requested and did not happen, instead of silently trying again.
 if ($result.rebootAction -eq 'reboot') {
   $delay = [int]$cfg.rebootDelaySeconds
-  & shutdown.exe /r /t $delay /c "${Name}: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
+  $bootNow = Get-BootEpoch
+  $issued = [ordered]@{
+    schemaVersion      = 1
+    runStamp           = $runStamp
+    requestedBy        = 'engine-headless'
+    trigger            = 'headless-delay'
+    outcome            = 'issued'
+    executedLocal      = (Get-SunUpTimestamp)
+    executedEpoch      = (Get-SunUpEpoch)
+    bootAtRequestEpoch = $bootNow
+    bootAtRequestLocal = (Get-SunUpTimestamp (Get-BootLocal))
+    method             = 'shutdown.exe /r'
+    sunupVersion       = $script:Version
+  }
+  if (Publish-JsonFile $issued $NotifyRestart) {
+    & shutdown.exe /r /t $delay /c "${Name}: updates applied — rebooting in $([math]::Round($delay/60)) min. Run 'shutdown /a' to abort." /d p:2:4
+  } else {
+    Write-Log ERROR 'reboot: could not record the restart, so it was NOT issued. The next run will re-evaluate.'
+    Write-Evt 2005 Warning "${Name}: restart withheld — the restart record could not be written."
+  }
 }
 
 # Explicit, meaningful exit code so Task Scheduler's LastTaskResult reflects the run —
