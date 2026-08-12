@@ -46,7 +46,25 @@ else {
   function Get-RebootState { param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
     [pscustomobject]@{ Required = ($RunRequired -or $HandoffRequired); Sources = @(); Labels = @('Updates installed')
                        Reasons = @(); Advisory = @(); CheckedUtc = (Get-Date).ToUniversalTime() } }
-  function Test-BootedSince { param($Utc) $false }
+  # This used to be `{ $false }` -- a constant, which is not a degraded answer but a wrong one: it
+  # says "the box has never booted since anything", so a reboot the run asked for could never be
+  # retired and the sunset icon stayed lit for good. Degrading the DETECTION is acceptable here;
+  # degrading the RETIREMENT re-creates the permanently-lit icon v0.16.0 existed to remove.
+  function ConvertTo-UtcTime { param($Value, [switch]$AllowFuture)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [long] -or $Value -is [int]) { return (New-Object datetime 1970,1,1,0,0,0,([System.DateTimeKind]::Utc)).AddSeconds([double]$Value) }
+    try {
+      $p = [datetime]::Parse("$Value", $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+      if ($p.Kind -eq [System.DateTimeKind]::Unspecified) { $p = [datetime]::SpecifyKind($p, [System.DateTimeKind]::Local) }
+      return $p.ToUniversalTime()
+    } catch { return $null }
+  }
+  function Test-BootedSince { param($Utc)
+    $t = ConvertTo-UtcTime $Utc
+    if ($null -eq $t) { return $false }
+    try { ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() -gt $t) } catch { $false }
+  }
 }
 
 function Get-RebootPolicy {
@@ -66,12 +84,20 @@ function Get-Payload {
 # code is recorded in the run payload and nowhere else. So the tray reading only the registry meant
 # the one case where a restart was certainly needed — SunUp having just installed something that
 # asked for one — was the case the icon could not show. Both halves are folded in here.
-# A restart the run asked for is retired by an actual boot, mirroring the dialog's own pre/post
-# test; Test-BootedSince answers $false when it cannot tell, so the state stays visible on doubt.
+# A restart the run asked for is retired by an actual boot, sharing one implementation with the
+# dialog rather than mirroring it; Test-BootedSince answers $false when it cannot tell, so the state
+# stays visible on doubt. (Mirroring is exactly what failed: the dialog's copy of this test was the
+# 2026-08-12 restart loop, and this one was right the whole time because it went through the
+# shared reader. Two implementations of one question is the bug, not the drift between them.)
 function Get-TrayRebootState {
   $runOutstanding = $false
   $p = Get-Payload
-  if ($p -and $p.rebootRequired) { $runOutstanding = -not (Test-BootedSince $p.runEndUtc) }
+  # runEnd is v0.17.0's local-with-offset field; runEndUtc is the v0.16.0 spelling, still honoured
+  # so a tray that outlives an engine upgrade reads the older payload correctly rather than blindly.
+  if ($p -and $p.rebootRequired) {
+    $runEndValue = if ($p.PSObject.Properties.Name -contains 'runEnd') { $p.runEnd } else { $p.runEndUtc }
+    $runOutstanding = -not (Test-BootedSince $runEndValue)
+  }
   $lr = Get-LastRun
   if ($lr -and $lr.handoffRebootPending) { $runOutstanding = $true }
   Get-RebootState -HandoffRequired $runOutstanding
@@ -209,8 +235,36 @@ $miRun.Add_Click({
 })
 $miSummary.Add_Click({
   # Re-show the most recent summary: set pendingShow so the dialog displays, then trigger it.
+  # Under the same Global\SunUp-Notify mutex and published by rename as every other writer of this
+  # file -- three processes read-modify-write it and a torn write kills the next dialog outright.
+  #
+  # Worth remembering what this menu item used to be able to do: with the payload still saying
+  # rebootRequired and the dialog unable to tell it had already restarted, clicking "Show last
+  # summary" armed a fresh five-minute countdown and rebooted the machine. It is now inert -- the
+  # restart record decides, and re-showing a summary cannot re-arm anything.
   try {
-    if (Test-Path $Payload) { $p = Get-Content $Payload -Raw | ConvertFrom-Json; $p.pendingShow = $true; $p | ConvertTo-Json -Depth 8 | Set-Content $Payload -Encoding UTF8 }
+    if (Test-Path $Payload) {
+      $mx = $null; $held = $false
+      try { $mx = New-Object System.Threading.Mutex($false, 'Global\SunUp-Notify') } catch {}
+      if ($mx) {
+        try { $held = $mx.WaitOne([timespan]::FromSeconds(5)) }
+        catch [System.Threading.AbandonedMutexException] { $held = $true }
+        catch { $held = $false }
+      }
+      if ($held) {
+        try {
+          $p = Get-Content $Payload -Raw -ErrorAction Stop | ConvertFrom-Json
+          $p.pendingShow = $true
+          $tmp = "$Payload.tmp"
+          ($p | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+          $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json
+          Move-Item -Path $tmp -Destination $Payload -Force -ErrorAction Stop
+        } finally {
+          try { $mx.ReleaseMutex() } catch {}
+          try { $mx.Dispose() } catch {}
+        }
+      }
+    }
     Start-ScheduledTask -TaskName "$Name-Notify" -ErrorAction Stop
   } catch { [System.Windows.Forms.MessageBox]::Show("Couldn't open the summary: $_", 'SunUp', 'OK', 'Warning') | Out-Null }
 })
