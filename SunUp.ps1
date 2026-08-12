@@ -1380,7 +1380,14 @@ if ($script:Updates.Count -gt 1) {
     # in the event log. Only bit when a run had 2+ updates, so it looked random.
     $rowName = if ($grp.Count -gt 1) { "$($first.name) $([char]0x00D7)$($grp.Count)" } else { "$($first.name)" }
     $dur   = ($grp | ForEach-Object { $_.durationSec } | Where-Object { $_ -ne $null } | Measure-Object -Maximum).Maximum
-    $deduped.Add([ordered]@{ name=$rowName; source=$first.source; old=$first.old; new=$first.new; durationSec=$dur; sizeMB=$first.sizeMB })
+    $row = [ordered]@{ name=$rowName; source=$first.source; old=$first.old; new=$first.new; durationSec=$dur; sizeMB=$first.sizeMB }
+    # Carry the representative row's metadata. This block REBUILDS each row from scratch, so any
+    # field not named right here is silently dropped -- and dropping meta blinds the restart
+    # notification on exactly the runs that collapse, i.e. the multi-update ones where explaining
+    # what is being restarted for matters most. Found by deploying and running it (2026-08-12), not
+    # by reading it: the first live run under v0.17.0 emitted no meta on any row.
+    if ($first.meta) { $row.meta = $first.meta }
+    $deduped.Add($row)
   }
   $script:Updates = $deduped
 }

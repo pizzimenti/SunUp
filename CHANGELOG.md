@@ -187,6 +187,12 @@ Accuracy over drama: a Windows security update almost never makes a feature *una
 restart, it leaves the old vulnerable code running. Claiming otherwise would be easier to write and
 false, and a notification that overstates its case once is ignored forever after.
 
+One footnote, because it is the kind of thing that only shows up when you run it: the duplicate-row
+collapse rebuilds every row from a fresh literal, so it silently dropped the new `meta` field on any
+run with two or more updates — precisely the runs where the notification most needs to say what it
+is restarting for. Caught by deploying v0.17.0 and watching the first live run emit no metadata at
+all. Same shape as the `$Name` bug already documented in that same block, for the same reason.
+
 Optional on top of that, `notify.explain = auto` (default `off`) asks Claude for the specific version
 in plain words, cached per KB in `notify\why-cache.json` so each update is researched once ever.
 Bounded by a 30s timeout — 12.4s measured for a warm call, so the original 12s budget timed out every
@@ -227,7 +233,7 @@ a fresh five-minute countdown and rebooted the machine. It is now inert.
 
 ### Tests
 
-Suite is 359 checks (was 238), in two new sections:
+Suite is 361 checks (was 238), in two new sections:
 
 - **[12] the restart loop** — the incident as a unit test, including the assertion that a `runEnd`
   seven hours in the future **cannot** re-arm a restart that a record says already happened; the

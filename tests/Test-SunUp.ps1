@@ -338,12 +338,22 @@ Check 'the collapse block was found in source' $m.Success
 $Name = 'SunUp'
 $script:Updates = [System.Collections.Generic.List[object]]::new()
 $script:Updates.Add([ordered]@{ name='Tailscale';    source='winget'; old='1.98.9'; new='1.99.0';  durationSec=3; sizeMB=10 })
-$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
-$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90; meta=[ordered]@{ kb='KB5121003'; severity='Critical' } })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90; meta=[ordered]@{ kb='KB5121003'; severity='Critical' } })
 Invoke-Expression $m.Value
 Check '$Name survives the collapse block' ($Name -eq 'SunUp') "got '$Name'"
 Check 'duplicate rows still collapse' ($script:Updates.Count -eq 2) "$($script:Updates.Count) rows"
 Check 'and the collapsed row is annotated' (($script:Updates | ForEach-Object { $_.name }) -join ',' -match ([char]0x00D7)) (($script:Updates | ForEach-Object { $_.name }) -join ',')
+# FOUND BY DEPLOYING IT (2026-08-12), not by reading it. This block REBUILDS every row from a fresh
+# [ordered] literal, so a field it does not name is dropped -- and the first live run under v0.17.0
+# emitted no meta on any row. It only bites a run with 2+ updates, which is precisely the run where
+# the restart notification most needs to say what it is restarting for. Same shape as the $Name bug
+# above, in the same block, for the same reason.
+$collapsed = @($script:Updates | Where-Object { $_.name -like 'Google Chrome*' })[0]
+Check 'and the row keeps its metadata, which the notification explains itself out of' `
+      ("$($collapsed.meta.kb)" -eq 'KB5121003') "got '$($collapsed.meta.kb)'"
+Check 'while a row that never had metadata does not gain an empty one' `
+      (-not (@($script:Updates | Where-Object { $_.name -eq 'Tailscale' })[0].Keys -contains 'meta'))
 
 Write-Host "`n[7] user-scope pass (v0.13.0)"
 $userSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'UserScope.ps1'
