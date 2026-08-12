@@ -993,6 +993,137 @@ Check 'but never under rebootPolicy=never, where no restart is ever coming' `
 Check 'and the skip still asks for the restart, so it is self-limiting' `
       ($engineText3 -match "(?s)detail = 'restart pending.{0,120}reboot = \`$true")
 
+Write-Host "`n[13] the Restarting Soon toast (v0.17.0)"
+$toastSrc = Join-Path $repoRoot 'Show-RestartToast.ps1'
+$actSrc   = Join-Path $repoRoot 'Invoke-ToastAction.ps1'
+Check 'Show-RestartToast.ps1 exists'  (Test-Path $toastSrc)
+Check 'Invoke-ToastAction.ps1 exists' (Test-Path $actSrc)
+$toastText = Get-Content $toastSrc -Raw
+$actText   = Get-Content $actSrc   -Raw
+$toastCode = Get-CodeOnly $toastText
+$installText = Get-Content (Join-Path $repoRoot 'Install.ps1') -Raw
+$toastAst  = [System.Management.Automation.Language.Parser]::ParseFile($toastSrc, [ref]$null, [ref]$null)
+# The <text> elements are a mix: two bare ones (which PowerShell surfaces as plain strings) and one
+# carrying placement="attribution" (an XmlElement). Indexing the property would compare a string to
+# an element, so go through the nodes and read InnerText.
+function Get-ToastTexts { param($Xml) @($Xml.toast.visual.binding.SelectNodes('text') | ForEach-Object { $_.InnerText }) }
+
+# The toast host runs under 5.1 because WinRT has no projection in .NET Core. Same ASCII trap as
+# SelfHost.ps1, and the same consequence: a task that dies at parse time, silently.
+foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}) {
+  $na = @($f.t.ToCharArray() | Where-Object { [int]$_ -gt 127 })
+  Check "  $($f.n) is pure ASCII" ($na.Count -eq 0) "$($na.Count) non-ASCII char(s)"
+  $r = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "
+    `$e = `$null
+    [void][System.Management.Automation.Language.Parser]::ParseFile('$($f.p)', [ref]`$null, [ref]`$e)
+    if (`$e) { 'FAIL: ' + (`$e[0].Message) } else { 'OK' }"
+  Check "  $($f.n) parses under Windows PowerShell 5.1" ("$r" -eq 'OK') "$r"
+}
+Check 'the toast task runs Windows PowerShell 5.1, never pwsh (WinRT does not exist there)' `
+      ($installText -match '(?s)\$rAction\s*=\s*New-ScheduledTaskAction -Execute \$ps51.{0,120}Show-RestartToast\.ps1')
+Check 'and the engine hands it the countdown instead of the dialog when it intends to restart' `
+      ($engineText3 -match '(?s)if \(\$willReboot\).{0,600}Start-ScheduledTask -TaskName \$RestartTask')
+
+# --- the XML is real XML, and it escapes what it is given ---------------------
+foreach ($fnName in 'ConvertTo-XmlText','New-ToastXml','Format-Countdown','Get-RestartSubject','Get-RestartWhy') {
+  $fnAst = $toastAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fnName }.GetNewClosure(), $true)
+  Check "  $fnName is defined in the toast host" ($null -ne $fnAst)
+  if ($fnAst) { . ([scriptblock]::Create($fnAst.Extent.Text)) }
+}
+$xmlOk = $false; $xmlErr = ''
+try { $x = [xml](New-ToastXml -Subject 'KB5121003' -Why 'Because.' -Paused $false); $xmlOk = ($null -ne $x) } catch { $xmlErr = $_.Exception.Message }
+Check 'the toast XML is well-formed' $xmlOk $xmlErr
+# An update title really can contain an ampersand ("Intel(R) Chipset & Firmware"), and an unescaped
+# one makes the whole toast fail to load -- i.e. no restart warning at all.
+$hostile = 'Update & <script> "quoted" 2026-08 R&D'
+$esc = $null; $escOk = $false
+try { $esc = [xml](New-ToastXml -Subject $hostile -Why "Ampersands & angle <brackets>" -Paused $false); $escOk = $true } catch {}
+Check 'and survives an update title containing & and < >' $escOk
+if ($escOk) {
+  Check 'with the text preserved, not mangled' ((Get-ToastTexts $esc) -contains $hostile)
+}
+$x0 = [xml](New-ToastXml -Subject 's' -Why 'w' -Paused $false)
+Check 'the toast is a reminder, so it stays on screen instead of vanishing in 5s' ($x0.toast.scenario -eq 'reminder')
+Check 'the countdown is data-bound, so it updates without re-popping the toast' `
+      ($x0.toast.visual.binding.progress.value -eq '{tick}' -and $x0.toast.visual.binding.progress.valueStringOverride -eq '{ticklabel}')
+$acts = @($x0.toast.actions.action)
+Check 'there are exactly two buttons' ($acts.Count -eq 2)
+Check 'Restart now comes first, Pause second (the order the user asked for)' `
+      ($acts[0].content -eq 'Restart now' -and $acts[1].content -eq 'Pause')
+Check 'both activate by protocol -- the only route that works without a COM activator' `
+      (@($acts | Where-Object { $_.activationType -eq 'protocol' }).Count -eq 2)
+$xP = [xml](New-ToastXml -Subject 's' -Why 'w' -Paused $true)
+$actsP = @($xP.toast.actions.action)
+Check 'and Pause toggles to Unpause, pointing at the resume action' `
+      ($actsP[1].content -eq 'Unpause' -and $actsP[1].arguments -eq 'sunup:resume')
+Check 'the header changes with it, so a paused toast does not still say Restarting Soon' `
+      ((Get-ToastTexts $xP)[0] -eq 'Restart Paused' -and (Get-ToastTexts $x0)[0] -eq 'Restarting Soon')
+Check 'the countdown formats as m:ss' ((Format-Countdown 125) -eq '2:05' -and (Format-Countdown 5) -eq '0:05' -and (Format-Countdown -3) -eq '0:00')
+
+# --- it names the update, and says why in plain words ------------------------
+$pay = [pscustomobject]@{
+  rebootRequired = $true; runStamp = 'R1'; rebootSources = @('windowsUpdate','run')
+  whyPlain = @(Get-RebootConsequence -Sources @('windowsUpdate','run'))
+  items = @(
+    [pscustomobject]@{ name = 'KB5121003 Security Update'; meta = [pscustomobject]@{ rebootRequired = $true } }
+    [pscustomobject]@{ name = 'KB5120708 .NET Update';     meta = [pscustomobject]@{ rebootRequired = $true } }
+    [pscustomobject]@{ name = 'Defender signatures' }          # no meta: did NOT ask for a restart
+  )
+}
+$subj = Get-RestartSubject $pay
+Check 'the toast names the update that is asking, not just "an update"' ($subj -like 'KB5121003*')
+Check 'and counts only the ones that actually asked (Defender did not)' ($subj -like '*1 other update')
+Check 'with no payload at all it still says something honest' ((Get-RestartSubject $null) -eq 'A recent update')
+$whyText = Get-RestartWhy $pay
+Check 'the why-text is plain language, with no CVE or KB jargon' `
+      ($whyText -notmatch '(?i)CVE-|\bKB\d|servicing stack|mitigation') "got: $whyText"
+Check 'and it fits an attribution line' ($whyText.Length -le 260) "length $($whyText.Length)"
+Check 'a payload with no explanation still gets a sentence rather than a blank' `
+      ((Get-RestartWhy ([pscustomobject]@{ rebootRequired = $true })).Length -gt 0)
+
+# --- the safety properties ---------------------------------------------------
+Check 'ONLY the countdown mode may restart anything' `
+      ($toastText -match "if \(\`$restart\.Mode -ne 'countdown'\)")
+Check 'the toast records the restart before issuing it, and refuses to restart if it cannot' `
+      ($toastText -match '(?s)if \(-not \(Save-RestartRecord.{0,200}return \$false')
+Check 'every give-up path hands the countdown back to the dialog' `
+      (@([regex]::Matches($toastText, 'Invoke-DialogFallback')).Count -ge 5)
+Check 'and the dialog stands down while the toast is counting, so there is never a second countdown' `
+      ($dlgText -match "Get-ScheduledTask -TaskName `"\`$Name-Restart`"" -and $dlgText -match '\$toastOwnsCountdown')
+Check 'pausing holds indefinitely -- nothing auto-resumes it' `
+      ($toastCode -notmatch '(?i)auto-?resume' -and $toastCode -notmatch '(?i)Start-Sleep -Seconds \$?resume' -and $toastText -match 'holding indefinitely')
+Check 'the protocol handler allow-lists actions instead of trusting the URI' `
+      ($actText -match "\`$known = @\('restart', 'pause', 'resume', 'dismiss', 'show'\)" -and $actText -match '\$known -notcontains \$action')
+Check 'and it can never restart anything itself' ($actText -notmatch 'Restart-Computer|shutdown\.exe')
+Check 'Install registers the sunup: protocol the buttons need' ($installText -match 'Classes\\sunup')
+Check 'and asserts bin is readable by the non-elevated dialog and toast' `
+      ($installText -match 'icacls \$Bin /grant "\*S-1-5-32-545')
+Check 'and drops a pre-v0.17.0 payload that no record could be proven against' `
+      ($installText -match 'schemaVersion' -and $installText -match 'Removed a pre-v0\.17\.0 notify payload')
+$uninstText = Get-Content (Join-Path $repoRoot 'Uninstall.ps1') -Raw
+Check 'Uninstall removes the restart task, the AUMID and the protocol' `
+      ($uninstText -match '\$Name-Restart' -and $uninstText -match 'AppUserModelId' -and $uninstText -match 'Classes\\sunup')
+
+# --- optional Claude enrichment: an enhancement that can never break the warning ---
+Check 'enrichment is OFF by default' ($engineText3 -match "explain\s*=\s*'off'")
+Check 'and the engine tells the toast what it may do, since config.json is admin-only' `
+      ($engineText3 -match "explain\s+=\s+\`$\(if \(\`$cfg\.notify")
+Check 'the toast only enriches when explicitly set to auto' ($toastCode -match "if \(\`$mode -ne 'auto'\) \{ return \`$Fallback \}")
+Check 'every enrichment failure returns the deterministic text' `
+      (@([regex]::Matches($toastCode, 'return \$Fallback')).Count -ge 2 -and $toastCode -match 'if \(-not \$text\) \{ return \$Fallback \}')
+Check 'the call is bounded by a timeout and killed if it overruns' `
+      ($toastCode -match 'WaitForExit\(\$TimeoutSec \* 1000\)' -and $toastCode -match '\$p\.Kill\(\)')
+Check 'and it is judged on its OUTPUT, not on an exit code that is empty here' `
+      ($toastCode -match '\(\$null -ne \$exit\) -and \(\$exit -ne 0\)')
+Check 'the answer is sanity-checked before it goes on screen' `
+      ($toastCode -match '\$text\.Length -lt 20 -or \$text\.Length -gt 400' -and $toastCode -match "CVE-\\d")
+Check 'the prompt forbids the jargon the user asked us to avoid' `
+      ($toastText -match 'No CVE numbers, no KB numbers' -and $toastText -match 'plain everyday English')
+Check 'results are cached per update set, so each one is researched once ever' `
+      ($toastCode -match 'function Get-WhyCacheKey' -and $toastCode -match 'Save-CachedWhy \$key \$text')
+Check 'and enrichment happens only once a toast is definitely going up' `
+      ($toastCode -match '(?s)if \(\$restart\.Mode -ne .countdown.\).{0,200}\$why = Get-ExplainedWhy')
+
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)
   # unwound straight past the counter to the summary, which then printed ALL TESTS PASSED -- while
