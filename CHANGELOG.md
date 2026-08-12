@@ -2,6 +2,247 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.17.0] - 2026-08-12
+
+### Fixed — the summary dialog restarted this box three times in seventy minutes
+
+`notify\reboot.log`, this morning:
+
+```
+2026-08-12T08:09:53  Restart-Computer -Force   <- correct: 300s after the 08:00 run
+2026-08-12T09:03:18  Restart-Computer -Force   <- wrong
+2026-08-12T09:09:45  Restart-Computer -Force   <- wrong
+```
+
+Each of the last two fired about five minutes after a logon. `Show-UpdateDialog.ps1` could not tell
+that the machine had already restarted, so the `SunUp-Notify` logon trigger armed a fresh countdown
+every time the user signed in, and the countdown did what it was built to do.
+
+The cause was one line, and it is the same class of bug v0.13.2 already fixed once:
+
+```powershell
+$runEnd = [datetime]::Parse($data.runEndUtc, $null, [DateTimeStyles]::RoundtripKind).ToUniversalTime()
+```
+
+`$data` came from `ConvertFrom-Json`, which had **already** deserialized `runEndUtc` into a
+`[datetime]` with `Kind=Utc`. Passing a `DateTime` to `[datetime]::Parse` stringifies it through the
+current culture first, and that drops the `Z`:
+
+```
+runEndUtc                    2026-08-12T15:04:43.8905354Z    (Kind=Utc)
+stringified for Parse        "08/12/2026 15:04:43"           <- the Z is gone
+reparsed                     Kind=Unspecified
+.ToUniversalTime()           2026-08-12T22:04:43Z            <- +7h, permanently in the future
+```
+
+So `$boot -gt $runEnd` could never be true. Note the failure is sign-dependent: west of UTC the
+timestamp moves forward and the box restarts repeatedly; east of UTC the same line moves it backward
+and the dialog would have **silently skipped every restart it was supposed to warn about**. Same
+line, opposite symptom, decided by geography.
+
+`RebootState.ps1` had the guard that prevents this all along — `if ($Utc -is [datetime])` in
+`Test-BootedSince` — and the tray, which used it, was right the whole time. The dialog was the one
+consumer that never dot-sourced the shared file. That is the actual defect: the detection *source*
+has now been rewritten four times (v0.3.1 per-run signal, v0.4.0 registry `Test-PendingReboot`,
+v0.8.0 the `rebootPolicy` switch, v0.16.0 the classified verdict), and every single fix landed in
+the engine while the consumers drifted.
+
+### Fixed — SunUp reinstalled updates Windows had already installed, and that is what started it
+
+The loop above repeated the restart. This is what caused the first one, and it was hiding in the
+same blind spot.
+
+```
+08-11 21:24  MoUpdateOrchestrator     2026-08 .NET Framework Security Update (KB5120708)
+08-11 21:45  MoUpdateOrchestrator     2026-08 Security Update (KB5121003) (26200.9168)
+08-12 08:03  <<PROCESS>>: pwsh.exe    2026-08 .NET Framework Security Update (KB5120708)   <- SunUp, again
+08-12 08:04  <<PROCESS>>: pwsh.exe    2026-08 Security Update (KB5121003) (26200.9168)     <- SunUp, again
+```
+
+Windows Update's own orchestrator installed both the previous evening and left the box waiting. The
+CBS Setup log timestamps the hold at **21:45:40**, ten hours before the run:
+
+```
+08-11 21:45:40  A reboot is necessary before package KB5121003 can be changed to the Installed state.
+08-12 08:04:08  Initiating changes for package KB5121003. Current state is Installed. Target state is Installed.
+```
+
+The WU agent reports an installed-but-pending-restart update as **not installed**, so it offers it
+again, and `-IgnoreReboot` lets us take the offer. `result.json` recorded "6 installed, 0 failed
+(6 offered)" — two KBs, offered three times each, all of them finished work.
+
+It cost 242 seconds. What it cost that actually mattered was `rebootRequiredByRun`, which under the
+default `ifRequired` policy is the **only** thing that triggers a restart — a pre-existing pending
+state alone never does. The 08-11 run proves it: `rebootPending=True`, `rebootRequiredByRun=False`,
+`rebootAction=suppressed`, no restart. So redoing finished work is what escalated "pending, nag in
+three days" into "restarting in five minutes".
+
+`Get-RebootState` is now asked **before** the components run, not only after. If a servicing signal
+is already outstanding, the Windows Update pass is skipped: the updates are installed and waiting to
+be committed, and the engine's job at that point is to get the box restarted, not to install more on
+top. That is Windows' own model. Two rules keep it honest:
+
+- **The skip still requests the restart**, so it is self-limiting — it lasts one cycle, not forever.
+- **It never applies under `rebootPolicy: never`**, where no restart is coming and skipping would
+  mean the updates are never installed at all. Redundant work beats no work.
+
+Only *servicing* signals qualify (`cbs`, `cbsInProgress`, `cbsPackages`, `windowsUpdate`,
+`wuPostReboot`). A queued temp-file deletion must never suppress the update pass — that is the
+false positive v0.16.0 exists to disarm, and it is exactly what the 08-11 run's pending state was.
+
+Separately, and because the same run reported installing **93 GB**: Windows Update rows no longer
+carry a size. PSWindowsUpdate's `Size` is the WUA `MaxDownloadSize`, a worst-case figure for the
+entire bundle rather than what this machine transferred — measured at 93,184 MB for the August
+cumulative and 1,489 MB for a Defender signature update roughly a tenth that size. An honest blank
+beats a confident wrong number; the raw value is kept in `meta.maxDownloadMB` for forensics, and
+winget rows still show a real size because those are HEAD-probed from the actual download.
+
+### Changed — the restart decision rests on boot identity, not on comparing two clocks
+
+Timestamp hygiene alone would have fixed the instance and left the class, so the decision no longer
+depends on a timestamp at all. `notify\restart-state.json` records that a restart was **issued**, for
+which run, and **which boot the machine was on** when it was issued. The test is then:
+
+> A restart is complete iff `Get-BootEpoch() -ne $rec.bootAtRequestEpoch`.
+
+`-ne`, not `-gt`. Both sides are readings of the same counter, taken by SunUp, as integers: no parse,
+no culture, no offset, no DST, no second clock to disagree. Even with every timestamp on disk
+mangled, that comparison still answers correctly — which is the point.
+
+Two rules come with it:
+
+- **Record first, restart second, and if the record cannot be written, do not restart.** A restart
+  nothing can prove happened is one the next logon re-arms a countdown for. Refusing costs one
+  postponed update; restarting unrecorded costs the user their work, repeatedly.
+- **A payload with no `runStamp` may never arm a countdown.** One written by v0.16.0 or earlier
+  cannot be tied to any record, so nothing can prove a restart was not already issued for it. Showing
+  a stale summary costs a day of the watchdog nag; arming a countdown on an unprovable payload *is*
+  the incident. This is also the upgrade path, and it lasts exactly one run cycle.
+
+A third display state falls out of the record: **`awaitingRestart`** — issued, but the machine is
+still on the same boot. An aborted or blocked shutdown (`shutdown /a`, a driver veto, an app refusing
+to close). That state was real before and completely invisible: it presented as "restart needed" and
+re-armed. It now says a restart was requested and did not happen, and offers a manual button only.
+Nothing automatic asks a machine to restart twice.
+
+### Added — a "Restarting Soon" toast that says what and why, with Restart now / Pause
+
+`Show-RestartToast.ps1` replaces the WPF countdown as the normal path:
+
+- header **Restarting Soon**, the update that is asking (named, not "an update"), and a smaller line
+  saying what is still exposed until the restart;
+- a live countdown that updates **in place** — `<progress>` fields are data-bound and rewritten by
+  `ToastNotifier.Update()`, so it does not re-pop once a second;
+- **[Restart now]** and **[Pause]**, where Pause toggles to **Unpause** and holds the countdown
+  indefinitely. There is no auto-resume and no cap: if you paused it, you meant it.
+
+Windows PowerShell 5.1, not pwsh 7, because the WinRT toast APIs have no .NET Core projection — the
+same carve-out `SelfHost.ps1` makes for a different reason, with the same pure-ASCII constraint,
+now enforced against the real 5.1 parser for `RebootState.ps1` too (it had ten em dashes and failed
+with six errors).
+
+Three things had to be measured rather than assumed, all on 2026-08-12:
+
+- `NotificationData.Values` comes back as a bare `System.__ComObject` under 5.1. Indexing throws,
+  `.Insert()` does not exist, and it will not cast to `IDictionary[string,string]`. The only route
+  that works is handing the whole dictionary to the **constructor**, and the unary comma in
+  `-ArgumentList (,$d)` is load-bearing.
+- `scenario="reminder"` is what keeps the toast on screen; a default toast auto-dismisses in about
+  five seconds, which is useless for something you are being asked to act on.
+- Buttons activate by **protocol** (`Invoke-ToastAction.ps1`, the `sunup:` scheme). Foreground and
+  background activation both need a registered COM CLSID an unpackaged script cannot provide, and
+  `system` only dismisses.
+
+The dialog keeps its countdown as the fallback for when a toast cannot be shown, and the toast starts
+it on every give-up path — the process that tried to show a toast is the only one that knows whether
+one appeared. The dialog stands down while the toast is running, so one run can never produce two
+countdowns.
+
+Do Not Disturb is asserted off rather than worked around, per the machine's owner: the documented
+levers (`NOC_GLOBAL_SETTING_TOASTS_ENABLED`, the per-app `AllowUrgentNotifications`, the
+`NoQuietHours` policy) are set at install and re-asserted at toast time. The Windows 11 DND toggle
+itself lives in an undocumented CloudStore blob, which is **detected and reported**, never written.
+
+### Added — the post-reboot summary says when it restarted and when it came back
+
+`Restarted to finish updates.` gave no way to tell a restart you slept through from the third one in
+an hour. It now reads, in local time:
+
+```
+Restarted to finish updates.  restarted 9:09:45 AM, back up 9:10:15 AM (down 30s)
+```
+
+Executed time comes from the record; the return time is `LastBootUpTime` read live at display time
+(already `Kind=Local`, so no conversion — which is the point); the gap between them is the outage.
+
+### Added — the notification can finally explain itself
+
+`RebootState.ps1`'s full-sentence `Reasons` existed since v0.16.0 but only ever reached `result.json`,
+and `Comp-WindowsUpdate` read `Description`, `KBArticleIDs`, `MoreInfoUrls`, `MsrcSeverity` and
+`Categories` off every update and threw them all away. Both now reach the payload, alongside a plain
+-language consequence table keyed on the reboot sources — written to a rule: no CVE numbers, no KB
+numbers, no "servicing stack", say what is still running or still exposed.
+
+Accuracy over drama: a Windows security update almost never makes a feature *unavailable* until you
+restart, it leaves the old vulnerable code running. Claiming otherwise would be easier to write and
+false, and a notification that overstates its case once is ignored forever after.
+
+Optional on top of that, `notify.explain = auto` (default `off`) asks Claude for the specific version
+in plain words, cached per KB in `notify\why-cache.json` so each update is researched once ever.
+Bounded by a 30s timeout — 12.4s measured for a warm call, so the original 12s budget timed out every
+time — and every failure path falls back to the table. A restart warning must never wait on a network
+call, and it never blocks: enrichment runs only once a toast is definitely going up.
+
+### Fixed — three more instances of the same timestamp class, found by looking for them
+
+- `$nextCursor` carried the ingest cursor forward as `"$($stamp.ingestCursor)"`. That interpolates a
+  `[datetime]` `ConvertFrom-Json` had already produced, writing culture text to disk; the next run
+  read it as local and added the offset, putting the cursor **seven hours in the future** — where it
+  would consume-unread every detached helper record written in that window, losing their upgrades and
+  their reboot requests silently. `ConvertTo-UtcTime` now clamps a future timestamp, which self-heals
+  a `lastrun.json` already damaged this way.
+- `$pendingSince` degraded the same way on its first carry, turning a round-trippable field into a
+  culture-dependent one.
+- `processStartUtc` was written as `Z` and re-parsed by `Test-RunAlive` with no trailing
+  `.ToUniversalTime()` — accidentally correct, and one edit away from declaring a live run dead.
+
+The writer contract that prevents all of them: **SunUp never writes `Z` into its own JSON.**
+`Get-SunUpTimestamp` emits local-with-offset, which round-trips correctly *even through the buggy
+parse* — the only layer that makes an already-deployed, un-upgraded consumer right rather than seven
+hours wrong. Restart-gating values are additionally stored as epoch integers, which nothing can
+coerce into a date. And `[datetime]::Parse(` may now appear exactly once in the product, asserted by
+the suite.
+
+### Changed — `latest-updates.json` is published atomically, and `pendingShow` is serialized
+
+The payload was written with bare `Set-Content`. A torn write still satisfies `Test-Path`, and the
+dialog runs with `$ErrorActionPreference = 'Stop'`, so a truncated payload killed it before it drew
+anything: no window, no error, no trace, just no summary. It now goes through `Publish-JsonFile`.
+The three unlocked read-modify-write writers of that file (engine as SYSTEM, dialog, tray) now take
+`Global\SunUp-Notify` and publish by rename.
+
+Worth recording what the tray's **Show last summary** used to be able to do: with the payload still
+saying `rebootRequired` and the dialog unable to tell the box had already restarted, one click armed
+a fresh five-minute countdown and rebooted the machine. It is now inert.
+
+### Tests
+
+Suite is 359 checks (was 238), in two new sections:
+
+- **[12] the restart loop** — the incident as a unit test, including the assertion that a `runEnd`
+  seven hours in the future **cannot** re-arm a restart that a record says already happened; the
+  migration guard; `awaitingRestart`; and — deliberately, so that "never re-arm" cannot pass by
+  simply never arming — that a genuinely new `runStamp` still does. `Test-BootedSince` is exercised
+  for the first time, over every shape `ConvertFrom-Json` can produce.
+- **[13] the toast** — 5.1 parseability, XML well-formedness against an update title containing
+  `&` and `<`, the button contract and the Pause/Unpause toggle, and that every give-up path hands
+  the countdown back to the dialog.
+
+Two of the new guards had to be written twice, which is worth noting because it is a trap in a
+codebase that documents its bugs by quoting them: `-notmatch 'the old broken form'` matched the
+comment explaining that the form is no longer used. Negative assertions now run against source with
+comments stripped.
+
 ## [0.16.0] - 2026-08-11
 
 ### Fixed — `rebootPending` was true continuously for a week, on a box that had rebooted twice

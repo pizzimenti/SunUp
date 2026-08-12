@@ -45,26 +45,80 @@ you sit down.
 ## The summary dialog
 
 After every cycle (even when nothing needed updating), an interactive task (`SunUp-Notify`) shows the
-Win11-styled dialog above in your desktop session. It lists the current run's updates in normal color
+Win11-styled dialog above in your desktop session. Since v0.17.0 the **restart** lives in its own
+native notification (`SunUp-Restart`, below); this dialog is the record of what happened, and takes
+the countdown back only if a toast cannot be shown. It lists the current run's updates in normal color
 and the past `notify.historyDays` (default **30**) greyed out below, with a **When** column. By default
 the history is collapsed to the latest occurrence per package (`notify.historyCollapse`) so daily
 Defender-signature bumps don't flood it.
 
-### Reboots, on your terms
+### Restarts, on your terms
 
-If — and only if — an update leaves a reboot **pending**, the dialog owns a cancellable countdown
-(**Restart now** / **Postpone**). A reboot that isn't actually needed never prompts you. If no one is
-logged in, the engine reboots headlessly after a grace period and shows the summary at next sign-in.
+If — and only if — an update leaves a restart **pending**, a native Windows **Restarting Soon**
+notification appears in your desktop session and owns a cancellable countdown:
 
-The default `rebootPolicy: "ifRequired"` reboots only when a component **this run** actually reported
-a reboot as required. Set `"always"` to reboot on any confirmed pending state, or `"never"` to never
-auto-reboot.
+- a header, then **which update** is asking (named, not "an update");
+- a smaller line saying, in ordinary words, what is still exposed or still broken until you restart;
+- a countdown that ticks in place;
+- **Restart now**, and **Pause** — which toggles to **Unpause** and holds the countdown
+  **indefinitely**. Nothing auto-resumes it. If you paused it, you meant it.
+
+A restart that isn't actually needed never prompts you. If no one is logged in, the engine restarts
+headlessly after a grace period and shows the summary at next sign-in. If a toast can't be shown for
+any reason, the summary dialog takes the countdown back — the machine is never restarted without a
+visible warning.
+
+The default `rebootPolicy: "ifRequired"` restarts only when a component **this run** actually
+reported a restart as required. Set `"always"` to restart on any confirmed pending state, or
+`"never"` to never auto-restart.
+
+After the machine comes back, the summary says when it went down and when it returned, in local time:
+
+```
+Restarted to finish updates.  restarted 9:09:45 AM, back up 9:10:15 AM (down 30s)
+```
+
+### How SunUp knows it has already restarted
+
+Whichever surface issues a restart records it first — for which run, and **which boot the machine was
+on** — in `notify\restart-state.json`. "Has the restart happened?" is then an integer comparison of
+two readings of the same counter, with no clock, timezone or timestamp involved:
+
+> A restart is complete iff the current boot identity differs from the recorded one.
+
+If that record cannot be written, **the restart is not issued.** A restart nothing can prove happened
+is one the next sign-in would ask for again — which is exactly what happened on 2026-08-12, when a
+mis-parsed timestamp had this machine restart three times in seventy minutes. It also means a
+restart that was issued but *didn't happen* (an aborted shutdown, an app blocking it) is now a state
+of its own: SunUp says so and offers a manual button, instead of quietly trying again.
+
+### If a restart is already pending, SunUp doesn't install on top of it
+
+An update that is installed but waiting on a restart is reported by the Windows Update agent as
+**not installed** — so it gets offered again, and installing it again is redoing finished work.
+
+That is not hypothetical. On 2026-08-12 Windows' own update orchestrator installed the August
+cumulative at 21:45 the night before; SunUp reinstalled it at 08:04 the next morning. It cost four
+minutes, told you it had installed 93 GB that were already on the disk, and — because under
+`ifRequired` only *this run's* work triggers a restart — it manufactured the restart request that
+started three of them.
+
+So SunUp now checks for a pending servicing restart **before** it runs, and skips the Windows Update
+pass while one is outstanding: those updates are installed and waiting to be committed, and the job
+at that point is to get the machine restarted, not to pile more on top. The skip still asks for the
+restart, so it lasts one cycle at most, and it never applies under `rebootPolicy: "never"` — where
+no restart is coming and skipping would mean never installing at all.
+
+> Windows Update's own auto-install was the other half of this. On this machine it is now set to
+> **download but notify** (`AUOptions=3`) so SunUp owns install timing. Windows still delivers
+> everything; it just stops installing behind SunUp's back.
 
 ### How "pending" is decided
 
-`RebootState.ps1` is the single detector, shared by the engine and the tray so the icon and the
-restart decision can never disagree. It **classifies** signals rather than counting them, and
-reports *why*, which `-Mode Status` and the run log both print:
+`RebootState.ps1` is the single detector, shared by the engine, the tray, the summary dialog and the
+restart toast, so no two of them can disagree about whether this machine needs restarting or whether
+it already has. It **classifies** signals rather than counting them, and reports *why*, which
+`-Mode Status`, the run log, the toast and the dialog all draw on:
 
 - **Authoritative** — Component Based Servicing (`RebootPending`, `RebootInProgress`,
   `PackagesPending`), Windows Update's `RebootRequired`, a queued machine rename, a staged domain join.
@@ -156,12 +210,14 @@ defaults):
 |---|---|---|
 | `rebootPolicy` | `"ifRequired"` | `ifRequired` reboots only when a component this run required it; `always` reboots on any *confirmed* pending state (see [How "pending" is decided](#how-pending-is-decided)); `never` never does |
 | `rebootDelaySeconds` | `120` | headless restart grace |
-| `rebootGraceInteractiveSec` | `300` | countdown the dialog shows when a user is logged in |
+| `rebootGraceInteractiveSec` | `300` | countdown the **Restarting Soon** notification shows when a user is logged in. Pausing it holds it indefinitely; this is only the starting value |
 | `pendingRebootAlertDays` | `3` | under `ifRequired`, alert once if a reboot stays pending this many days without a run requiring it (`0` disables). The timer restarts whenever the box boots |
 | `keepRuns` | `30` | per-run log dirs to retain |
+| `notify.enabled` | `true` | show the summary dialog and the restart notification at all |
 | `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |
 | `notify.historyMaxRows` | `500` | cap on history rows |
+| `notify.explain` | `"off"` | `off` uses the built-in plain-language consequence table — offline, instant, no key. `auto` additionally asks Claude for a sentence about what *these* updates leave exposed, cached per KB in `notify\why-cache.json` so each is researched once ever. Bounded by a 30s timeout; every failure falls back to the table, and it never delays a restart warning by more than that |
 | `vendorUpdates` | `"allow"` | `block` keeps **this machine's OEM** from pushing driver/firmware/utility updates, on both delivering paths (Windows Update titles + winget ids). The OEM is detected at run time, so the same setting blocks Dell on a Dell and Lenovo on a Lenovo — see `VendorProfiles.ps1`. A block that can't be enforced (unrecognized OEM) is logged, never silent |
 | `windowsUpdate.notTitle` | `"NVIDIA"` | skip updates whose title matches (preserves pinned drivers) |
 | `winget.excludePattern` | (regex) | skip pinned/self-updating apps — applied to **both** the machine and user passes |
@@ -227,7 +283,12 @@ Manager; nothing short of a reboot-time install avoids it.
 ## Requirements
 
 - Windows 10/11, PowerShell 7 (`pwsh`).
+- Windows PowerShell 5.1 (`powershell.exe`, present on every Windows install). Two components run
+  there on purpose: `SelfHost.ps1`, because Restart Manager cannot reach a separate installation, and
+  `Show-RestartToast.ps1`, because the WinRT toast APIs have no .NET Core projection.
 - [PSWindowsUpdate](https://www.powershellgallery.com/packages/PSWindowsUpdate) (installed by `Install.ps1`).
+- `notify.explain = auto` additionally wants the `claude` CLI on `PATH`. Without it SunUp uses its
+  built-in explanations and logs the fact — nothing else changes.
 
 ## License
 
