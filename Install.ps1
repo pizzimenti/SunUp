@@ -87,6 +87,9 @@ Copy-Item (Join-Path $PSScriptRoot 'UserScope.ps1')        $Bin -Force
 # OEM identification for the vendorUpdates policy. Dot-sourced by BOTH the engine and the user pass,
 # so the two can never disagree about what this machine's vendor is.
 Copy-Item (Join-Path $PSScriptRoot 'VendorProfiles.ps1')   $Bin -Force
+# Reboot detection. Dot-sourced by BOTH the engine and the tray, so the icon in the notification
+# area and the engine's own restart decision can never disagree about the state of this machine.
+Copy-Item (Join-Path $PSScriptRoot 'RebootState.ps1')      $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 

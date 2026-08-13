@@ -57,13 +57,34 @@ If — and only if — an update leaves a reboot **pending**, the dialog owns a 
 logged in, the engine reboots headlessly after a grace period and shows the summary at next sign-in.
 
 The default `rebootPolicy: "ifRequired"` reboots only when a component **this run** actually reported
-a reboot as required — a stray OS "pending" flag (e.g. a PnP/audio driver) no longer forces a restart.
-Set `"always"` to reboot on any pending flag (the old behavior), or `"never"` to never auto-reboot.
+a reboot as required. Set `"always"` to reboot on any confirmed pending state, or `"never"` to never
+auto-reboot.
+
+### How "pending" is decided
+
+`RebootState.ps1` is the single detector, shared by the engine and the tray so the icon and the
+restart decision can never disagree. It **classifies** signals rather than counting them, and
+reports *why*, which `-Mode Status` and the run log both print:
+
+- **Authoritative** — Component Based Servicing (`RebootPending`, `RebootInProgress`,
+  `PackagesPending`), Windows Update's `RebootRequired`, a queued machine rename, a staged domain join.
+- **Run signals** — an MSI `3010` or a winget restart exit code from this run. These set *no* OS flag
+  anywhere, so a registry-only check reports "no restart needed" on a box that plainly needs one.
+- **Classified** — `PendingFileRenameOperations` is a work queue for `smss.exe`, not a reboot signal.
+  A rename *into* a destination counts; a delete-on-boot of a file under a temp directory does not,
+  because that is an application cleaning up after itself. Anything unrecognised counts (fails open).
+
+That last rule matters more than it sounds. Any Node/Electron app that unpacks a native `.node`
+addon to `%TEMP%` registers a delete-on-boot for it, often minutes into *every* startup — so the
+naive "is `PendingFileRenameOperations` non-empty?" check that every reboot-detection snippet on the
+internet uses reports a permanent pending reboot on an ordinary developer machine.
 
 ## System tray
 
-Windows has no service-manager UI for a scheduled task, so SunUp adds a **tray presence** — a sun
-icon (amber when a reboot is pending) launched at logon. Right-click for:
+Windows has no service-manager UI for a scheduled task, so SunUp adds a **tray presence**, launched
+at logon. The icon is a **full sun** normally and a **setting sun** when a restart is needed — a
+difference in shape rather than shade, so it survives the 16px the notification area renders at.
+Right-click for:
 
 <img src="docs/tray-menu.png" alt="SunUp tray menu" width="280">
 
@@ -73,7 +94,8 @@ icon (amber when a reboot is pending) launched at logon. Right-click for:
 - **Auto-reboot when needed** — toggle `rebootPolicy` (checkmark reflects current state)
 - **Exit**
 
-The tooltip shows the last run and reboot-pending state; a balloon pops when a run completes.
+The tooltip shows the last run and, when a restart is outstanding, **what is asking for it**
+("Restart needed — Windows Update"). A balloon pops when a run completes.
 
 ## Logging
 
@@ -132,10 +154,10 @@ defaults):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rebootPolicy` | `"ifRequired"` | `ifRequired` reboots only when a component this run required it; `always` reboots on any OS pending flag; `never` never does |
+| `rebootPolicy` | `"ifRequired"` | `ifRequired` reboots only when a component this run required it; `always` reboots on any *confirmed* pending state (see [How "pending" is decided](#how-pending-is-decided)); `never` never does |
 | `rebootDelaySeconds` | `120` | headless restart grace |
 | `rebootGraceInteractiveSec` | `300` | countdown the dialog shows when a user is logged in |
-| `pendingRebootAlertDays` | `3` | under `ifRequired`, alert once if a reboot stays pending this many days without a run requiring it (`0` disables) |
+| `pendingRebootAlertDays` | `3` | under `ifRequired`, alert once if a reboot stays pending this many days without a run requiring it (`0` disables). The timer restarts whenever the box boots |
 | `keepRuns` | `30` | per-run log dirs to retain |
 | `notify.historyDays` | `30` | days of past updates shown (greyed) in the dialog |
 | `notify.historyCollapse` | `true` | keep only the latest occurrence per package in the history |

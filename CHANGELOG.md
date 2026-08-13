@@ -2,6 +2,106 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.16.0] - 2026-08-11
+
+### Fixed — `rebootPending` was true continuously for a week, on a box that had rebooted twice
+
+`Test-PendingReboot` returned `$true` for **any** non-empty `PendingFileRenameOperations`. That
+value is not a reboot signal. It is a work queue for `smss.exe` — "perform these file operations
+before anything else loads" — and while Windows Update genuinely uses it to swap in-use system
+files, *any* process can call `MoveFileEx(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)` to have a file
+it cannot unlink deleted at the next boot. The two intents are indistinguishable from the value's
+mere existence, which is all the old check looked at.
+
+Something on this box does the second thing constantly. Claude Code is a Bun-compiled standalone
+binary, and a bundled native addon cannot be `dlopen`'d from inside the executable — so at load
+time it is written out to `%TEMP%` under a content-hash name and immediately queued for
+delete-on-boot, because a loaded DLL cannot unlink itself on Windows. A fresh entry appears within
+minutes of every startup, and more accumulate as the day goes on:
+
+```
+*1\??\C:\Users\bradley\AppData\Local\Temp\.78eefce1f7f6b7d6-0.node   ->   (empty = delete at boot)
+```
+
+Every consequence was silent:
+
+- `rebootPending` was `true` in every run's `result.json`, so the field meant nothing.
+- The tray icon sat in its alert state permanently, so it signalled nothing.
+- Under `rebootPolicy: "always"` the box would have been restarted on account of a temp file.
+- The stale-reboot watchdog fired on **2026-08-04** and stayed latched. `pendingSince` reset only
+  when a run observed the state *clear* — which quietly assumes a pending signal persists until a
+  restart consumes it. A self-renewing signal breaks that assumption outright: re-armed ~2 minutes
+  into each boot, with the engine running an hour later, no run ever caught it clear. So the
+  tracker ratcheted backwards indefinitely, reporting a reboot "pending 7.0 days" on 08-11 across
+  intervening restarts on **08-08** and **08-11** — and being once-only, the alert never repeated,
+  never corrected itself, and gave no indication of what was supposedly holding.
+
+The watchdog now also resets when the box has **booted since the last run**, using the
+`$bootedSinceLastRun` predicate the handoff logic already computed a hundred lines earlier. A boot
+satisfies every reboot outstanding before it, so anything still pending afterwards is by definition
+new and is dated from the boot. The alert names the signals responsible.
+
+### Added — `RebootState.ps1`: one classified detector, shared
+
+Reboot detection was previously duplicated: the engine had a `Test-PendingReboot`, the tray had its
+own copy, and both were wrong in the same way independently. There is now a single dot-sourced
+implementation used by both (and by the tests), so the icon in the notification area and the
+engine's restart decision cannot drift apart.
+
+It returns a **verdict**, not a boolean — `Required`, `Sources`, `Labels`, `Reasons`, `Advisory` —
+because a boolean could never explain itself. Signals are grouped by how far they can be trusted:
+
+| Class | Signals |
+|---|---|
+| Authoritative | CBS `RebootPending` / `RebootInProgress` / `PackagesPending`, WU `RebootRequired` and `PostRebootReporting`, a queued machine rename, a staged domain join |
+| Run signals | an MSI `3010` or winget restart exit code from this run, or carried from a detached helper — these set **no** OS flag anywhere |
+| Classified | `PendingFileRenameOperations`, per entry |
+
+`PendingFileRenameOperations` is parsed into real source/destination pairs (stripping the `\??\` NT
+prefix, the `!` replace-existing marker and the `*N` source marker) and judged pair by pair:
+
+- a rename **into** a destination is a file being put in place — servicing, so it counts;
+- a delete-on-boot of a file under a temp directory is an application cleaning up, so it does not;
+- anything else, including anything unparseable, **counts**. It fails open on purpose: a spurious
+  sunset icon costs a glance, a missed servicing reboot leaves the box half-patched.
+
+Temp directories are matched by pattern (`\Users\*\AppData\Local\Temp\`, `\Windows\Temp\`, …) rather
+than against `$env:TEMP`, because the engine runs as SYSTEM — whose `TEMP` is `C:\Windows\TEMP` —
+and the entries that matter are left by interactive users whose profiles it knows nothing about.
+
+Dismissed signals are recorded rather than discarded: they appear in the run log, in `-Mode Status`
+and in `result.json` as `rebootIgnored`, so a misclassification is visible instead of silent.
+
+### Changed — the tray shows a **sunset** when a restart is needed, and says what is asking
+
+The two icon states were both full suns separated by one shade of amber (`255,201,64` against
+`255,170,0`) — a distinction that survives neither the 16px the notification area actually renders
+at nor a light taskbar behind it. The alert state is now a **setting sun**: the disc clipped at a
+horizon line, rays fanning upward only, amber falling to dusk orange down the face. The states now
+differ in *shape*.
+
+The tray also folds in the reboots SunUp itself caused. Those never reach the registry — an MSI
+`3010` or a winget restart code lives in the run payload and nowhere else — so the one case where a
+restart is certainly needed was precisely the case the old registry-only icon could not show. A
+run-signalled restart is retired by an actual boot, mirroring the dialog's own pre/post test.
+
+The tooltip now reads `Restart needed — Windows Update` instead of a bare "Reboot pending". With no
+attribution there was no way to tell a real servicing hold from the false positive above.
+
+### Changed — `-Mode Status` and `result.json` explain the verdict
+
+`Status` prints the reasons beneath the verdict, and the signals it dismissed:
+
+```
+  Reboot now    : False
+                    ~ ignored: 4 queued file deletion(s) under a temp directory — application
+                      cleanup, not a restart requirement
+```
+
+`result.json` gains `rebootSources`, `rebootReasons` and `rebootIgnored` alongside the existing
+`rebootPending` / `rebootRequiredByRun`. `rebootPolicy: "always"` now keys off the classified
+verdict, which makes it a genuine policy choice rather than the blunt instrument it was.
+
 ## [0.15.1] - 2026-08-05
 
 ### Fixed — the dialog's history list was alphabetical by package, not newest-first
