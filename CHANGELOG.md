@@ -2,6 +2,38 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.17.1] - 2026-08-12
+
+### Fixed — the installer force-killed any PowerShell that merely mentioned the tray script
+
+`Install.ps1` restarts the tray so a new build takes over, and to get past the tray's single-instance
+mutex it first kills the old one:
+
+```powershell
+Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Force ... }
+```
+
+That is a substring match on a **bare filename**, anywhere in the command line — not a match on the
+process actually running the script. Any elevated `pwsh` that so much as named the file qualified:
+an editor, a log tail, a script listing the deployed files.
+
+Measured while deploying v0.17.0. A shell verifying the deployment listed the bin filenames to
+hash-compare them against the repo, which put `SunUp-Tray.ps1` in its command line. `Install.ps1`
+killed it — and since it happened to be `Install.ps1`'s own caller, the install died with it at exit
+255, **after** registering every task but **before** `Start-ScheduledTask`. Every task was
+registered, every file was copied, the version was correct, and the tray was left stopped. It
+looked like a clean install.
+
+Both kill filters now anchor on the deployed path after `-File`, and neither will kill the process
+doing the killing. `Uninstall.ps1` was already narrower — it builds full paths rather than bare
+filenames — but shares the class and is tightened to the same shape so the two read alike.
+
+The regression guard checks the source shape *and* exercises the pattern against real command lines:
+the actual tray process must still match (quoted and unquoted `-File`), and a shell that merely
+hashes or names that path must not. Verified to fail five ways against the unfixed code.
+
+- Suite is 379 checks (was 370).
+
 ## [0.17.0] - 2026-08-12
 
 ### Fixed — the summary dialog restarted this box three times in seventy minutes
