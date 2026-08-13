@@ -34,6 +34,31 @@ foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','Install.ps1'
 
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
 
+# The shared timestamp reader/writer, dot-sourced HERE -- before the AST lifts below, not at [11]
+# where it used to be. As of v0.17.0 the engine functions those lifts pull out (Test-RunAlive,
+# Import-DetachedResults, Save-StampMerged) call ConvertTo-UtcTime and Get-SunUpTimestamp, which now
+# live in RebootState.ps1 rather than in SunUp.ps1. Lifting a function away from its dependencies
+# does not throw -- PowerShell resolves the call at run time, so it just returns $null and the
+# assertion passes for the wrong reason. Which is exactly how this suite stayed green while
+# Show-UpdateDialog.ps1 carried the bug that restarted the box three times.
+$rebootStatePath = Join-Path $repoRoot 'RebootState.ps1'
+. $rebootStatePath
+$rsAst  = [System.Management.Automation.Language.Parser]::ParseFile($rebootStatePath, [ref]$null, [ref]$null)
+$rsText = Get-Content $rebootStatePath -Raw
+
+# Source text with whole-line comments removed, for the assertions that say a construct must NOT
+# appear. This file documents its bugs by quoting them, so "the engine no longer interpolates
+# $stamp.ingestCursor" was matching the comment EXPLAINING that it no longer does -- a guard that
+# fails the moment someone describes the thing it guards against. Positive assertions keep using
+# the raw text; only the negative ones need this.
+# Strips <# block #> comments first, then whole-line # comments. Both matter: these files explain
+# themselves at length, and a header that says "there is no auto-resume" would otherwise satisfy a
+# search for "auto-resume" and fail the very check asserting the behaviour is absent.
+function Get-CodeOnly { param([string]$Text)
+  $noBlocks = [regex]::Replace($Text, '(?s)<#.*?#>', '')
+  (($noBlocks -split "`r?`n") | Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+}
+
 Write-Host "`n[2] Report-CrashedRuns"
 # stubs for the engine's logging surface
 $script:logged = @(); $script:events = @(); $script:alerts = @()
@@ -313,12 +338,22 @@ Check 'the collapse block was found in source' $m.Success
 $Name = 'SunUp'
 $script:Updates = [System.Collections.Generic.List[object]]::new()
 $script:Updates.Add([ordered]@{ name='Tailscale';    source='winget'; old='1.98.9'; new='1.99.0';  durationSec=3; sizeMB=10 })
-$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
-$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90 })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90; meta=[ordered]@{ kb='KB5121003'; severity='Critical' } })
+$script:Updates.Add([ordered]@{ name='Google Chrome'; source='winget'; old='150.0';  new='150.1';   durationSec=4; sizeMB=90; meta=[ordered]@{ kb='KB5121003'; severity='Critical' } })
 Invoke-Expression $m.Value
 Check '$Name survives the collapse block' ($Name -eq 'SunUp') "got '$Name'"
 Check 'duplicate rows still collapse' ($script:Updates.Count -eq 2) "$($script:Updates.Count) rows"
 Check 'and the collapsed row is annotated' (($script:Updates | ForEach-Object { $_.name }) -join ',' -match ([char]0x00D7)) (($script:Updates | ForEach-Object { $_.name }) -join ',')
+# FOUND BY DEPLOYING IT (2026-08-12), not by reading it. This block REBUILDS every row from a fresh
+# [ordered] literal, so a field it does not name is dropped -- and the first live run under v0.17.0
+# emitted no meta on any row. It only bites a run with 2+ updates, which is precisely the run where
+# the restart notification most needs to say what it is restarting for. Same shape as the $Name bug
+# above, in the same block, for the same reason.
+$collapsed = @($script:Updates | Where-Object { $_.name -like 'Google Chrome*' })[0]
+Check 'and the row keeps its metadata, which the notification explains itself out of' `
+      ("$($collapsed.meta.kb)" -eq 'KB5121003') "got '$($collapsed.meta.kb)'"
+Check 'while a row that never had metadata does not gain an empty one' `
+      (-not (@($script:Updates | Where-Object { $_.name -eq 'Tailscale' })[0].Keys -contains 'meta'))
 
 Write-Host "`n[7] user-scope pass (v0.13.0)"
 $userSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'UserScope.ps1'
@@ -475,7 +510,15 @@ Check 'so does the user-scope pass' `
 Check 'and neither writes the live file directly any more' `
       ($selfText -notmatch 'Set-Content -Path \$SelfJson' -and $userText -notmatch 'Set-Content \$UserJson')
 Check 'and it is persisted separately from finishedLocal' `
-      ($engineText2 -match '\$nextCursor = if \(\$detached\.scanned\) \{ \$ingestScanAt\.ToString\(.o.\)' -and $engineText2 -match 'ingestCursor = \$nextCursor')
+      ($engineText2 -match '\$nextCursor = if \(\$detached\.scanned\) \{ Get-SunUpTimestamp \$ingestScanAt' -and $engineText2 -match 'ingestCursor = \$nextCursor')
+# The carry arm used to be "$($stamp.ingestCursor)": interpolating a value ConvertFrom-Json had
+# already turned back into a [datetime] wrote culture text to disk, which the next run read as local
+# and pushed SEVEN HOURS INTO THE FUTURE -- consuming every helper record written in that window.
+$engineCode = Get-CodeOnly $engineText2
+Check 'and the carry arm normalizes it instead of interpolating it' `
+      ($engineText2 -match 'elseif \(\$stamp\) \{ Get-SunUpTimestamp \$stamp\.ingestCursor' -and $engineCode -notmatch '"\$\(\$stamp\.ingestCursor\)"')
+Check 'the same for the stale-reboot tracker' `
+      ($engineText2 -match 'Get-SunUpTimestamp \$stamp\.pendingSince' -and $engineCode -notmatch '"\$\(\$stamp\.pendingSince\)"')
 Check 'a stamp from before the cursor existed still works' ($engineText2 -match '\$ingestCursor = \$lastRunEnd')
 
 # A reboot a detached pass asked for must outlive the run that ingests it: with a user logged in that
@@ -520,10 +563,19 @@ Check 'an unlocked stamp write is verified and retried, not skipped' `
 # [datetime], whose string form is culture-formatted LOCAL time ("08/03/2026 06:18:05") and never
 # equals the round-trip string it was written from. The verification compared those as text, so every
 # single run logged a phantom "a concurrent run rewrote it" and wrote the stamp three times.
-$cvFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-UtcTime' }, $true)
-Check 'ConvertTo-UtcTime found in source' ($null -ne $cvFn)
+$cvFn = $rsAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-UtcTime' }, $true)
+Check 'ConvertTo-UtcTime is defined in RebootState.ps1, shared by every consumer' ($null -ne $cvFn)
+# The engine may still define it, but ONLY inside the degraded fallback that runs when bin\ is
+# missing the shared file -- never as its own primary implementation. That is the difference between
+# a graceful degradation and the second copy that drifts.
+$dotSourceAt = $engineText2.IndexOf('if (Test-Path $RebootStateScript) { . $RebootStateScript }')
+$configAt    = $engineText2.IndexOf('# ---- config ---')
+$cvInEngine  = @([regex]::Matches($engineText2, 'function ConvertTo-UtcTime'))
+Check 'and the engine keeps no primary copy -- only the degraded fallback defines one' `
+      ($dotSourceAt -gt 0 -and $configAt -gt $dotSourceAt -and $cvInEngine.Count -eq 1 -and
+       $cvInEngine[0].Index -gt $dotSourceAt -and $cvInEngine[0].Index -lt $configAt) `
+      "defs=$($cvInEngine.Count)"
 if ($cvFn) {
-  Invoke-Expression $cvFn.Extent.Text
   $iso = '2026-08-03T06:18:05.9758571Z'
   $roundTripped = ('{"ingestCursor":"' + $iso + '"}' | ConvertFrom-Json).ingestCursor
   Check 'the round-tripped stamp value really is a DateTime, not a string' ($roundTripped -is [datetime])
@@ -768,6 +820,353 @@ try {
         "sunset alpha $($b2.GetPixel(16,2).A), sun alpha $($b1.GetPixel(16,4).A)"
   $b1.Dispose(); $b2.Dispose()
 } catch { Check 'both icons render without a GDI+ error' $false $_.Exception.Message }
+
+Write-Host "`n[12] the restart loop (v0.17.0)"
+# On 2026-08-12 this box restarted three times in seventy minutes -- 08:09:53, 09:03:18, 09:09:45 --
+# because Show-UpdateDialog.ps1 could not tell that it had already restarted. Everything in this
+# section is that incident, decomposed into things that can fail independently.
+$dlgSrc  = Join-Path $repoRoot 'Show-UpdateDialog.ps1'
+$dlgText = Get-Content $dlgSrc -Raw
+$dlgAst  = [System.Management.Automation.Language.Parser]::ParseFile($dlgSrc, [ref]$null, [ref]$null)
+$dlgCode = Get-CodeOnly $dlgText
+
+# --- the bug itself, as a unit test ------------------------------------------
+$data = '{"runEndUtc":"2026-08-12T15:04:43.8905354Z"}' | ConvertFrom-Json
+Check 'ConvertFrom-Json hands a consumer a [datetime], not the string it wrote' ($data.runEndUtc -is [datetime])
+$truth = [datetime]::Parse('2026-08-12T15:04:43.8905354Z', $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+Check 'ConvertTo-UtcTime reads the deserialized value exactly (the fix)' ((ConvertTo-UtcTime $data.runEndUtc) -eq $truth)
+# Only meaningful away from UTC; asserted conditionally so the suite stays timezone-portable.
+if ([TimeZoneInfo]::Local.BaseUtcOffset -ne [TimeSpan]::Zero) {
+  $bug = [datetime]::Parse($data.runEndUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+  Check 'and the old dialog parse really did land in the future' ($bug -gt $truth) "off by $(($bug - $truth).TotalHours)h"
+}
+# THE WRITER CONTRACT, which is the layer that protects a consumer that forgot the guard entirely.
+$ts = Get-SunUpTimestamp
+Check 'the canonical writer emits local-with-offset, never Z' `
+      ($ts -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2}$') "got '$ts'"
+Check 'and still does when handed a UTC DateTime' ((Get-SunUpTimestamp ([datetime]::UtcNow)) -notmatch 'Z$')
+$viaBug = [datetime]::Parse((("{`"a`":`"$ts`"}" | ConvertFrom-Json).a), $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+Check 'local-with-offset survives EVEN the buggy reparse (why the format matters)' `
+      (($viaBug - (ConvertTo-UtcTime $ts)).Duration().TotalSeconds -lt 1)
+# A corrupted cursor already on disk self-heals rather than eating a week of helper records.
+Check 'a timestamp in the future is clamped, not trusted' `
+      ((ConvertTo-UtcTime ((Get-Date).ToUniversalTime().AddHours(7))) -le (Get-Date).ToUniversalTime().AddMinutes(1))
+
+# --- Test-BootedSince, which no test had ever called -------------------------
+$bootU = Get-BootUtc
+foreach ($shape in @(@{n='raw [datetime]'; f={param($d) $d}},
+                     @{n='local-offset';   f={param($d) Get-SunUpTimestamp $d}},
+                     @{n='epoch';          f={param($d) Get-SunUpEpoch $d}})) {
+  Check "  an instant before the boot reads as booted-since ($($shape.n))" (Test-BootedSince (& $shape.f $bootU.AddMinutes(-10)))
+  Check "  an instant after it does not ($($shape.n))"                     (-not (Test-BootedSince (& $shape.f $bootU.AddMinutes(10))))
+}
+Check 'null and empty never read as booted-since' ((-not (Test-BootedSince $null)) -and (-not (Test-BootedSince '')))
+
+# --- boot identity: the comparison that needs no clock -----------------------
+$be = Get-BootEpoch
+Check 'the boot epoch is stable across queries' ($be -eq (Get-BootEpoch))
+Check 'the same boot reads as the same boot' (Test-SameBoot $be $be)
+Check 'a second of clock drift is still the same boot' (Test-SameBoot $be ($be + 1))
+Check 'a genuinely different boot is detected' (-not (Test-SameBoot $be ($be + 5000)))
+Check 'an unknown recorded boot reads as "not restarted yet", never as done' (Test-SameBoot $null $be)
+
+# --- one implementation, every consumer --------------------------------------
+$consumers = [ordered]@{ 'SunUp.ps1' = $engineText3; 'SunUp-Tray.ps1' = $trayText; 'Show-UpdateDialog.ps1' = $dlgText }
+foreach ($k in $consumers.Keys) {
+  Check "  $k dot-sources the shared RebootState.ps1" ($consumers[$k] -match "Join-Path \`$PSScriptRoot 'RebootState\.ps1'")
+  Check "  $k parses no timestamp of its own outside its degraded fallback" `
+        (@([regex]::Matches((Get-CodeOnly $consumers[$k]), '\[datetime\]::Parse\(')).Count -le 1)
+}
+Check 'RebootState.ps1 is the only place in the product that parses a timestamp' `
+      (@([regex]::Matches((Get-CodeOnly $rsText), '\[datetime\]::Parse\(')).Count -eq 1)
+# Write-only helpers are exempt from the dependency ON PURPOSE: SelfHost.ps1 runs under 5.1, launched
+# by a task, after the engine is dead, and a silent dot-source failure there is the worst place for a
+# new runtime dependency. They inline the compliant one-liner instead, and that is asserted here.
+foreach ($w in @{n='SelfHost.ps1'; t=$selfText}, @{n='UserScope.ps1'; t=$userText}) {
+  Check "  $($w.n) writes local-with-offset inline, without depending on bin\" `
+        (((Get-CodeOnly $w.t) -match "\(Get-Date\)\.ToString\('o'\)") -and ((Get-CodeOnly $w.t) -notmatch "ToUniversalTime\(\)\.ToString\('o'\)"))
+}
+Check 'no shipped script writes a UTC round-trip string into a persisted field' `
+      (@(($consumers.Values + $selfText + $userText) | Where-Object { (Get-CodeOnly $_) -match "ToUniversalTime\(\)\.ToString\('o'\)" }).Count -eq 0)
+
+# --- RebootState.ps1 must load under 5.1 (the toast host dot-sources it) -----
+$rsNonAscii = @($rsText.ToCharArray() | Where-Object { [int]$_ -gt 127 })
+Check 'RebootState.ps1 is pure ASCII' ($rsNonAscii.Count -eq 0) "$($rsNonAscii.Count) non-ASCII char(s)"
+$rsParse51 = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "
+  `$e = `$null
+  [void][System.Management.Automation.Language.Parser]::ParseFile('$rebootStatePath', [ref]`$null, [ref]`$e)
+  if (`$e) { 'FAIL: ' + (`$e[0].Message) } else { 'OK' }"
+Check 'RebootState.ps1 parses under Windows PowerShell 5.1' ("$rsParse51" -eq 'OK') "$rsParse51"
+
+# --- the plain-language consequence table ------------------------------------
+$cons = Get-RebootConsequence -Sources @('windowsUpdate','run')
+Check 'a consequence is produced for the signals that fired' (@($cons).Count -eq 2)
+Check 'and it is plain language -- no CVE, KB or servicing jargon' `
+      (($cons -join ' ') -notmatch '(?i)CVE-|\bKB\d|servicing stack|mitigation')
+Check 'an unknown signal still gets an honest sentence, never a blank' `
+      (@(Get-RebootConsequence -Sources @('somethingNew')).Count -eq 1)
+Check 'and no signals at all produces nothing to say' (@(Get-RebootConsequence -Sources @()).Count -eq 0)
+
+# --- the record gates re-arming ----------------------------------------------
+# Lifted from RebootState.ps1, NOT from the dialog: the toast host runs under 5.1 and needs the
+# identical answer, so the decision lives in the one file both dot-source. A copy in each is exactly
+# the shape of the bug that caused the incident.
+foreach ($fnName in 'Get-RestartRecord','Save-RestartRecord','New-RestartRecord','Get-RestartDisplayState','Format-LocalStamp') {
+  $fnAst = $rsAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fnName }.GetNewClosure(), $true)
+  Check "$fnName is shared in RebootState.ps1, not private to a UI script" ($null -ne $fnAst)
+}
+# The dialog is allowed exactly one Get-RestartDisplayState: the degraded stub used when bin\ has no
+# RebootState.ps1. What it must NOT contain is a second real implementation -- so the stub is
+# required to be incapable of arming anything. A fallback nobody exercises is the likeliest copy of
+# all to drift, and a drifted copy of THIS function is the incident.
+$dlgFallback = $dlgAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-RestartDisplayState' }, $true)
+Check 'the dialog keeps no second real copy of the restart decision' `
+      (($null -eq $dlgFallback) -or ($dlgFallback.Extent.Text -notmatch "'countdown'"))
+Check 'and without the shared file it decides nothing rather than guessing' `
+      (($null -ne $dlgFallback) -and ($dlgFallback.Extent.Text -match "Mode = 'none'"))
+$BOOT = 1000
+$payAt  = [pscustomobject]@{ rebootRequired = $true; runStamp = 'R1'; rebootCountdownSec = 300 }
+$issued = [pscustomobject]@{ runStamp = 'R1'; outcome = 'issued'; trigger = 'countdown-expired'
+                             executedLocal = (Get-SunUpTimestamp (Get-Date).AddMinutes(-5)); bootAtRequestEpoch = ($BOOT - 5000) }
+$same   = [pscustomobject]@{ runStamp = 'R1'; outcome = 'issued'; trigger = 'countdown-expired'
+                             executedLocal = (Get-SunUpTimestamp (Get-Date).AddMinutes(-5)); bootAtRequestEpoch = $BOOT }
+Check 'a fresh run with no record arms the countdown' `
+      ((Get-RestartDisplayState -Data $payAt -Record $null -BootEpoch $BOOT).Mode -eq 'countdown')
+Check 'a restart that was issued and came back reads as post-reboot' `
+      ((Get-RestartDisplayState -Data $payAt -Record $issued -BootEpoch $BOOT).Mode -eq 'postReboot')
+# THE INCIDENT: the record must win over the timestamp, however wrong the timestamp is.
+$future = [pscustomobject]@{ rebootRequired = $true; runStamp = 'R1'; rebootCountdownSec = 300
+                             runEnd = (Get-SunUpTimestamp (Get-Date).AddHours(7)) }
+Check 'and a runEnd seven hours in the future CANNOT re-arm it (2026-08-12)' `
+      ((Get-RestartDisplayState -Data $future -Record $issued -BootEpoch $BOOT).Mode -eq 'postReboot')
+Check 'an issued restart on an UNCHANGED boot is awaitingRestart, never a second countdown' `
+      ((Get-RestartDisplayState -Data $payAt -Record $same -BootEpoch $BOOT).Mode -eq 'awaitingRestart')
+# Anti-over-fitting: a "fix" that simply never re-arms must fail here.
+$run2 = [pscustomobject]@{ rebootRequired = $true; runStamp = 'R2'; rebootCountdownSec = 300 }
+Check 'but a genuinely NEW run still arms one' `
+      ((Get-RestartDisplayState -Data $run2 -Record $issued -BootEpoch $BOOT).Mode -eq 'countdown')
+Check 'no restart required means nothing to show' `
+      ((Get-RestartDisplayState -Data ([pscustomobject]@{ rebootRequired = $false; runStamp = 'R1' }) -Record $null -BootEpoch $BOOT).Mode -eq 'none')
+# MIGRATION: a payload from <=v0.16.0 has no runStamp, so no record can be tied to it and nothing can
+# prove a restart was not already issued. Showing a stale summary costs a day's nag; arming a
+# countdown on an unprovable payload is the incident itself.
+$old = [pscustomobject]@{ rebootRequired = $true; runEndUtc = '2026-08-12T15:04:43.8905354Z' }
+Check 'a v0.16.0 payload with no runStamp can NEVER arm a countdown' `
+      ((Get-RestartDisplayState -Data $old -Record $null -BootEpoch $BOOT).Mode -ne 'countdown')
+Check 'and it still reports the restart once a boot has been observed' `
+      ((Get-RestartDisplayState -Data $old -Record $null -BootEpoch $BOOT -BootedSinceRun $true).Mode -eq 'postReboot')
+# The timing display the summary is built from.
+$post = Get-RestartDisplayState -Data $payAt -Record $issued -BootEpoch $BOOT -BootLocal (Get-Date)
+Check 'the post-reboot state carries when the restart executed' ($null -ne $post.ExecutedLocal)
+Check 'and when the box came back, and how long it was down' `
+      (($null -ne $post.BootedLocal) -and ($post.DowntimeSec -ge 290 -and $post.DowntimeSec -le 310)) "downtime=$($post.DowntimeSec)"
+
+# --- record first, restart second --------------------------------------------
+Check 'the dialog refuses to restart if it cannot record the restart' `
+      ($dlgText -match '(?s)if \(-not \(Save-RestartRecord.{0,400}return' )
+Check 'and the engine does the same on the headless path' `
+      ($engineText3 -match '(?s)if \(Publish-JsonFile \$issued \$NotifyRestart\).{0,200}shutdown\.exe /r')
+Check 'the engine arms a record naming the run, so a stale one cannot be mistaken for it' `
+      ($engineText3 -match "runStamp\s*=\s*\`$runStamp" -and $engineText3 -match "outcome\s*=\s*'armed'")
+Check 'the payload carries the runStamp the record is matched on' ($engineText3 -match 'runStamp\s+=\s+\$runStamp\s+#')
+Check 'and the reasons a person can actually read' `
+      ($engineText3 -match 'whyPlain\s+=\s+@\(Get-RebootConsequence' -and $engineText3 -match 'rebootReasons\s+=\s+@\(\$rebootState\.Reasons\)')
+Check 'the payload is published atomically, not Set-Content into place' `
+      ($engineText3 -match 'Publish-JsonFile \$payload \$NotifyPayload' -and $dlgCode -notmatch 'Set-Content \$script:dataPath')
+
+# --- the pre-flight: do not redo work that is only waiting on a restart ------
+# 2026-08-12, from the CBS Setup log: the orchestrator installed KB5120708+KB5121003 at 21:24/21:45
+# and left "A reboot is necessary before package KB5121003 can be changed to the Installed state" at
+# 21:45:40. Ten hours later this engine was handed the same packages -- "Current state is Installed.
+# Target state is Installed" -- reinstalled them, and set rebootRequiredByRun, which under
+# ifRequired is the ONLY thing that arms a restart. That is what started the loop.
+Check 'servicing signals are recognised as a reason to hold off installing' `
+      ((@(Get-ServicingSignals @('cbs','windowsUpdate')).Count -eq 2))
+Check 'a queued temp-file deletion is NOT one -- it must never suppress the update pass' `
+      (@(Get-ServicingSignals @('pendingRename')).Count -eq 0)
+Check 'nor is this run''s own signal, which describes work we just did' `
+      (@(Get-ServicingSignals @('run','handoff')).Count -eq 0)
+Check 'and a mixed state reports only the servicing half' `
+      ((@(Get-ServicingSignals @('pendingRename','cbsPackages','run')) -join ',') -eq 'cbsPackages')
+Check 'empty and null are safe' ((@(Get-ServicingSignals @()).Count -eq 0) -and (@(Get-ServicingSignals $null).Count -eq 0))
+# The whole point is WHEN it is asked. Asked after the components run -- as Get-RebootState always
+# was -- it can only decide whether to restart, never whether the work was necessary.
+$preAt  = $engineText3.IndexOf('$preRebootState = Get-RebootState')
+$runAt  = $engineText3.IndexOf('$results = [System.Collections.Generic.List[object]]::new()')
+Check 'the reboot state is captured BEFORE the components run, not only after' `
+      ($preAt -gt 0 -and $runAt -gt $preAt) "pre=$preAt run=$runAt"
+Check 'the Windows Update pass is skipped while a servicing restart is pending' `
+      ($engineText3 -match 'if \(\$skipWuForPending\)' -and $engineText3 -match "status = 'skip'")
+# Otherwise the pass would be suppressed every day forever and new updates would never install.
+Check 'but never under rebootPolicy=never, where no restart is ever coming' `
+      ($engineText3 -match '\$skipWuForPending = \(\$preServicing\.Count -gt 0\) -and \("\$\(\$cfg\.rebootPolicy\)" -ne .never.\)')
+Check 'and the skip still asks for the restart, so it is self-limiting' `
+      ($engineText3 -match "(?s)detail = 'restart pending.{0,120}reboot = \`$true")
+
+Write-Host "`n[13] the Restarting Soon toast (v0.17.0)"
+$toastSrc = Join-Path $repoRoot 'Show-RestartToast.ps1'
+$actSrc   = Join-Path $repoRoot 'Invoke-ToastAction.ps1'
+Check 'Show-RestartToast.ps1 exists'  (Test-Path $toastSrc)
+Check 'Invoke-ToastAction.ps1 exists' (Test-Path $actSrc)
+$toastText = Get-Content $toastSrc -Raw
+$actText   = Get-Content $actSrc   -Raw
+$toastCode = Get-CodeOnly $toastText
+$installText = Get-Content (Join-Path $repoRoot 'Install.ps1') -Raw
+$toastAst  = [System.Management.Automation.Language.Parser]::ParseFile($toastSrc, [ref]$null, [ref]$null)
+# The <text> elements are a mix: two bare ones (which PowerShell surfaces as plain strings) and one
+# carrying placement="attribution" (an XmlElement). Indexing the property would compare a string to
+# an element, so go through the nodes and read InnerText.
+function Get-ToastTexts { param($Xml) @($Xml.toast.visual.binding.SelectNodes('text') | ForEach-Object { $_.InnerText }) }
+
+# The toast host runs under 5.1 because WinRT has no projection in .NET Core. Same ASCII trap as
+# SelfHost.ps1, and the same consequence: a task that dies at parse time, silently.
+foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}) {
+  $na = @($f.t.ToCharArray() | Where-Object { [int]$_ -gt 127 })
+  Check "  $($f.n) is pure ASCII" ($na.Count -eq 0) "$($na.Count) non-ASCII char(s)"
+  $r = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "
+    `$e = `$null
+    [void][System.Management.Automation.Language.Parser]::ParseFile('$($f.p)', [ref]`$null, [ref]`$e)
+    if (`$e) { 'FAIL: ' + (`$e[0].Message) } else { 'OK' }"
+  Check "  $($f.n) parses under Windows PowerShell 5.1" ("$r" -eq 'OK') "$r"
+}
+Check 'the toast task runs Windows PowerShell 5.1, never pwsh (WinRT does not exist there)' `
+      ($installText -match '(?s)\$rAction\s*=\s*New-ScheduledTaskAction -Execute \$ps51.{0,120}Show-RestartToast\.ps1')
+Check 'and the engine hands it the countdown instead of the dialog when it intends to restart' `
+      ($engineText3 -match '(?s)if \(\$willReboot\).{0,600}Start-ScheduledTask -TaskName \$RestartTask')
+
+# --- the XML is real XML, and it escapes what it is given ---------------------
+foreach ($fnName in 'ConvertTo-XmlText','New-ToastXml','Format-Countdown','Get-RestartSubject','Get-RestartWhy') {
+  $fnAst = $toastAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fnName }.GetNewClosure(), $true)
+  Check "  $fnName is defined in the toast host" ($null -ne $fnAst)
+  if ($fnAst) { . ([scriptblock]::Create($fnAst.Extent.Text)) }
+}
+$xmlOk = $false; $xmlErr = ''
+try { $x = [xml](New-ToastXml -Subject 'KB5121003' -Why 'Because.' -Paused $false); $xmlOk = ($null -ne $x) } catch { $xmlErr = $_.Exception.Message }
+Check 'the toast XML is well-formed' $xmlOk $xmlErr
+# An update title really can contain an ampersand ("Intel(R) Chipset & Firmware"), and an unescaped
+# one makes the whole toast fail to load -- i.e. no restart warning at all.
+$hostile = 'Update & <script> "quoted" 2026-08 R&D'
+$esc = $null; $escOk = $false
+try { $esc = [xml](New-ToastXml -Subject $hostile -Why "Ampersands & angle <brackets>" -Paused $false); $escOk = $true } catch {}
+Check 'and survives an update title containing & and < >' $escOk
+if ($escOk) {
+  Check 'with the text preserved, not mangled' ((Get-ToastTexts $esc) -contains $hostile)
+}
+$x0 = [xml](New-ToastXml -Subject 's' -Why 'w' -Paused $false)
+Check 'the toast is a reminder, so it stays on screen instead of vanishing in 5s' ($x0.toast.scenario -eq 'reminder')
+Check 'the countdown is data-bound, so it updates without re-popping the toast' `
+      ($x0.toast.visual.binding.progress.value -eq '{tick}' -and $x0.toast.visual.binding.progress.valueStringOverride -eq '{ticklabel}')
+$acts = @($x0.toast.actions.action)
+Check 'there are exactly two buttons' ($acts.Count -eq 2)
+Check 'Restart now comes first, Pause second (the order the user asked for)' `
+      ($acts[0].content -eq 'Restart now' -and $acts[1].content -eq 'Pause')
+Check 'both activate by protocol -- the only route that works without a COM activator' `
+      (@($acts | Where-Object { $_.activationType -eq 'protocol' }).Count -eq 2)
+$xP = [xml](New-ToastXml -Subject 's' -Why 'w' -Paused $true)
+$actsP = @($xP.toast.actions.action)
+Check 'and Pause toggles to Unpause, pointing at the resume action' `
+      ($actsP[1].content -eq 'Unpause' -and $actsP[1].arguments -eq 'sunup:resume')
+Check 'the header changes with it, so a paused toast does not still say Restarting Soon' `
+      ((Get-ToastTexts $xP)[0] -eq 'Restart Paused' -and (Get-ToastTexts $x0)[0] -eq 'Restarting Soon')
+Check 'the countdown formats as m:ss' ((Format-Countdown 125) -eq '2:05' -and (Format-Countdown 5) -eq '0:05' -and (Format-Countdown -3) -eq '0:00')
+
+# --- it names the update, and says why in plain words ------------------------
+$pay = [pscustomobject]@{
+  rebootRequired = $true; runStamp = 'R1'; rebootSources = @('windowsUpdate','run')
+  whyPlain = @(Get-RebootConsequence -Sources @('windowsUpdate','run'))
+  items = @(
+    [pscustomobject]@{ name = 'KB5121003 Security Update'; meta = [pscustomobject]@{ rebootRequired = $true } }
+    [pscustomobject]@{ name = 'KB5120708 .NET Update';     meta = [pscustomobject]@{ rebootRequired = $true } }
+    [pscustomobject]@{ name = 'Defender signatures' }          # no meta: did NOT ask for a restart
+  )
+}
+$subj = Get-RestartSubject $pay
+Check 'the toast names the update that is asking, not just "an update"' ($subj -like 'KB5121003*')
+Check 'and counts only the ones that actually asked (Defender did not)' ($subj -like '*1 other update')
+Check 'with no payload at all it still says something honest' ((Get-RestartSubject $null) -eq 'A recent update')
+$whyText = Get-RestartWhy $pay
+Check 'the why-text is plain language, with no CVE or KB jargon' `
+      ($whyText -notmatch '(?i)CVE-|\bKB\d|servicing stack|mitigation') "got: $whyText"
+Check 'and it fits an attribution line' ($whyText.Length -le 260) "length $($whyText.Length)"
+Check 'a payload with no explanation still gets a sentence rather than a blank' `
+      ((Get-RestartWhy ([pscustomobject]@{ rebootRequired = $true })).Length -gt 0)
+
+# --- the safety properties ---------------------------------------------------
+Check 'ONLY the countdown mode may restart anything' `
+      ($toastText -match "if \(\`$restart\.Mode -ne 'countdown'\)")
+Check 'the toast records the restart before issuing it, and refuses to restart if it cannot' `
+      ($toastText -match '(?s)if \(-not \(Save-RestartRecord.{0,200}return \$false')
+Check 'every give-up path hands the countdown back to the dialog' `
+      (@([regex]::Matches($toastText, 'Invoke-DialogFallback')).Count -ge 5)
+Check 'and the dialog stands down while the toast is counting, so there is never a second countdown' `
+      ($dlgText -match "Get-ScheduledTask -TaskName `"\`$Name-Restart`"" -and $dlgText -match '\$toastOwnsCountdown')
+Check 'pausing holds indefinitely -- nothing auto-resumes it' `
+      ($toastCode -notmatch '(?i)auto-?resume' -and $toastCode -notmatch '(?i)Start-Sleep -Seconds \$?resume' -and $toastText -match 'holding indefinitely')
+Check 'the protocol handler allow-lists actions instead of trusting the URI' `
+      ($actText -match "\`$known = @\('restart', 'pause', 'resume', 'dismiss', 'show'\)" -and $actText -match '\$known -notcontains \$action')
+Check 'and it can never restart anything itself' ($actText -notmatch 'Restart-Computer|shutdown\.exe')
+Check 'Install registers the sunup: protocol the buttons need' ($installText -match 'Classes\\sunup')
+# bin\ holds the scripts the ELEVATED interactive tasks run, so the grant must be read+execute and
+# never write -- a write ACE there is a direct path to code execution with an administrator token.
+Check 'and asserts bin is readable, never writable, by BUILTIN\Users' `
+      ($installText -match 'icacls \$Bin /grant "\*S-1-5-32-545:\(OI\)\(CI\)RX"' -and
+       $installText -notmatch 'icacls \$Bin /grant[^\r\n]*S-1-5-32-545[^\r\n]*(:\(OI\)\(CI\))?(M|F|W)\b')
+Check 'and drops a pre-v0.17.0 payload that no record could be proven against' `
+      ($installText -match 'schemaVersion' -and $installText -match 'Removed a pre-v0\.17\.0 notify payload')
+$uninstText = Get-Content (Join-Path $repoRoot 'Uninstall.ps1') -Raw
+Check 'Uninstall removes the restart task, the AUMID and the protocol' `
+      ($uninstText -match '\$Name-Restart' -and $uninstText -match 'AppUserModelId' -and $uninstText -match 'Classes\\sunup')
+
+# --- optional Claude enrichment: an enhancement that can never break the warning ---
+Check 'enrichment is OFF by default' ($engineText3 -match "explain\s*=\s*'off'")
+# A switch that decides whether to execute an external program must live in the admin-owned file,
+# never in the payload. notify\ is granted Modify to the interactive user -- the SAME account the
+# elevated toast task runs as -- so a policy kept there is settable by the party it constrains. The
+# engine briefly did carry it, justified as "the toast runs non-elevated and config.json is
+# admin-only"; a security review of this branch established that BOTH halves were false (every
+# interactive task is RunLevel Highest, and config.json is world-readable, admin-writable).
+Check 'the policy is NOT carried in the user-writable payload' `
+      ((Get-CodeOnly $engineText3) -notmatch 'explain\s+=\s+\$\(if \(\$cfg\.notify')
+Check 'and the toast reads it from admin-owned config.json instead' `
+      ($toastCode -match 'function Get-ExplainMode' -and $toastCode -match 'Get-Content \$ConfigFile')
+Check 'the toast only enriches when that policy says auto' `
+      ($toastCode -match "if \(\(Get-ExplainMode\) -ne 'auto'\) \{ return \`$Fallback \}")
+# Behavioural, not just structural: every way of failing to read the policy must land on OFF, so a
+# missing key or a corrupt file can only ever disable the feature, never enable it.
+$emFn = $toastAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-ExplainMode' }, $true)
+Check 'Get-ExplainMode is a liftable function' ($null -ne $emFn)
+if ($emFn) {
+  function Write-ToastLog { param($Level, $Msg) }          # the lifted function logs on failure
+  . ([scriptblock]::Create($emFn.Extent.Text))
+  $cfgProbe = Join-Path $RunsDir 'explain-config.json'
+  foreach ($case in @(@{ n='auto';           json='{"notify":{"explain":"auto"}}'; want='auto' },
+                      @{ n='off';            json='{"notify":{"explain":"off"}}';  want='off'  },
+                      @{ n='mixed case';     json='{"notify":{"explain":"AUTO"}}'; want='auto' },
+                      @{ n='key absent';     json='{"notify":{}}';                 want='off'  },
+                      @{ n='notify absent';  json='{}';                            want='off'  },
+                      @{ n='corrupt file';   json='not json at all';               want='off'  })) {
+    Set-Content -Path $cfgProbe -Value $case.json -Encoding UTF8
+    $ConfigFile = $cfgProbe
+    Check "  policy from config.json: $($case.n) -> $($case.want)" ((Get-ExplainMode) -eq $case.want) "got '$(Get-ExplainMode)'"
+  }
+  Remove-Item $cfgProbe -Force -ErrorAction SilentlyContinue
+  $ConfigFile = $cfgProbe        # now missing
+  Check '  policy from config.json: file missing -> off' ((Get-ExplainMode) -eq 'off') "got '$(Get-ExplainMode)'"
+}
+Check 'every enrichment failure returns the deterministic text' `
+      (@([regex]::Matches($toastCode, 'return \$Fallback')).Count -ge 2 -and $toastCode -match 'if \(-not \$text\) \{ return \$Fallback \}')
+Check 'the call is bounded by a timeout and killed if it overruns' `
+      ($toastCode -match 'WaitForExit\(\$TimeoutSec \* 1000\)' -and $toastCode -match '\$p\.Kill\(\)')
+Check 'and it is judged on its OUTPUT, not on an exit code that is empty here' `
+      ($toastCode -match '\(\$null -ne \$exit\) -and \(\$exit -ne 0\)')
+Check 'the answer is sanity-checked before it goes on screen' `
+      ($toastCode -match '\$text\.Length -lt 20 -or \$text\.Length -gt 400' -and $toastCode -match "CVE-\\d")
+Check 'the prompt forbids the jargon the user asked us to avoid' `
+      ($toastText -match 'No CVE numbers, no KB numbers' -and $toastText -match 'plain everyday English')
+Check 'results are cached per update set, so each one is researched once ever' `
+      ($toastCode -match 'function Get-WhyCacheKey' -and $toastCode -match 'Save-CachedWhy \$key \$text')
+Check 'and enrichment happens only once a toast is definitely going up' `
+      ($toastCode -match '(?s)if \(\$restart\.Mode -ne .countdown.\).{0,200}\$why = Get-ExplainedWhy')
 
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)

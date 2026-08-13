@@ -70,8 +70,17 @@ function Remove-OldInstall {
 Invoke-RenameMigration
 
 New-Item -ItemType Directory -Force -Path $Bin, (Join-Path $Root 'logs'), $Notify | Out-Null
-# The dialog runs as the non-elevated interactive user and must read the payload + clear its
-# pendingShow flag, so grant that account Modify on the notify subfolder only (rest stays admin-only).
+# The dialog, the tray and the restart toast all run as the interactive user and must read the
+# payload + clear its pendingShow flag, so grant that account Modify on the notify subfolder only
+# (rest stays admin-only).
+#
+# Worth being precise, because the comments here previously were not: those tasks run at RunLevel
+# Highest, i.e. ELEVATED, not "non-elevated" as this file used to claim. $nUser is also
+# $env:USERNAME of an already-elevated installer (#Requires -RunAsAdministrator at the top), so it
+# is an administrator by construction. That means this grant does not hand anything to a lesser
+# principal -- but it does mean notify\ is writable by the same account the elevated tasks run as,
+# so nothing in there is a trustworthy place to keep a decision about what those tasks may do.
+# See Get-ExplainMode in Show-RestartToast.ps1 for the one case where that mattered.
 $nUser = "$env:USERDOMAIN\$env:USERNAME"
 & icacls $Notify /grant "${nUser}:(OI)(CI)M" /T 2>&1 | Out-Null
 Write-Host "Granted $nUser Modify on $Notify"
@@ -87,11 +96,41 @@ Copy-Item (Join-Path $PSScriptRoot 'UserScope.ps1')        $Bin -Force
 # OEM identification for the vendorUpdates policy. Dot-sourced by BOTH the engine and the user pass,
 # so the two can never disagree about what this machine's vendor is.
 Copy-Item (Join-Path $PSScriptRoot 'VendorProfiles.ps1')   $Bin -Force
-# Reboot detection. Dot-sourced by BOTH the engine and the tray, so the icon in the notification
-# area and the engine's own restart decision can never disagree about the state of this machine.
+# Reboot detection, timestamp handling and the restart decision. Dot-sourced by the engine, the tray,
+# the summary dialog AND the restart toast, so no two of them can disagree about whether this machine
+# needs restarting or whether it already has. Two copies of that question is what restarted this box
+# three times on 2026-08-12.
 Copy-Item (Join-Path $PSScriptRoot 'RebootState.ps1')      $Bin -Force
+# The restart toast and the protocol handler behind its buttons. Windows PowerShell 5.1 only -- the
+# WinRT toast APIs do not project into pwsh 7.
+Copy-Item (Join-Path $PSScriptRoot 'Show-RestartToast.ps1') $Bin -Force
+Copy-Item (Join-Path $PSScriptRoot 'Invoke-ToastAction.ps1') $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
+
+# The dialog and the toast dot-source bin\RebootState.ps1, and they can read it today only because
+# bin inherits ProgramData's default Users:(OI)(CI)(RX) -- nothing ever asserted it. Assert it, so a
+# tightened ACL upstream becomes a failed install rather than a dialog that silently degrades to
+# making no restart decision at all. S-1-5-32-545 is BUILTIN\Users by SID, locale-independent.
+#
+# The grant is READ+EXECUTE only, deliberately: bin\ holds the scripts those elevated tasks run, so
+# write access here would be a straight path to code execution with an administrator token.
+& icacls $Bin /grant "*S-1-5-32-545:(OI)(CI)RX" 2>&1 | Out-Null
+Write-Host "Asserted read+execute (never write) on $Bin for BUILTIN\Users."
+
+# A payload written by v0.16.0 or earlier carries no runStamp, so nothing can prove whether its
+# restart was already issued. Get-RestartDisplayState refuses to arm a countdown on one -- correct,
+# but it also means the box would show a stale summary until the next run. Deleting it is cleaner:
+# the only loss is one summary the user has almost certainly already seen.
+$oldPayload = Join-Path $Notify 'latest-updates.json'
+if (Test-Path $oldPayload) {
+  $needsReset = $true
+  try { $needsReset = -not ((Get-Content $oldPayload -Raw | ConvertFrom-Json).PSObject.Properties.Name -contains 'schemaVersion') } catch {}
+  if ($needsReset) {
+    Remove-Item $oldPayload -Force -ErrorAction SilentlyContinue
+    Write-Host 'Removed a pre-v0.17.0 notify payload (no runStamp, so no restart could be proven against it).'
+  }
+}
 
 # ---- config (seed only; never clobber local edits on reinstall) -------------
 $ConfigFile = Join-Path $Root 'config.json'
@@ -196,6 +235,41 @@ $nLogon     = New-ScheduledTaskTrigger -AtLogOn -User $nUser
 Register-ScheduledTask -TaskName $NotifyTask -Action $nAction -Principal $nPrincipal -Settings $nSettings -Trigger $nLogon -Force `
   -Description 'Shows the SunUp summary dialog (and owns the restart countdown) in the interactive user session. Fired on demand by the engine; AtLogon shows a not-yet-seen cycle (e.g. post-reboot). Self-gates on notify\latest-updates.json pendingShow.' | Out-Null
 Write-Host "Registered task '$NotifyTask' (interactive, on-demand + AtLogon) as $nUser."
+
+# ---- restart toast: the "Restarting Soon" notification and its countdown -----
+# WINDOWS POWERSHELL 5.1, not $pwsh. The WinRT toast APIs have no projection in .NET Core, so
+# [Windows.UI.Notifications.ToastNotificationManager] simply does not resolve under pwsh 7. Same
+# carve-out SelfHost.ps1 makes, different reason. Never change this to $pwsh.
+$RestartTask = "$Name-Restart"
+$ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$rAction    = New-ScheduledTaskAction -Execute $ps51 -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\Show-RestartToast.ps1`""
+$rPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Highest
+# IgnoreNew, not Parallel: two countdowns for one run would race to restart the box. Never times
+# out -- it owns a countdown the user is allowed to pause indefinitely.
+$rSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+# No AtLogon trigger, deliberately. The summary dialog handles logon; a toast that re-armed a
+# countdown at every sign-in is precisely the 2026-08-12 failure, and while the restart record now
+# makes that impossible, not having the trigger at all is a second lock on the same door.
+Register-ScheduledTask -TaskName $RestartTask -Action $rAction -Principal $rPrincipal -Settings $rSettings -Force `
+  -Description 'Shows the SunUp "Restarting Soon" toast and owns the restart countdown (Restart now / Pause). Windows PowerShell 5.1 because the toast APIs are WinRT-only. Fired on demand by the engine; exits 2 if a toast cannot be shown so the caller falls back to the summary dialog.' | Out-Null
+Write-Host "Registered task '$RestartTask' (interactive, on-demand, WinPS 5.1) as $nUser."
+
+# ---- sunup: protocol, so the toast's buttons can reach us -------------------
+# A toast button can activate three ways: "foreground" and "background" both require a COM activator
+# registered under a CLSID, which an unpackaged script cannot sanely provide; "system" only
+# dismisses. "protocol" is the one that works for a script. HKCU, so no elevation and no machine-wide
+# footprint; Uninstall.ps1 removes it.
+$proto = 'HKCU:\Software\Classes\sunup'
+try {
+  New-Item -Path $proto -Force | Out-Null
+  New-ItemProperty -Path $proto -Name '(Default)'    -Value 'URL:SunUp Protocol' -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path $proto -Name 'URL Protocol' -Value ''                   -PropertyType String -Force | Out-Null
+  New-Item -Path "$proto\shell\open\command" -Force | Out-Null
+  $protoCmd = '"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" "%1"' -f $ps51, (Join-Path $Bin 'Invoke-ToastAction.ps1')
+  New-ItemProperty -Path "$proto\shell\open\command" -Name '(Default)' -Value $protoCmd -PropertyType String -Force | Out-Null
+  Write-Host 'Registered the sunup: protocol (the restart toast buttons activate through it).'
+} catch { Write-Host "WARNING: could not register the sunup: protocol ($_) - the toast buttons will not respond." }
 
 # ---- user-scope winget task: the packages SYSTEM structurally cannot see -----
 # winget resolves installed packages PER USER, so anything registered under HKCU is invisible to

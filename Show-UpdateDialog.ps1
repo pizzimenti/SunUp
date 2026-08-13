@@ -1,31 +1,91 @@
 <#
 Show-UpdateDialog.ps1 — Win11 (acrylic) WPF dialog for a SunUp cycle.
 
-Shown after EVERY cycle (even with no updates). Reads notify\latest-updates.json.
-Lists the current run's updates (normal) plus the past N days of updates (greyed,
-from the payload's history[]). The dialog re-checks the live pending-reboot state:
-  * reboot pending now  -> table + cancellable countdown (Restart now / Postpone)
-  * reboot was required but already done (post-reboot) -> table + "Restarted to finish"
-  * otherwise           -> table (or "up to date" empty state) + Close
+Shown after EVERY cycle (even with no updates). Reads notify\latest-updates.json
+and notify\restart-state.json. Lists the current run's updates (normal) plus the
+past N days of updates (greyed, from the payload's history[]). Four modes, decided
+by the pure Get-RestartDisplayState below:
+  * countdown       restart expected, not yet issued -> cancellable countdown
+  * postReboot      issued and the box came back -> "Restarted ... back up ..." + times
+  * awaitingRestart issued but the box is STILL ON THE SAME BOOT (aborted or blocked
+                    shutdown) -> says so, offers a MANUAL restart, retries nothing
+  * none            table, or the "up to date" empty state
+
+As of v0.17.0 the countdown here is the FALLBACK path. Show-RestartToast.ps1 owns
+the restart normally; this window takes over only when the toast cannot be shown.
+
+Which mode applies is decided on BOOT IDENTITY, not on comparing two timestamps.
+Until v0.17.0 it was the latter, and this script re-parsed a value ConvertFrom-Json
+had already turned into a [datetime] -- which added the local offset, put the run's
+end seven hours in the future, and made "has the box rebooted yet?" permanently
+false. It armed a fresh countdown at every logon and restarted this machine three
+times in seventy minutes on 2026-08-12. See RebootState.ps1's header.
 
 `pendingShow` in the payload gates display: the engine sets it true each run; this
 dialog clears it once shown (so the on-logon trigger only re-shows a not-yet-seen
 cycle, e.g. the post-reboot summary). A reboot path leaves pendingShow set so the
-summary appears after the box returns.
+summary appears after the box returns -- which is safe precisely because the record
+now decides, so a surviving pendingShow can no longer re-arm anything.
 
-Runs as the interactive user (non-elevated). Must run STA.
-  -DataPath <file>   alternate payload
-  -Demo              show countdown but never restart; ignore pendingShow (preview)
-  -Validate          build the window but don't show it, exit 0
+Runs as the interactive user at RunLevel Highest -- ELEVATED, so it can actually restart the
+box. (It was documented as non-elevated for several releases and is not; a security review of
+v0.17.0 caught the discrepancy. It matters: anything this window trusts, it trusts with an
+administrator token.) Must run STA.
+  -DataPath <file>          alternate payload
+  -RestartStatePath <file>  alternate restart record (fixtures in tests)
+  -Demo                     show countdown but never restart; ignore pendingShow
+  -Validate                 build the window but don't show it, print mode, exit 0
 #>
 param(
   [string]$DataPath = 'C:\ProgramData\SunUp\notify\latest-updates.json',
+  [string]$RestartStatePath = 'C:\ProgramData\SunUp\notify\restart-state.json',
   [switch]$Demo,
   [switch]$Validate
 )
 $ErrorActionPreference = 'Stop'
 $Name = 'SunUp'   # window title + self-close key + reboot.log path all derive from this
 try { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml } catch {}
+
+# Timestamp handling and boot identity are shared verbatim with the engine and the tray
+# (RebootState.ps1, deployed alongside this script in bin\). Until v0.17.0 this dialog was the ONE
+# consumer that did not dot-source it, and carried its own re-parse of the payload's runEndUtc --
+# which is what restarted this box three times in seventy minutes on 2026-08-12. See that file's
+# header for the full autopsy. bin\ is readable by BUILTIN\Users, and Install.ps1 now asserts that
+# rather than relying on inheritance.
+$RebootStateScript = Join-Path $PSScriptRoot 'RebootState.ps1'
+if (Test-Path $RebootStateScript) { . $RebootStateScript }
+else {
+  # Degraded, and deliberately NOT a reimplementation. Without the shared file this dialog will show
+  # the update table and nothing else: no countdown, no restart button, no restart decision at all.
+  #
+  # That is the whole lesson of this release stated as code. A second copy of the restart decision
+  # is exactly what restarted this box three times, and a copy written in a hurry inside a fallback
+  # nobody exercises is the likeliest of all to drift. Showing a summary without restart controls
+  # costs the user a manual restart they were going to be asked for anyway; getting the decision
+  # wrong costs them their work. So the fallback answers 'none' and says so, loudly, in the log it
+  # can still write.
+  function Get-RestartRecord { param([string]$Path) $null }
+  function Get-BootLocal { try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { $null } }
+  function Get-BootEpoch { $null }
+  function Test-BootedSince { param($Utc) $false }
+  function ConvertTo-UtcTime { param($Value, [switch]$AllowFuture) $null }
+  function Format-LocalStamp { param($Value) '' }
+  function Get-RestartDisplayState {
+    param($Data, $Record = $null, $BootEpoch = $null, [bool]$BootedSinceRun = $false, $BootLocal = $null, [switch]$Demo)
+    [pscustomobject][ordered]@{ Mode = 'none'; CountdownSec = 300; ExecutedLocal = $null
+                                BootedLocal = $BootLocal; DowntimeSec = $null; Trigger = $null }
+  }
+  try {
+    "$((Get-Date).ToString('o')) DEGRADED: bin\RebootState.ps1 not found -- summary shown without restart controls" |
+      Add-Content "C:\ProgramData\$Name\notify\reboot.log"
+  } catch {}
+}
+
+# Get-RestartRecord / Save-RestartRecord / New-RestartRecord / Get-RestartDisplayState /
+# Format-LocalStamp all come from RebootState.ps1, shared verbatim with Show-RestartToast.ps1 (which
+# runs under 5.1 and needs the identical answer) and exercised directly by the test suite. Keeping
+# the decision here, in a WPF file that cannot be loaded headlessly, is what left it untested and
+# wrong for nine months.
 
 # ---- payload ----------------------------------------------------------------
 if (Test-Path $DataPath) { $data = Get-Content $DataPath -Raw | ConvertFrom-Json }
@@ -38,17 +98,46 @@ if (-not $Demo -and -not $Validate -and -not $data.pendingShow) { exit 0 }
 # even for a run-signal reboot (winget/MSI 3010) that sets no OS pending flag — the old Test-PendingReboot
 # proxy would misread that as "already rebooted" and silently skip the countdown. On any uncertainty we
 # default to pre-reboot (show the cancellable countdown) so a needed reboot is never silently skipped.
+#
+# The comparison itself now lives in Test-BootedSince (RebootState.ps1), which routes the payload
+# value through the ONE guarded reader. The version that used to sit here called
+# [datetime]::Parse() on a value ConvertFrom-Json had ALREADY deserialized into a [datetime]; that
+# stringifies through the current culture, drops the 'Z', and re-parses as Unspecified, so the
+# trailing .ToUniversalTime() added the local offset instead of nothing. runEnd landed seven hours
+# in the future, "has it booted since?" was permanently false, and this dialog armed a fresh
+# countdown at every logon. Three restarts on 2026-08-12, 08:09 / 09:03 / 09:09.
 $needsReboot = [bool]$data.rebootRequired
-$rebootedSinceRun = $false
-if (-not $Demo -and $needsReboot -and $data.runEndUtc) {
-  try {
-    $runEnd = [datetime]::Parse($data.runEndUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
-    $boot   = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime()
-    $rebootedSinceRun = $boot -gt $runEnd
-  } catch { $rebootedSinceRun = $false }   # can't tell → assume not yet rebooted → show countdown
+# runEnd is the v0.17.0 local-with-offset field; runEndUtc is the v0.16.0 spelling, still read so a
+# payload written by the previous version is understood rather than treated as unknown.
+$runEndValue = if ($data.PSObject.Properties.Name -contains 'runEnd') { $data.runEnd } else { $data.runEndUtc }
+$bootedSinceRun = if (-not $Demo -and $needsReboot -and $runEndValue) { [bool](Test-BootedSince $runEndValue) } else { $false }
+
+# Three impure lookups, then one pure decision. The record wins over the timestamp: even if runEnd
+# were mangled into next week, an issued record plus a changed boot still reads as postReboot.
+$restartRecord = Get-RestartRecord $RestartStatePath
+$bootEpochNow  = Get-BootEpoch
+$bootLocalNow  = Get-BootLocal
+$restart = Get-RestartDisplayState -Data $data -Record $restartRecord -BootEpoch $bootEpochNow `
+                                   -BootedSinceRun $bootedSinceRun -BootLocal $bootLocalNow -Demo:$Demo
+
+$showCountdown   = ($restart.Mode -eq 'countdown')
+$postReboot      = ($restart.Mode -eq 'postReboot')
+$awaitingRestart = ($restart.Mode -eq 'awaitingRestart')
+
+# EXACTLY ONE countdown per run. As of v0.17.0 the toast normally owns it, and this window is the
+# fallback for when a toast cannot be shown -- but both read the same payload and would both reach
+# mode=countdown, so without this check a logon during a live toast countdown would put a second
+# one on screen, racing the first to restart the box. Two countdowns for one restart is a worse
+# version of the bug this release is about.
+#
+# Asked of the task, not of a lock file: the task's Running state IS the fact we need, it cannot go
+# stale after a crash, and a failure to answer means "no toast", which lands on showing the
+# countdown here -- the safe side.
+$toastOwnsCountdown = $false
+if ($showCountdown -and -not $Demo) {
+  try { $toastOwnsCountdown = ((Get-ScheduledTask -TaskName "$Name-Restart" -ErrorAction Stop).State -eq 'Running') } catch {}
+  if ($toastOwnsCountdown) { $showCountdown = $false }
 }
-$showCountdown = if ($Demo) { [bool]$data.rebootRequired } else { $needsReboot -and -not $rebootedSinceRun }
-$postReboot    = $needsReboot -and $rebootedSinceRun   # required, and the box has since restarted
 
 function Format-Size { param($mb) if ($null -eq $mb -or $mb -le 0) { '—' } elseif ($mb -ge 1024) { '{0:N1} GB' -f ($mb/1024) } else { '{0:N0} MB' -f $mb } }
 function Format-Dur  { param($s) if ($null -eq $s -or $s -le 0) { '—' } elseif ($s -lt 60) { "$([int]$s)s" } else { '{0}m {1:00}s' -f [math]::Floor($s/60), ([int]$s % 60) } }
@@ -69,7 +158,7 @@ $hasItems  = $count -gt 0            # chips reflect THIS run
 $hasRows   = $rows.Count -gt 0       # table shows if there's a current OR past row
 $totalDur  = Format-Dur $data.totalDurationSec
 $totalSize = Format-Size $data.totalSizeMB
-$countdown = if ($data.rebootCountdownSec -and $data.rebootCountdownSec -gt 0) { [int]$data.rebootCountdownSec } else { 300 }
+$countdown = $restart.CountdownSec
 $subtitle  = if ($data.runDate) { "Completed $($data.runDate)" } else { 'Completed' }
 
 # ---- theme ------------------------------------------------------------------
@@ -196,24 +285,73 @@ $script:demo = [bool]$Demo
 $script:remain = $countdown
 $script:dataPath = $DataPath
 $script:rebooting = $false
+$script:restartStatePath = $RestartStatePath
+$script:runStamp = "$($data.runStamp)"
 
 # Mark this cycle as seen so the logon trigger won't re-show it (skip if a reboot is coming).
+#
+# latest-updates.json has THREE unlocked read-modify-write writers -- the engine as SYSTEM, this
+# dialog, and the tray's "Show last summary" -- so a plain Get/Set pair here could drop a whole
+# payload the engine had just written, or leave a truncated file that kills the next dialog before
+# it draws anything ($ErrorActionPreference is 'Stop'). Serialize on a named mutex and publish by
+# rename, the same way the engine publishes every other JSON file it owns.
+#
+# Failing to take the lock means NOT writing. The cost is one summary shown twice; the cost of
+# writing anyway is losing the run's payload.
 function Clear-PendingShow {
   if ($script:rebooting) { return }
-  try { $d = Get-Content $script:dataPath -Raw | ConvertFrom-Json
-        $d.pendingShow = $false
-        $d | ConvertTo-Json -Depth 6 | Set-Content $script:dataPath } catch {}
+  $mx = $null; $held = $false
+  try { $mx = New-Object System.Threading.Mutex($false, 'Global\SunUp-Notify') } catch {}
+  if ($mx) {
+    try { $held = $mx.WaitOne([timespan]::FromSeconds(5)) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    catch { $held = $false }
+  }
+  if (-not $held) { return }
+  try {
+    $d = Get-Content $script:dataPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    $d.pendingShow = $false
+    $tmp = "$($script:dataPath).tmp"
+    ($d | ConvertTo-Json -Depth 8) | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+    $null = Get-Content $tmp -Raw -ErrorAction Stop | ConvertFrom-Json
+    Move-Item -Path $tmp -Destination $script:dataPath -Force -ErrorAction Stop
+  } catch {
+  } finally {
+    if ($mx -and $held) { try { $mx.ReleaseMutex() } catch {} }
+    if ($mx) { try { $mx.Dispose() } catch {} }
+  }
 }
 function Invoke-Restart {
+  param([string]$Trigger = 'countdown-expired')
   if ($script:demo) { $script:countText.Text=''; $script:rebootLbl.Text='Demo — restart skipped.'; return }
-  $script:rebooting = $true
   $rl = "C:\ProgramData\$Name\notify\reboot.log"
+
+  # RECORD FIRST, RESTART SECOND, and if the record cannot be written DO NOT RESTART.
+  #
+  # That ordering is the whole safety property. A restart we cannot record is a restart nothing can
+  # later prove happened -- so the next logon sees "reboot required, no evidence of a reboot" and
+  # arms another countdown, which is precisely the loop of 2026-08-12. Refusing to restart costs
+  # the user one postponed update; restarting unrecorded costs them their work, repeatedly.
+  #
+  # The boot epoch is re-read inside New-RestartRecord rather than reused from the arm step: minutes
+  # may have passed, and it is the boot we are actually leaving that has to be recorded.
+  $rec = New-RestartRecord -RunStamp $script:runStamp -RequestedBy 'dialog' -Trigger $Trigger -Method 'Restart-Computer'
+  $bootNow = $rec.bootAtRequestEpoch
+  if (-not (Save-RestartRecord $script:restartStatePath $rec)) {
+    try { "$(Get-SunUpTimestamp) ABORTED: could not write restart-state.json -- refusing to restart unrecorded" | Add-Content $rl } catch {}
+    if ($script:timer) { $script:timer.Stop() }
+    $script:countText.Text = ''
+    $script:rebootLbl.Text = 'Could not record the restart, so it was not started. Restart manually when convenient.'
+    return
+  }
+
+  $script:rebooting = $true
   # Restart-Computer -Force is the primary path: in this elevated interactive-task context
   # shutdown.exe returns exit=1 even with the privilege held (observed 2026-06-27 — only the
   # Restart-Computer fallback actually rebooted), so lead with the proven call and keep
   # shutdown.exe as the fallback. The visible countdown already served as the warning.
   try {
-    "$(Get-Date -Format o) Restart-Computer -Force" | Add-Content $rl
+    "$(Get-SunUpTimestamp) run=$($script:runStamp) trigger=$Trigger method=Restart-Computer boot=$bootNow" | Add-Content $rl
     Restart-Computer -Force
   } catch {
     "$(Get-Date -Format o) Restart-Computer failed: $_ -> shutdown.exe fallback" | Add-Content $rl
@@ -234,13 +372,45 @@ if ($showCountdown) {
     if ($script:remain -le 0) { $script:timer.Stop(); Invoke-Restart; return }
     $script:countText.Text = ('{0}:{1:00}' -f [math]::Floor($script:remain/60), ($script:remain%60))
   })
-  $restartBtn.Add_Click({ if ($script:timer){$script:timer.Stop()}; Invoke-Restart })
+  $restartBtn.Add_Click({ if ($script:timer){$script:timer.Stop()}; Invoke-Restart -Trigger 'user-clicked' })
   $closeBtn.Add_Click({ if ($script:timer){$script:timer.Stop()}; try { & shutdown.exe /a 2>$null } catch {}; $script:rebootLbl.Text='Restart postponed.'; $script:countText.Text=''; Clear-PendingShow; $script:win.Close() })
 }
 elseif ($postReboot) {
   $rebootIcon.Text = [char]0x2714; $rebootIcon.Foreground = $okGreen   # real ✔ glyph (not the XML entity — this is a runtime .Text assignment, not XAML)
-  $script:rebootLbl.Text = 'Restarted to finish updates.'
+  # Say WHEN, in local time. "Restarted to finish updates." left the user with no way to tell a
+  # restart they slept through from one that happened while they were away from the desk -- or, on
+  # 2026-08-12, one restart from the third one in an hour. The record supplies the moment we issued
+  # it; LastBootUpTime supplies the moment the box came back; the gap between them is the outage.
+  $txt = 'Restarted to finish updates.'
+  $when = @()
+  if ($restart.ExecutedLocal) { $when += "restarted $(Format-LocalStamp $restart.ExecutedLocal)" }
+  if ($restart.BootedLocal)   { $when += "back up $(Format-LocalStamp $restart.BootedLocal)" }
+  if ($when.Count) { $txt += '  ' + ($when -join ', ') }
+  if ($null -ne $restart.DowntimeSec) { $txt += " (down $(Format-Dur $restart.DowntimeSec))" }
+  $script:rebootLbl.Text = $txt
   $restartBtn.Visibility = 'Collapsed'; $closeBtn.Content = 'Close'
+  $closeBtn.Add_Click({ Clear-PendingShow; $script:win.Close() })
+}
+elseif ($toastOwnsCountdown) {
+  # A restart is coming, but the "Restarting Soon" toast is counting it down. Say so and stay out of
+  # the way: no timer, no restart button, nothing here that could start a second one.
+  $rebootIcon.Text = [char]0x21BB
+  $script:rebootLbl.Text = 'Restart required to finish updates — see the "Restarting Soon" notification.'
+  $restartBtn.Visibility = 'Collapsed'; $closeBtn.Content = 'Close'
+  $closeBtn.Add_Click({ Clear-PendingShow; $script:win.Close() })
+}
+elseif ($awaitingRestart) {
+  # We issued a restart and the machine is still on the same boot: something aborted or blocked the
+  # shutdown (shutdown /a, a driver veto, an app refusing to close). Before v0.17.0 this state was
+  # indistinguishable from "restart needed", so the dialog armed ANOTHER countdown and tried again.
+  # Now it says what happened and hands the decision back. Manual button only -- nothing automatic
+  # retries a restart the machine has already declined once.
+  $rebootIcon.Text = [char]0x26A0                                       # warning sign
+  $when = if ($restart.ExecutedLocal) { " at $(Format-LocalStamp $restart.ExecutedLocal)" } else { '' }
+  $script:rebootLbl.Text = "A restart was requested$when but the machine has not restarted yet."
+  $restartBtn.Visibility = 'Visible'; $restartBtn.Content = 'Restart now'
+  $closeBtn.Content = 'Close'
+  $restartBtn.Add_Click({ Invoke-Restart -Trigger 'user-clicked' })
   $closeBtn.Add_Click({ Clear-PendingShow; $script:win.Close() })
 }
 else {
@@ -264,7 +434,15 @@ $script:win.Add_SourceInitialized({
   if ($showCountdown) { $script:timer.Start() }
 })
 
-if ($Validate) { Write-Host "validate OK: $($rows.Count) rows ($count current + $(@($data.history).Count) history), countdown=$showCountdown, postReboot=$postReboot"; exit 0 }
+if ($Validate) {
+  # Mode is the load-bearing value, so -Validate prints it: that turns this switch into a real
+  # integration check (run the shipped script against a fixture payload + record, assert the mode)
+  # rather than only a "does it build" smoke test.
+  Write-Host ("validate OK: $($rows.Count) rows ($count current + $(@($data.history).Count) history)," +
+              " mode=$($restart.Mode), countdown=$showCountdown, postReboot=$postReboot," +
+              " executed=$($restart.ExecutedLocal), bootedLocal=$($restart.BootedLocal), downtimeSec=$($restart.DowntimeSec)")
+  exit 0
+}
 # Replace any already-open SunUp dialog (a newer cycle supersedes the old one). Mine isn't
 # shown yet, so its title isn't "$Name" yet — only prior dialogs match.
 try { Get-Process pwsh -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq $Name } | ForEach-Object { $_.CloseMainWindow() | Out-Null } } catch {}
