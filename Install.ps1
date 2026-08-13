@@ -70,8 +70,17 @@ function Remove-OldInstall {
 Invoke-RenameMigration
 
 New-Item -ItemType Directory -Force -Path $Bin, (Join-Path $Root 'logs'), $Notify | Out-Null
-# The dialog runs as the non-elevated interactive user and must read the payload + clear its
-# pendingShow flag, so grant that account Modify on the notify subfolder only (rest stays admin-only).
+# The dialog, the tray and the restart toast all run as the interactive user and must read the
+# payload + clear its pendingShow flag, so grant that account Modify on the notify subfolder only
+# (rest stays admin-only).
+#
+# Worth being precise, because the comments here previously were not: those tasks run at RunLevel
+# Highest, i.e. ELEVATED, not "non-elevated" as this file used to claim. $nUser is also
+# $env:USERNAME of an already-elevated installer (#Requires -RunAsAdministrator at the top), so it
+# is an administrator by construction. That means this grant does not hand anything to a lesser
+# principal -- but it does mean notify\ is writable by the same account the elevated tasks run as,
+# so nothing in there is a trustworthy place to keep a decision about what those tasks may do.
+# See Get-ExplainMode in Show-RestartToast.ps1 for the one case where that mattered.
 $nUser = "$env:USERDOMAIN\$env:USERNAME"
 & icacls $Notify /grant "${nUser}:(OI)(CI)M" /T 2>&1 | Out-Null
 Write-Host "Granted $nUser Modify on $Notify"
@@ -99,13 +108,15 @@ Copy-Item (Join-Path $PSScriptRoot 'Invoke-ToastAction.ps1') $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
-# The dialog and the toast both run NON-ELEVATED and dot-source bin\RebootState.ps1. They can read
-# it today only because bin inherits ProgramData's default Users:(OI)(CI)(RX) -- nothing ever
-# asserted it. Assert it, so a tightened ACL upstream becomes a failed install rather than a dialog
-# that silently degrades to making no restart decision at all. S-1-5-32-545 is BUILTIN\Users by SID,
-# which is locale-independent.
+# The dialog and the toast dot-source bin\RebootState.ps1, and they can read it today only because
+# bin inherits ProgramData's default Users:(OI)(CI)(RX) -- nothing ever asserted it. Assert it, so a
+# tightened ACL upstream becomes a failed install rather than a dialog that silently degrades to
+# making no restart decision at all. S-1-5-32-545 is BUILTIN\Users by SID, locale-independent.
+#
+# The grant is READ+EXECUTE only, deliberately: bin\ holds the scripts those elevated tasks run, so
+# write access here would be a straight path to code execution with an administrator token.
 & icacls $Bin /grant "*S-1-5-32-545:(OI)(CI)RX" 2>&1 | Out-Null
-Write-Host "Asserted read+execute on $Bin for BUILTIN\Users (the dialog and toast run non-elevated)."
+Write-Host "Asserted read+execute (never write) on $Bin for BUILTIN\Users."
 
 # A payload written by v0.16.0 or earlier carries no runStamp, so nothing can prove whether its
 # restart was already issued. Get-RestartDisplayState refuses to arm a countdown on one -- correct,

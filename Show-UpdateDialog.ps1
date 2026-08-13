@@ -27,7 +27,10 @@ cycle, e.g. the post-reboot summary). A reboot path leaves pendingShow set so th
 summary appears after the box returns -- which is safe precisely because the record
 now decides, so a surviving pendingShow can no longer re-arm anything.
 
-Runs as the interactive user (non-elevated). Must run STA.
+Runs as the interactive user at RunLevel Highest -- ELEVATED, so it can actually restart the
+box. (It was documented as non-elevated for several releases and is not; a security review of
+v0.17.0 caught the discrepancy. It matters: anything this window trusts, it trusts with an
+administrator token.) Must run STA.
   -DataPath <file>          alternate payload
   -RestartStatePath <file>  alternate restart record (fixtures in tests)
   -Demo                     show countdown but never restart; ignore pendingShow

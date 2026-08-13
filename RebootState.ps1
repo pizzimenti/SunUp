@@ -294,10 +294,16 @@ function Get-PfroEntries {
 
 # ---- the restart record, and the decision it gates --------------------------
 # notify\restart-state.json records that a restart was ISSUED, for which run, and which boot the
-# machine was on when it was issued. It lives in notify\ because that is the only directory the
-# non-elevated dialog and the 5.1 toast host can write, and it is a SEPARATE file from
-# latest-updates.json on purpose: that one has three unlocked read-modify-write writers, and the one
-# fact that has to survive a reboot does not belong in the file most likely to lose an update.
+# machine was on when it was issued. It lives in notify\ because that is the directory the engine
+# grants the interactive user Modify on, and the dialog and the 5.1 toast host both write it. It is
+# a SEPARATE file from latest-updates.json on purpose: that one has three unlocked
+# read-modify-write writers, and the one fact that has to survive a reboot does not belong in the
+# file most likely to lose an update.
+#
+# Note what this file is NOT. It is a record of what happened, held somewhere the interactive user
+# can write, so it must never be read as a statement of what anything is PERMITTED to do -- only as
+# evidence about a restart, cross-checked against the boot counter, which no file can forge. Policy
+# lives in config.json, which only an administrator can change.
 #
 # These live here, not in the dialog, because the toast host needs the identical answer. Two
 # implementations of one question is the bug this release exists to remove -- it is what the dialog

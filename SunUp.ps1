@@ -1050,8 +1050,11 @@ function Get-LatestResult {
   $null
 }
 
-# Past-N-day update history for the dialog. The dialog runs non-elevated and can't read logs\,
-# so the engine (SYSTEM) reads history.jsonl here and the result is embedded in the notify payload.
+# Past-N-day update history for the dialog. The engine (SYSTEM) reads history.jsonl here and embeds
+# the result in the notify payload, so the dialog needs no second file handle and no second parser.
+# (This used to be justified as "the dialog runs non-elevated and can't read logs\". Neither half
+# held: the dialog runs at RunLevel Highest, and logs\ inherits Users:RX from ProgramData anyway.
+# The design is still the right one -- one payload, one read -- but for convenience, not necessity.)
 # Each history.jsonl line is a full run object carrying date/runStamp/updates[]. Returns flat rows
 # {when,stamp,name,source,old,new,durationSec,sizeMB}, newest-first, capped at MaxRows. Collapse
 # keeps only the latest occurrence per name|source (so daily Defender-signature bumps don't flood
@@ -1571,9 +1574,12 @@ $payload = [ordered]@{
   rebootIgnored       = @($rebootState.Advisory)
   # Plain language, deliberately: "the machine still has the problem they fix" beats quoting a CVE.
   whyPlain            = @(Get-RebootConsequence -Sources $rebootState.Sources)
-  # Carried in the payload rather than read from config by the toast: the toast runs non-elevated
-  # and config.json is admin-only, so this is the engine telling it what it is allowed to do.
-  explain             = $(if ($cfg.notify.PSObject.Properties.Name -contains 'explain') { "$($cfg.notify.explain)" } else { 'off' })
+  # NOTE: notify.explain is deliberately NOT carried here. It briefly was, justified as "the toast
+  # runs non-elevated and config.json is admin-only" -- both halves false. Every interactive task is
+  # registered RunLevel Highest, and config.json is world-readable and merely admin-writable, so the
+  # toast reads the policy from config.json itself. Putting a switch that gates executing an external
+  # program into notify\ (Modify for the interactive user) moved it somewhere weaker for no gain.
+  # See Get-ExplainMode in Show-RestartToast.ps1.
   pendingShow        = $true                # dialog clears this once shown (gates the logon trigger)
   items              = @($script:Updates)
   history            = $history             # past-Ndays updates, greyed below the current run

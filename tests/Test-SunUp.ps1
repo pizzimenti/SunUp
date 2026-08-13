@@ -1106,8 +1106,11 @@ Check 'the protocol handler allow-lists actions instead of trusting the URI' `
       ($actText -match "\`$known = @\('restart', 'pause', 'resume', 'dismiss', 'show'\)" -and $actText -match '\$known -notcontains \$action')
 Check 'and it can never restart anything itself' ($actText -notmatch 'Restart-Computer|shutdown\.exe')
 Check 'Install registers the sunup: protocol the buttons need' ($installText -match 'Classes\\sunup')
-Check 'and asserts bin is readable by the non-elevated dialog and toast' `
-      ($installText -match 'icacls \$Bin /grant "\*S-1-5-32-545')
+# bin\ holds the scripts the ELEVATED interactive tasks run, so the grant must be read+execute and
+# never write -- a write ACE there is a direct path to code execution with an administrator token.
+Check 'and asserts bin is readable, never writable, by BUILTIN\Users' `
+      ($installText -match 'icacls \$Bin /grant "\*S-1-5-32-545:\(OI\)\(CI\)RX"' -and
+       $installText -notmatch 'icacls \$Bin /grant[^\r\n]*S-1-5-32-545[^\r\n]*(:\(OI\)\(CI\))?(M|F|W)\b')
 Check 'and drops a pre-v0.17.0 payload that no record could be proven against' `
       ($installText -match 'schemaVersion' -and $installText -match 'Removed a pre-v0\.17\.0 notify payload')
 $uninstText = Get-Content (Join-Path $repoRoot 'Uninstall.ps1') -Raw
@@ -1116,9 +1119,40 @@ Check 'Uninstall removes the restart task, the AUMID and the protocol' `
 
 # --- optional Claude enrichment: an enhancement that can never break the warning ---
 Check 'enrichment is OFF by default' ($engineText3 -match "explain\s*=\s*'off'")
-Check 'and the engine tells the toast what it may do, since config.json is admin-only' `
-      ($engineText3 -match "explain\s+=\s+\`$\(if \(\`$cfg\.notify")
-Check 'the toast only enriches when explicitly set to auto' ($toastCode -match "if \(\`$mode -ne 'auto'\) \{ return \`$Fallback \}")
+# A switch that decides whether to execute an external program must live in the admin-owned file,
+# never in the payload. notify\ is granted Modify to the interactive user -- the SAME account the
+# elevated toast task runs as -- so a policy kept there is settable by the party it constrains. The
+# engine briefly did carry it, justified as "the toast runs non-elevated and config.json is
+# admin-only"; a security review of this branch established that BOTH halves were false (every
+# interactive task is RunLevel Highest, and config.json is world-readable, admin-writable).
+Check 'the policy is NOT carried in the user-writable payload' `
+      ((Get-CodeOnly $engineText3) -notmatch 'explain\s+=\s+\$\(if \(\$cfg\.notify')
+Check 'and the toast reads it from admin-owned config.json instead' `
+      ($toastCode -match 'function Get-ExplainMode' -and $toastCode -match 'Get-Content \$ConfigFile')
+Check 'the toast only enriches when that policy says auto' `
+      ($toastCode -match "if \(\(Get-ExplainMode\) -ne 'auto'\) \{ return \`$Fallback \}")
+# Behavioural, not just structural: every way of failing to read the policy must land on OFF, so a
+# missing key or a corrupt file can only ever disable the feature, never enable it.
+$emFn = $toastAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-ExplainMode' }, $true)
+Check 'Get-ExplainMode is a liftable function' ($null -ne $emFn)
+if ($emFn) {
+  function Write-ToastLog { param($Level, $Msg) }          # the lifted function logs on failure
+  . ([scriptblock]::Create($emFn.Extent.Text))
+  $cfgProbe = Join-Path $RunsDir 'explain-config.json'
+  foreach ($case in @(@{ n='auto';           json='{"notify":{"explain":"auto"}}'; want='auto' },
+                      @{ n='off';            json='{"notify":{"explain":"off"}}';  want='off'  },
+                      @{ n='mixed case';     json='{"notify":{"explain":"AUTO"}}'; want='auto' },
+                      @{ n='key absent';     json='{"notify":{}}';                 want='off'  },
+                      @{ n='notify absent';  json='{}';                            want='off'  },
+                      @{ n='corrupt file';   json='not json at all';               want='off'  })) {
+    Set-Content -Path $cfgProbe -Value $case.json -Encoding UTF8
+    $ConfigFile = $cfgProbe
+    Check "  policy from config.json: $($case.n) -> $($case.want)" ((Get-ExplainMode) -eq $case.want) "got '$(Get-ExplainMode)'"
+  }
+  Remove-Item $cfgProbe -Force -ErrorAction SilentlyContinue
+  $ConfigFile = $cfgProbe        # now missing
+  Check '  policy from config.json: file missing -> off' ((Get-ExplainMode) -eq 'off') "got '$(Get-ExplainMode)'"
+}
 Check 'every enrichment failure returns the deterministic text' `
       (@([regex]::Matches($toastCode, 'return \$Fallback')).Count -ge 2 -and $toastCode -match 'if \(-not \$text\) \{ return \$Fallback \}')
 Check 'the call is bounded by a timeout and killed if it overruns' `

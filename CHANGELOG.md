@@ -193,6 +193,24 @@ run with two or more updates — precisely the runs where the notification most 
 is restarting for. Caught by deploying v0.17.0 and watching the first live run emit no metadata at
 all. Same shape as the `$Name` bug already documented in that same block, for the same reason.
 
+The `notify.explain` policy is read by the toast **from `config.json` directly**, which is the
+admin-owned file that owns it. It briefly travelled in the notify payload instead, justified in a
+comment as "the toast runs non-elevated and config.json is admin-only" — a security review of this
+branch established that both halves were false. Every interactive task is registered
+`RunLevel Highest` and measures High integrity, and `config.json` is world-*readable*
+(`Users:RX`), merely admin-*writable*. So a switch deciding whether to execute an external program
+had been relocated out of a file only an administrator can change and into `notify\`, which is
+granted Modify to the interactive user — for no benefit, since the reader could always open the
+original. Nothing could have escalated through it (writer and reader are the same account, with no
+privilege boundary between them), but "the engine tells the toast what it is allowed to do" is not
+a sentence a user-writable file gets to say. Absent, corrupt or unreadable config now reads as
+`off`, so every failure mode disables the feature rather than enabling it.
+
+The same review found the "non-elevated" claim repeated in five other comments across
+`Install.ps1`, `Show-UpdateDialog.ps1`, `RebootState.ps1` and `SunUp.ps1`. All corrected: these
+tasks hold an administrator token, and it matters that the code says so, because anything they
+trust they trust with that token.
+
 Optional on top of that, `notify.explain = auto` (default `off`) asks Claude for the specific version
 in plain words, cached per KB in `notify\why-cache.json` so each update is researched once ever.
 Bounded by a 30s timeout — 12.4s measured for a warm call, so the original 12s budget timed out every
@@ -233,7 +251,7 @@ a fresh five-minute countdown and rebooted the machine. It is now inert.
 
 ### Tests
 
-Suite is 361 checks (was 238), in two new sections:
+Suite is 370 checks (was 238), in two new sections:
 
 - **[12] the restart loop** — the incident as a unit test, including the assertion that a `runEnd`
   seven hours in the future **cannot** re-arm a restart that a record says already happened; the
@@ -1165,3 +1183,4 @@ These are source limitations, not logging gaps — the data doesn't exist to cap
 [0.3.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/pizzimenti/SunUp/releases/tag/v0.1.0
+

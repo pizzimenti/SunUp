@@ -63,6 +63,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $Name    = 'SunUp'
 $Root    = "C:\ProgramData\$Name"
+$ConfigFile = Join-Path $Root 'config.json'
 $LogFile = Join-Path $Root 'notify\reboot.log'
 $AumId   = 'SunUp.Restart'
 $ToastTag   = 'sunup-restart'
@@ -347,11 +348,34 @@ function Invoke-ClaudeExplain {
   }
 }
 
+# Read the policy from config.json, which is the admin-owned file that OWNS it -- not from the
+# payload.
+#
+# The engine used to copy `explain` into notify\latest-updates.json, justified in a comment as "the
+# toast runs non-elevated and config.json is admin-only". Both halves of that were false, and a
+# security review of this branch caught it. This task is registered RunLevel Highest and measures
+# High integrity (S-1-16-12288); config.json is world-READABLE (Users:RX) and merely admin-WRITABLE.
+# So a switch that decides whether to execute an external program was being relocated out of a file
+# only an administrator can change and into notify\, which is granted Modify to the interactive user
+# -- for no benefit whatsoever, since the reader could always just open the original.
+#
+# Nobody could have escalated through it here (the writer and this process are the same account, so
+# no privilege boundary sat between them), but "the engine tells the toast what it is allowed to do"
+# is not a thing a user-writable file can say. Absent or unreadable reads as 'off', matching
+# $DefaultConfig, so a missing key can only ever disable the feature.
+function Get-ExplainMode {
+  try {
+    $c = Get-Content $ConfigFile -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+    if ($c.notify -and ($c.notify.PSObject.Properties.Name -contains 'explain')) {
+      return "$($c.notify.explain)".Trim().ToLower()
+    }
+  } catch { Write-ToastLog WARN "could not read the explain policy from $ConfigFile ($_) -- treating it as off." }
+  'off'
+}
+
 function Get-ExplainedWhy {
   param($Data, [string]$Fallback)
-  $mode = ''
-  if ($Data -and ($Data.PSObject.Properties.Name -contains 'explain')) { $mode = "$($Data.explain)".ToLower() }
-  if ($mode -ne 'auto') { return $Fallback }
+  if ((Get-ExplainMode) -ne 'auto') { return $Fallback }
   $key = Get-WhyCacheKey $Data
   $hit = Get-CachedWhy $key
   if ($hit) { Write-ToastLog INFO 'explanation: cache hit.'; return $hit }
