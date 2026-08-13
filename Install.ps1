@@ -304,8 +304,23 @@ Write-Host "Registered task '$TrayTask' (interactive, AtLogon) as $nUser."
 # (Re)start the tray now so it's present without waiting for the next logon. Stop any prior instance
 # first so the new build takes over (the mutex would otherwise make the new one exit immediately).
 try { Stop-ScheduledTask -TaskName $TrayTask -ErrorAction SilentlyContinue } catch {}
+# Match the DEPLOYED PATH after -File, never the bare filename.
+#
+# This was `-like '*SunUp-Tray.ps1*'`, which force-killed any pwsh whose command line merely
+# MENTIONED that name -- an admin's own shell inspecting the install, an editor, a script listing
+# the deployed files. Measured 2026-08-12: a verification shell that happened to name the file was
+# killed mid-install, and because it was this script's own caller, Install.ps1 died with it at exit
+# 255, having registered every task but never reaching Start-ScheduledTask below. The tray was left
+# stopped and the install looked like it had succeeded.
+#
+# The -ne $PID guard is belt and braces: with the path match this script can no longer match itself,
+# but "never kill the process doing the killing" is worth stating rather than inferring.
+$trayScript = Join-Path $Bin 'SunUp-Tray.ps1'
 Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like '*SunUp-Tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Where-Object {
+    $cl = "$($_.CommandLine)"
+    $_.ProcessId -ne $PID -and (($cl -like "*-File `"$trayScript`"*") -or ($cl -like "*-File $trayScript*"))
+  } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 try { Start-ScheduledTask -TaskName $TrayTask -ErrorAction Stop; Write-Host "Started '$TrayTask'." } catch { Write-Host "(tray will start at next logon)" }
 
 # ---- remove the old AutoUpdate tasks/source now that SunUp's are live --------

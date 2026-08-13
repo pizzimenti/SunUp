@@ -19,8 +19,18 @@ $Name = 'SunUp'
 $Bin = "C:\ProgramData\$Name\bin"
 $ourScripts = @('SunUp.ps1', 'SunUp-Tray.ps1', 'Show-UpdateDialog.ps1', 'UserScope.ps1', 'SelfHost.ps1') |
               ForEach-Object { Join-Path $Bin $_ }
+# Match the deployed path AFTER -File, not merely anywhere in the command line. This was already
+# narrower than Install.ps1's version (it builds full paths rather than bare filenames), but it is
+# the same class: a process that only MENTIONS one of these paths -- an editor, a log tail, a shell
+# inspecting the install -- is not one of ours to kill. Install.ps1 proved the point on 2026-08-12
+# by force-killing its own caller. Tightened here for the same reason, and kept in the same shape so
+# the two read alike.
 Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $cl = "$($_.CommandLine)"; @($ourScripts | Where-Object { $cl -like "*$_*" }).Count -gt 0 } |
+  Where-Object {
+    $cl = "$($_.CommandLine)"
+    $_.ProcessId -ne $PID -and
+    @($ourScripts | Where-Object { ($cl -like "*-File `"$_`"*") -or ($cl -like "*-File $_*") }).Count -gt 0
+  } |
   ForEach-Object {
     Write-Host "  stopping pid $($_.ProcessId) ($($_.Name))"
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue

@@ -701,6 +701,31 @@ Check 'uninstall stops the detached helpers too' ($uninstText -match 'SelfHost\.
 Check 'and only processes running the INSTALLED copies are killed' `
       ($uninstText -match '\$Bin = "C:\\ProgramData\\\$Name\\bin"' -and $uninstText -match 'ForEach-Object \{ Join-Path \$Bin \$_ \}' -and $uninstText -notmatch '-like "\*\\\\\$_\*"')
 Check 'and looks at Windows PowerShell 5.1, where SelfHost runs' ($uninstText -match "Name='powershell\.exe'")
+
+# --- v0.17.1: a process that MENTIONS one of our scripts is not one of our processes ---
+$installText = Get-Content (Join-Path $repoRoot 'Install.ps1') -Raw
+# Install.ps1 killed on `-like '*SunUp-Tray.ps1*'`, i.e. the bare filename anywhere in the command
+# line. On 2026-08-12 that force-killed the shell that was verifying the deploy -- which was
+# Install.ps1's own caller, so the install died with it at exit 255, after registering every task
+# but before restarting the tray. Both scripts now anchor on the deployed path AFTER -File.
+Check 'the installer never kills on a bare filename match' `
+      ((Get-CodeOnly $installText) -notmatch "-like '\*SunUp-Tray\.ps1\*'")
+foreach ($f in @{ n='Install.ps1'; t=$installText }, @{ n='Uninstall.ps1'; t=$uninstText }) {
+  Check "  $($f.n) anchors the kill filter on -File <deployed path>" ($f.t -match '-like "\*-File `"\$\w+`"\*"')
+  Check "  $($f.n) never kills the process doing the killing"        ($f.t -match '\$_\.ProcessId -ne \$PID')
+}
+# Behavioural: exercise the pattern itself against realistic command lines. The regex guards above
+# prove the SHAPE changed; this proves the shape is CORRECT.
+$trayPath = 'C:\ProgramData\SunUp\bin\SunUp-Tray.ps1'
+$isOurs = { param($cl) ($cl -like "*-File `"$trayPath`"*") -or ($cl -like "*-File $trayPath*") }
+$realTray   = '"C:\Program Files\PowerShell\7\pwsh.exe" -STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $trayPath + '"'
+$unquoted   = 'pwsh.exe -NoProfile -File ' + $trayPath
+$innocentFull = 'pwsh -NoProfile -Command "Get-FileHash ' + $trayPath + '"'
+$innocentName = 'pwsh -NoProfile -Command "$names = @(''SunUp.ps1'',''SunUp-Tray.ps1'')"'
+Check '  the real tray process still matches (quoted -File)'   (& $isOurs $realTray)
+Check '  and unquoted -File matches too'                       (& $isOurs $unquoted)
+Check '  a shell merely hashing that path does NOT match'      (-not (& $isOurs $innocentFull)) 'this is the shell that got killed'
+Check '  nor does one that only names the file'                (-not (& $isOurs $innocentName))
 Check 'and stops running task instances before unregistering them' ($uninstText -match 'Stop-ScheduledTask')
 # Removal errors are suppressed, so "Purged …" was printed even when a path survived an open handle.
 Check 'purge reports only what it actually removed' ($uninstText -match 'Could NOT remove' -and $uninstText -match 'Where-Object \{ -not \(Test-Path \$_\) \}')

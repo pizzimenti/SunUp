@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.17.0'
+$script:Version = '0.17.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -1787,3 +1787,4 @@ if ($result.rebootAction -eq 'reboot') {
 # Explicit, meaningful exit code so Task Scheduler's LastTaskResult reflects the run —
 # not a native exit code (e.g. Update-Module's access-denied on an in-use module) leaking through.
 exit ([int]($errors.Count -gt 0))
+
