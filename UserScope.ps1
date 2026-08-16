@@ -97,10 +97,18 @@ function Publish-Json { param($Object, [string]$Path)
     return $false
   }
 }
-function Raise-SysSentryAlert { param([string]$Msg)
-  $f = 'C:\ProgramData\SysSentry\ALERTS.md'
-  if (-not (Test-Path (Split-Path $f))) { return }
-  try { Add-Content -Path $f -Value ('- {0} SunUp: {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm'), $Msg) -Encoding UTF8 } catch {}
+function Raise-Alert { param([string]$Msg)
+  # SunUp's own toast queue (SysSentry retired 2026-08-15; see the engine's Raise-Alert). Path and
+  # task name duplicated from the engine on purpose -- this runs as a different user in a different
+  # process and must not depend on the engine being loadable. Keep in sync by hand.
+  $q = 'C:\ProgramData\SunUp\notify\alerts.jsonl'
+  try {
+    $dir = Split-Path $q
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    (New-Object psobject -Property ([ordered]@{ ts = (Get-Date).ToString('o'); src = 'user-scope'; msg = "$Msg" }) |
+      ConvertTo-Json -Compress) | Add-Content -Path $q -Encoding UTF8
+  } catch {}
+  try { Start-ScheduledTask -TaskName 'SunUp-Alerts' -ErrorAction Stop } catch {}
 }
 
 # Parse winget's FIXED-WIDTH upgrade table by column position, taken from the header row.
@@ -226,7 +234,7 @@ if ($self.Count) {
   $helper  = Join-Path $PSScriptRoot 'SelfHost.ps1'
   if (-not (Test-Path $helper)) {
     $m = "cannot hand off $($self.Count) self-hosting package(s) - helper missing at $helper : $selfIds"
-    Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+    Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-Alert $m
   } else {
     try {
       $ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -241,13 +249,13 @@ if ($self.Count) {
       Start-Sleep -Seconds 3
       if ($proc -and $proc.HasExited) {
         $m = "self-host helper exited immediately (code $($proc.ExitCode)) - $selfIds NOT upgraded (SelfHost.ps1 requires elevation)"
-        Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+        Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-Alert $m
       } else {
         Write-Both 'INFO' "handed $($self.Count) self-hosting package(s) to a detached Windows PowerShell 5.1 helper (it upgrades them once this pass exits): $selfIds"
       }
     } catch {
       $m = "could not start the self-host helper for $selfIds - $_"
-      Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-SysSentryAlert $m
+      Write-Both 'WARN' $m; Write-Evt 2031 'Warning' "SunUp user-scope pass: $m"; Raise-Alert $m
     }
   }
 }
@@ -298,7 +306,7 @@ if (-not (Publish-Json ([ordered]@{
 if ($fail -gt 0) {
   $m = "SunUp user-scope pass: $ok upgraded, $fail failed. See $UserLog"
   Write-Evt 2031 'Warning' $m
-  Raise-SysSentryAlert $m
+  Raise-Alert $m
 } else {
   Write-Evt 2030 'Information' "SunUp user-scope pass: $ok upgraded, 0 failed."
 }

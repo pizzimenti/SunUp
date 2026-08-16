@@ -2,6 +2,32 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.19.0] - 2026-08-15
+
+### Added — SunUp speaks for itself: native alert toasts, no SysSentry
+
+SysSentry was retired from this box on 2026-08-15 (its monitoring scope had crept into a
+do-everything suite and was descoped wholesale). SunUp's alerts rode that tool's plumbing —
+`Raise-SysSentryAlert` appended to `ALERTS.md` and SysSentry's notifier toasted it — which meant
+the update manager could not tell its user "a restart is waiting on you" without a second product
+installed. Backwards, and now gone:
+
+- **`Show-AlertToast.ps1`** (new, task `SunUp-Alerts`): drains `notify\alerts.jsonl` into
+  persistent toasts. Interactive user + Windows PowerShell 5.1 + pure ASCII, the same shape as the
+  restart toast, for the same reasons (SYSTEM has no desktop; pwsh has no WinRT; 5.1 reads BOM-less
+  as ANSI). The design is inherited from the retired notifier because it was measured to work:
+  queue is the source of truth, history (`notify\alerts-history.md`) is written before toasting,
+  the queue truncates before toasting, >3 alerts collapse to a summary, AtLogon catches alerts
+  raised while signed out.
+- **`Raise-SysSentryAlert` → `Raise-Alert`** in the engine, SelfHost, and UserScope (each keeps
+  its self-contained copy, per this repo's rule that detached passes must not depend on the engine
+  being loadable): queue append + fire-and-forget `Start-ScheduledTask`, so a notification problem
+  can never break a run.
+- The v0.18.0 countdown-expiry stand-downs write `alerts-history.md` directly and do NOT queue —
+  each already shows its own UI, and queueing would toast a duplicate.
+- Install registers the task (RunLevel Limited — a toast needs no privilege) and no longer
+  refreshes a SysSentry baseline; Uninstall removes the task and the `SunUp.Alerts` AUMID.
+
 ## [0.18.0] - 2026-08-15
 
 ### Added — unattended restarts stand down for blocker processes

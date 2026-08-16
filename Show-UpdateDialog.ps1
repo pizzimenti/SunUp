@@ -335,12 +335,11 @@ function Invoke-Restart {
     if ($blk.Count -gt 0) {
       $blkList = $blk -join ', '
       try { "$(Get-SunUpTimestamp) DEFERRED at countdown expiry: blocker process(es) running: $blkList" | Add-Content $rl } catch {}
+      # History only, no queue: the label this sets IS the notification, and queueing would have
+      # Show-AlertToast.ps1 toast a duplicate of what is already on screen.
       try {
-        $f = 'C:\ProgramData\SysSentry\ALERTS.md'
-        if (Test-Path (Split-Path $f)) {
-          ('- **{0:yyyy-MM-dd HH:mm}** [SUNUP] Restart countdown expired but stood down - {1} is running. Restart when the session is done.' -f (Get-Date), $blkList) |
-            Add-Content -Path $f -Encoding UTF8
-        }
+        ('- **{0:yyyy-MM-dd HH:mm}** [dialog] Restart countdown expired but stood down - {1} is running. Restart when the session is done.' -f (Get-Date), $blkList) |
+          Add-Content -Path 'C:\ProgramData\SunUp\notify\alerts-history.md' -Encoding UTF8
       } catch {}
       if ($script:timer) { $script:timer.Stop() }
       $script:countText.Text = ''

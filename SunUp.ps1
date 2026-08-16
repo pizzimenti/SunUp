@@ -37,10 +37,10 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         selfhost.log / selfhost.json   ONLY if self-hosting packages (PowerShell, winget itself)
                                        were upgraded — written AFTER this run ends, by SelfHost.ps1
                                        under Windows PowerShell 5.1; see its header for why
-  Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
+  Plus Application event log (source SunUp) + its own alert toast queue on failure.
 
 Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
-Companion to ProcWatch (realtime CPU) and SysSentry (security drift).
+Companion to ProcWatch (realtime CPU). (SysSentry, the old drift monitor, retired 2026-08-15.)
 #>
 param(
   # Run = do the update; Status = overview; Errors = last failures + log pointers; Tail = last run.log tail.
@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.18.0'
+$script:Version = '0.19.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -73,7 +73,8 @@ $NotifyDir     = Join-Path $Root 'notify'                       # user-writable 
 $NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
 $NotifyRestart = Join-Path $NotifyDir 'restart-state.json'      # proof a restart was issued; survives the boot
 $EvtSource     = $Name
-$SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
+$AlertsTask  = "$Name-Alerts"                    # interactive toast drain (Show-AlertToast.ps1)
+$AlertsQueue = "C:\ProgramData\$Name\notify\alerts.jsonl"
 
 $script:RunDir = $null   # set in Run mode once we create the per-run dir
 $script:RunLog = $null
@@ -343,7 +344,7 @@ function Flush-Report {
 
 # ---- crashed-run detection --------------------------------------------------
 # A run killed mid-flight (its host process terminated, power loss, a hard reset) is otherwise
-# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the SysSentry
+# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the alert
 # echo, the summary dialog — lives after the component loop, and lastrun.json is never stamped, so
 # the next run just looks like a normal first-run-of-the-day. The 2026-07-22 run died that way
 # (Restart Manager killed the engine during winget's own PowerShell 7 upgrade) and nothing reported
@@ -473,7 +474,7 @@ function Report-CrashedRuns {
       $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
       Write-Log WARN $m
       Write-Evt 2011 Warning $m
-      Raise-SysSentryAlert $m
+      Raise-Alert $m
       # reported=true is written LAST and is what turns a claim into a finished report: if we die
       # before this, the marker stays unreported and a later run retakes it rather than losing it.
       # Written through the locked handle — a temp-file-and-rename publish cannot replace a file we
@@ -495,9 +496,19 @@ function Report-CrashedRuns {
   }
 }
 
-function Raise-SysSentryAlert { param($Msg)
-  if (-not (Test-Path $SysSentryAlerts)) { return }
-  try { "- **{0:yyyy-MM-dd HH:mm}** `[$($Name.ToUpper())`] {1}" -f (Get-Date), $Msg | Add-Content $SysSentryAlerts } catch {}
+# SunUp's own voice. Until v0.19.0 this appended to SysSentry's ALERTS.md and rode that tool's
+# notifier; SysSentry is retired, and an update manager should not need a second product installed
+# to tell its user something. Queue + fire-and-forget task start; the QUEUE is the delivery
+# contract (Show-AlertToast.ps1 drains it, AtLogon catches a signed-out gap), so a dropped start
+# here is harmless and a notification problem can never break the run.
+function Raise-Alert { param($Msg)
+  try {
+    $dir = Split-Path $AlertsQueue
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    ([pscustomobject]@{ ts = (Get-Date).ToString('o'); src = 'engine'; msg = "$Msg" } |
+      ConvertTo-Json -Compress) | Add-Content -Path $AlertsQueue -Encoding UTF8
+  } catch {}
+  try { Start-ScheduledTask -TaskName $AlertsTask -ErrorAction Stop } catch {}
 }
 
 # ---- per-day stamp ----------------------------------------------------------
@@ -1511,7 +1522,7 @@ if ($rebootPending -and -not $willReboot) {
       $why = if ($rebootState.Labels.Count) { ' (' + ($rebootState.Labels -join ', ') + ')' } else { '' }
       $m = ("Reboot has been pending {0:N1} days but no run required it" -f $ageDays) + $why +
            " (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient."
-      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-SysSentryAlert $m
+      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-Alert $m
       $pendingAlerted = $true
     }
   }
@@ -1542,7 +1553,7 @@ Add-Report "- Summary: $summary; rebootPending=$rebootPending; rebootAction=$($r
 if ($errors.Count -gt 0) {
   $msg = "$Name run $runStamp finished with errors: " + (($errors | ForEach-Object { $_.name }) -join ', ') + ". Drill in: $Name.ps1 -Mode Errors"
   Write-Evt 2010 Warning $msg
-  Raise-SysSentryAlert $msg
+  Raise-Alert $msg
 } elseif ($warns.Count -gt 0) {
   # A warn is a component that did LESS than it was asked to — an incomplete winget upgrade list, a
   # package the handoff failed to upgrade. Logging event 2001 "clean" for those made a partly blocked
@@ -1657,22 +1668,22 @@ elseif ($willReboot) {
 }
 elseif ($rebootDeferredByBlocker) {
   # The restart the policy called for is NOT happening this run. Say so everywhere a human
-  # might look — log, event log, SysSentry toast — because a deferred reboot that nobody
+  # might look — log, event log, alert toast — because a deferred reboot that nobody
   # hears about is just a reboot that happens later, still on top of someone's session.
   $blkList = $rebootBlockers -join ', '
   Write-Log INFO "Reboot required but DEFERRED — blocker process(es) running: $blkList. Restart manually when they are done; the pending-reboot watchdog keeps score."
   Write-Evt 2012 Warning "${Name}: restart required but deferred — $blkList is running. Restart when your session is done."
-  Raise-SysSentryAlert "Restart required but deferred — $blkList is running. Finish or close the session(s), then restart when convenient."
+  Raise-Alert "Restart required but deferred — $blkList is running. Finish or close the session(s), then restart when convenient."
 }
 elseif ($rebootPending) {
   # An OS pending flag is set but we're not rebooting. Two very different cases:
   if ("$($cfg.rebootPolicy)" -eq 'never') {
     # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge.
     Write-Log INFO 'Reboot pending but rebootPolicy=never — leaving box up.'
-    Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+    Raise-Alert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
   } else {
     # ifRequired: the flag is set (e.g. a PnP driver's PendingFileRename) but no component this run
-    # demanded a reboot. That's benign background state — note it, don't nag SysSentry every day.
+    # demanded a reboot. That's benign background state — note it, don't raise a daily nag toast.
     Write-Log INFO 'OS reboot-pending flag set, but no component this run required a reboot (rebootPolicy=ifRequired) — not rebooting.'
   }
 }
@@ -1782,11 +1793,11 @@ if (@($script:SelfHostPending).Count -gt 0) {
         # The start was a no-op, so nothing was handed anywhere — say that, instead of logging a
         # handoff and raising 2020 for an upgrade that will never happen.
         $m = "self-host: $SelfHostTask did NOT start — $($shStart.reason). $($shIds -join ', ') left for the next run."
-        Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+        Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-Alert $m
       }
     } catch {
       $m = "self-host: could not start ${SelfHostTask}: $_ — $($shIds -join ', ') left for the next run."
-      Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+      Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-Alert $m
     }
   }
 }

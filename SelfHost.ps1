@@ -112,14 +112,19 @@ function Write-Evt {
   param([int]$Id, [string]$Type, [string]$Msg)
   try { Write-EventLog -LogName Application -Source $EvtSource -EventId $Id -EntryType $Type -Message $Msg -ErrorAction Stop } catch {}
 }
-function Raise-SysSentryAlert {
+function Raise-Alert {
   param([string]$Msg)
-  $f = 'C:\ProgramData\SysSentry\ALERTS.md'
-  if (-not (Test-Path (Split-Path $f))) { return }
-  # Same "- **<ts>** [CAT] <msg>" shape as every other ALERTS.md writer. The old bare
-  # "- <ts> SunUp: <msg>" line parsed as category ALERT, so the toast said "SysSentry: ALERT"
-  # with no hint of who raised it, and the entry sat un-bolded in a file of bolded entries.
-  try { Add-Content -Path $f -Value ('- **{0}** [SUNUP] {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm'), $Msg) -Encoding UTF8 } catch {}
+  # SunUp's own toast queue (SysSentry retired 2026-08-15; see the engine's Raise-Alert). Kept
+  # self-contained like everything else in this file: the queue path and task name are duplicated
+  # from the engine on purpose and must be kept in sync by hand.
+  $q = 'C:\ProgramData\SunUp\notify\alerts.jsonl'
+  try {
+    $dir = Split-Path $q
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    (New-Object psobject -Property ([ordered]@{ ts = (Get-Date).ToString('o'); src = $Label; msg = "$Msg" }) |
+      ConvertTo-Json -Compress) | Add-Content -Path $q -Encoding UTF8
+  } catch {}
+  try { Start-ScheduledTask -TaskName 'SunUp-Alerts' -ErrorAction Stop } catch {}
 }
 # Did winget get far enough that a retry would rerun a PARTIAL install? The retry below drops
 # REBOOT=ReallySuppress, so it must fire ONLY when winget rejected that argument outright, before
@@ -211,7 +216,7 @@ if ($blockersNow.Count -gt 0) {
   $blkList = $blockersNow -join ', '
   Write-Both 'INFO' ("DEFERRED: blocker process(es) running ({0}) -- upgrading {1} would let Restart Manager kill them. Nothing attempted; the next run retries." -f $blkList, ($IdList -join ', '))
   Write-Evt 2022 'Information' ("SunUp {0}: upgrade of {1} deferred -- {2} is running. Close or finish the session(s) and the next run will upgrade." -f $Label, ($IdList -join ', '), $blkList)
-  Raise-SysSentryAlert ("Upgrade of {0} deferred -- {1} is running. Finish or close the session(s); tomorrow's run retries." -f ($IdList -join ', '), $blkList)
+  Raise-Alert ("Upgrade of {0} deferred -- {1} is running. Finish or close the session(s); tomorrow's run retries." -f ($IdList -join ', '), $blkList)
   $payload = [ordered]@{
     finishedLocal  = (Get-Date).ToString('o')
     ids            = $IdList
@@ -397,7 +402,7 @@ if (-not (Publish-Json $payload $SelfJson)) {
 if ($fail -gt 0) {
   $m = "SunUp $Label upgrade: $ok ok, $fail failed ($($IdList -join ', ')). See $SelfLog"
   Write-Evt 2021 'Warning' $m
-  Raise-SysSentryAlert $m
+  Raise-Alert $m
 } else {
   Write-Evt 2020 'Information' "SunUp $Label upgrade: $ok upgraded ($($IdList -join ', '))."
 }

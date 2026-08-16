@@ -23,7 +23,7 @@ Check 'SunUp.ps1 parses with no errors' ($errs.Count -eq 0) ($errs | Out-String)
 # Every script that ships. A syntax error in one of these is invisible until the task that runs it
 # fails silently in production -- UserScope.ps1 and Uninstall.ps1 had no parse coverage at all.
 $repoRoot = Split-Path $PSScriptRoot -Parent
-foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1') {
+foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1','Show-AlertToast.ps1') {
   $p = Join-Path $repoRoot $f
   $e = $null
   if (Test-Path $p) {
@@ -65,7 +65,7 @@ $script:logged = @(); $script:events = @(); $script:alerts = @()
 function Write-Log { param($Level, $Msg) $script:logged += "$Level|$Msg" }
 function Write-Evt { param([int]$Id, [string]$Type = 'Information', [string]$Msg) $script:events += $Id }
 $script:claimedAtAlert = @()
-function Raise-SysSentryAlert { param($Msg)
+function Raise-Alert { param($Msg)
   $script:alerts += $Msg
   # A report must be CLAIMED (incomplete.json created) before it is emitted, or two concurrent
   # scanners would both alert on the same dead run. Record what was true at alert time.
@@ -134,7 +134,7 @@ Check 'flags the dead runs (incl. recycled-PID marker), not the peer' ($script:e
 Check 'never flags a concurrent run that is still working' (-not ($script:alerts -match 'peer')) ($script:alerts -join ' | ')
 Check 'no incomplete.json written for the live peer' (-not (Test-Path (Join-Path $RunsDir 'peer\incomplete.json')))
 Check 'uses event id 2011' (($script:events | Sort-Object -Unique) -join ',' -eq '2011')
-Check 'raises a SysSentry alert per dead run' ($script:alerts.Count -eq 3)
+Check 'raises an alert per dead run' ($script:alerts.Count -eq 3)
 Check 'ignores the finished run' (-not ($script:alerts -match 'good'))
 Check 'ignores the run dir with no run.log' (-not ($script:alerts -match 'empty'))
 Check 'never flags the live run dir' (-not ($script:alerts -match 'live'))
@@ -1045,7 +1045,9 @@ function Get-ToastTexts { param($Xml) @($Xml.toast.visual.binding.SelectNodes('t
 
 # The toast host runs under 5.1 because WinRT has no projection in .NET Core. Same ASCII trap as
 # SelfHost.ps1, and the same consequence: a task that dies at parse time, silently.
-foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}) {
+$alertToastSrc  = Join-Path $repoRoot 'Show-AlertToast.ps1'
+$alertToastText = Get-Content $alertToastSrc -Raw
+foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}, @{n='Show-AlertToast.ps1'; p=$alertToastSrc; t=$alertToastText}) {
   $na = @($f.t.ToCharArray() | Where-Object { [int]$_ -gt 127 })
   Check "  $($f.n) is pure ASCII" ($na.Count -eq 0) "$($na.Count) non-ASCII char(s)"
   $r = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "

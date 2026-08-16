@@ -546,12 +546,11 @@ function Invoke-RestartNow {
       Write-ToastLog WARN "restart DEFERRED at countdown expiry: blocker process(es) running: $blkList"
       Hide-RestartToast
       [void](Show-DeferredToast $blkList)
+      # History only, no queue: this process just showed its own deferred toast, and queueing
+      # would have Show-AlertToast.ps1 repeat it.
       try {
-        $f = 'C:\ProgramData\SysSentry\ALERTS.md'
-        if (Test-Path (Split-Path $f)) {
-          ('- **{0:yyyy-MM-dd HH:mm}** [SUNUP] Restart countdown expired but stood down - {1} is running. Restart when the session is done.' -f (Get-Date), $blkList) |
-            Add-Content -Path $f -Encoding UTF8
-        }
+        ('- **{0:yyyy-MM-dd HH:mm}** [restart-toast] Restart countdown expired but stood down - {1} is running. Restart when the session is done.' -f (Get-Date), $blkList) |
+          Add-Content -Path 'C:\ProgramData\SunUp\notify\alerts-history.md' -Encoding UTF8
       } catch {}
       return $true
     }
