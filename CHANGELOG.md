@@ -2,6 +2,66 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.18.0] - 2026-08-15
+
+### Added — unattended restarts stand down for blocker processes
+
+On 2026-08-15 08:01 the self-host pass upgraded PowerShell 7.6.5 while two live Claude Code
+sessions sat in terminal pwsh tabs; Restart Manager closed both mid-conversation. No reboot was
+even involved — but the incident made the adjacent gap obvious: under `rebootPolicy=ifRequired`
+with a user logged in, the only thing between a required reboot and those same sessions was a
+300-second countdown that nobody away from the desk would ever see.
+
+A restart now distinguishes *approved* from *merely unopposed*. `Get-RebootBlockers`
+(RebootState.ps1, shared; config key `rebootBlockProcesses`, default `claude`) is consulted at
+three places:
+
+- **the engine's reboot decision** — a policy-allowed reboot with a blocker running becomes
+  `rebootAction=deferred-blocker`: no countdown is armed, event 2012 is written, and a
+  `[SUNUP]` alert tells the human a restart is waiting on them;
+- **the restart toast at countdown expiry** — the moment of truth re-checks, because the
+  engine's check ran minutes earlier and a session may have started since. On a hit the
+  countdown toast is replaced by a plain "Restart deferred" toast (no Restart button: the
+  process showing it is about to exit, so the button's command file would have no reader);
+- **the summary dialog at countdown expiry** — same stand-down, same alert line.
+
+`user-clicked` restarts skip all three checks on purpose: the human pressing "Restart now"
+owns the sessions the list exists to protect. Known limit: a deferred *run-signal* reboot
+(one that sets no OS flag) survives only as the alert and event — the stale-pending watchdog
+tracks OS-flagged states only.
+
+### Added — SelfHost defers self-hosting upgrades while a blocker runs
+
+Disabling Restart Manager from inside the pass measurably does not work (v0.11.0, removed
+v0.12.0), so the only real protection for processes RM would close is to not run the installer
+while they exist. After its engine/user-pass waits, `SelfHost.ps1` now checks the blocker list
+and, on a hit, records the whole handoff as **deferred** (`selfhost.json` gains a `deferred`
+field; ok=0, failed=0), writes event 2022 and a `[SUNUP]` alert, and exits 0. The engine hands
+the packages off again next run. Deferred is not failed: yesterday's "0 ok, 1 failed" toast
+for an upgrade that was going to kill two sessions was wrong twice over.
+
+The blocker default is duplicated in SelfHost by design (the script is self-contained,
+5.1-only, ASCII-only); the comment at both sites says to keep them in sync by hand.
+
+### Fixed — the mutex-race loser no longer reports the peer's success as its own failure
+
+Both scopes' handoffs can carry `Microsoft.PowerShell`. On 2026-08-15 the user pass won the
+winget lock and installed 7.6.5 (exit 0, 129s); the SYSTEM pass then ran, found nothing to do,
+got `0x8A15002B` ("No applicable update found"), retried without `--custom`, got it again, and
+recorded **FAILED** — event 2021, a failure toast, and a `selfhost.log` that says an upgrade
+failed on the very run where it succeeded. `0x8A15002B` is now a benign no-op ("already up to
+date -- a peer pass likely upgraded it first"): counted as ok, never retried, never alerted.
+
+Note recorded while verifying the fix: PowerShell parses 32-bit hex literals by bit pattern
+into negative Int32s (`0x8A150077` *is* `-1978335113`), so the existing `-contains
+$LASTEXITCODE` comparisons were always correct. Do not "fix" them with unsigned conversions.
+
+### Fixed — SelfHost's ALERTS.md lines now use the shared format
+
+`SelfHost.ps1` wrote `- <ts> SunUp: <msg>` — un-bolded, un-categorised — so SysSentry's parser
+filed it under the fallback category and the toast said "SysSentry: ALERT" with no hint of the
+source. It now writes the same `- **<ts>** [SUNUP] <msg>` shape as the engine.
+
 ## [0.17.1] - 2026-08-12
 
 ### Fixed — the installer force-killed any PowerShell that merely mentioned the tray script

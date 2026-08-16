@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.17.1'
+$script:Version = '0.18.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -149,6 +149,16 @@ else {
     if (-not $Sources) { return @() }
     @($Sources | Where-Object { @('cbs','cbsInProgress','cbsPackages','windowsUpdate','wuPostReboot') -contains $_ })
   }
+  # Same fallback duty as the timestamp helpers: the reboot decision now calls this
+  # unconditionally, so a stale bin without it must degrade, not die. Mirrors the shared
+  # default (claude) rather than returning @(), because "cannot check" must not quietly
+  # become "clear to restart" — the whole point is to fail toward not interrupting.
+  function Get-RebootBlockers {
+    param([string[]]$Names = @('claude'))
+    if (-not $Names -or @($Names).Count -eq 0) { return @() }
+    @(Get-Process -Name $Names -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty ProcessName -Unique)
+  }
   function Get-RebootState {
     param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
     $src = [System.Collections.Generic.List[string]]::new()
@@ -176,6 +186,12 @@ $DefaultConfig = [ordered]@{
   # forever unnoticed. 0 disables. (Under rebootPolicy=always this never triggers — the flag clears.)
   pendingRebootAlertDays = 3
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
+  # Processes an UNATTENDED restart must never interrupt (see Get-RebootBlockers in
+  # RebootState.ps1). While any of these run, the engine defers its reboot and raises a
+  # notification instead, and an expiring countdown re-checks and stands down. A live Claude
+  # Code session is hours of conversation state; 2026-08-15 showed what "restart anyway"
+  # costs. "Restart now" clicked by a human is always honored.
+  rebootBlockProcesses = @('claude')
   keepRuns           = 30            # how many per-run log dirs to retain
   # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
   # (greyed out, below the current run); historyCollapse keeps only the latest per package so
@@ -1431,8 +1447,20 @@ $willReboot       = switch ("$($cfg.rebootPolicy)") {
   'ifRequired' { $rebootRequiredByRun }
   default      { $false }
 }
-if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
-elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
+# A restart the policy allows can still be one the box cannot afford right now: a process on
+# the blocklist (a live Claude Code session, by default) holds unsaved conversation state that
+# a reboot — or the countdown nobody is watching — would destroy. Defer, notify, and let the
+# stale-pending watchdog below keep the debt visible. The countdown paths re-check this
+# themselves; this check just avoids arming a countdown we already know must stand down.
+$rebootBlockers = @(Get-RebootBlockers -Names $cfg.rebootBlockProcesses)
+$rebootDeferredByBlocker = $false
+if ($willReboot -and $rebootBlockers.Count -gt 0) {
+  $willReboot = $false
+  $rebootDeferredByBlocker = $true
+}
+if ($willReboot)                  { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
+elseif ($rebootDeferredByBlocker) { $result.rebootAction = 'deferred-blocker' }
+elseif ($rebootPending)           { $result.rebootAction = 'suppressed' }
 
 # The marker may only be dropped once result.json is REALLY on disk. $ErrorActionPreference is
 # 'Continue', so a transient lock or I/O error would let Set-Content fail quietly — and clearing the
@@ -1626,6 +1654,15 @@ if ($willReboot -and $interactive) {
 elseif ($willReboot) {
   Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in); summary shows at next logon."
   Write-Evt 2005 Warning "${Name}: headless reboot in $($cfg.rebootDelaySeconds)s."
+}
+elseif ($rebootDeferredByBlocker) {
+  # The restart the policy called for is NOT happening this run. Say so everywhere a human
+  # might look — log, event log, SysSentry toast — because a deferred reboot that nobody
+  # hears about is just a reboot that happens later, still on top of someone's session.
+  $blkList = $rebootBlockers -join ', '
+  Write-Log INFO "Reboot required but DEFERRED — blocker process(es) running: $blkList. Restart manually when they are done; the pending-reboot watchdog keeps score."
+  Write-Evt 2012 Warning "${Name}: restart required but deferred — $blkList is running. Restart when your session is done."
+  Raise-SysSentryAlert "Restart required but deferred — $blkList is running. Finish or close the session(s), then restart when convenient."
 }
 elseif ($rebootPending) {
   # An OS pending flag is set but we're not rebooting. Two very different cases:

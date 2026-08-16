@@ -491,6 +491,23 @@ function Get-RebootConsequence {
   @($out)
 }
 
+# ---- processes a restart must not interrupt ---------------------------------
+# 2026-08-15: SunUp's 08:00 run upgraded PowerShell while two Claude Code sessions sat in
+# terminal tabs; Restart Manager closed them mid-conversation. A reboot would have done the
+# same, only worse -- so every UNATTENDED restart path (engine decision, toast countdown
+# expiry, dialog countdown expiry) now asks this first. A user clicking "Restart now" is not
+# unattended and is never blocked: the person who owns those sessions is the one clicking.
+#
+# Returns the DISPLAY NAMES of blocker processes currently running (empty array = clear to
+# restart). $Names comes from config (rebootBlockProcesses) where config is loaded; callers
+# without config use the default, which must therefore stay in sync with $DefaultConfig.
+function Get-RebootBlockers {
+  param([string[]]$Names = @('claude'))
+  if (-not $Names -or @($Names).Count -eq 0) { return @() }
+  @(Get-Process -Name $Names -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty ProcessName -Unique)
+}
+
 # ---- the verdict ------------------------------------------------------------
 # Returns a structured state rather than a boolean:
 #   Required   [bool]   a restart is genuinely outstanding

@@ -116,7 +116,10 @@ function Raise-SysSentryAlert {
   param([string]$Msg)
   $f = 'C:\ProgramData\SysSentry\ALERTS.md'
   if (-not (Test-Path (Split-Path $f))) { return }
-  try { Add-Content -Path $f -Value ('- {0} SunUp: {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm'), $Msg) -Encoding UTF8 } catch {}
+  # Same "- **<ts>** [CAT] <msg>" shape as every other ALERTS.md writer. The old bare
+  # "- <ts> SunUp: <msg>" line parsed as category ALERT, so the toast said "SysSentry: ALERT"
+  # with no hint of who raised it, and the entry sat un-bolded in a file of bolded entries.
+  try { Add-Content -Path $f -Value ('- **{0}** [SUNUP] {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm'), $Msg) -Encoding UTF8 } catch {}
 }
 # Did winget get far enough that a retry would rerun a PARTIAL install? The retry below drops
 # REBOOT=ReallySuppress, so it must fire ONLY when winget rejected that argument outright, before
@@ -193,6 +196,38 @@ if ($WaitForTask) {
   }
 }
 
+# ---- stand down while a blocker process is running --------------------------
+# 2026-08-15: this pass upgraded Microsoft.PowerShell while two Claude Code sessions sat in
+# terminal pwsh tabs, and the MSI's Restart Manager closed both mid-conversation. Disabling
+# RM from here measurably does not work (v0.11.0 passed MSIRESTARTMANAGERCONTROL=Disable via
+# --custom; RM killed processes anyway; removed in v0.12.0) -- so the only real protection is
+# to not run the installer while a session exists. Deferred, NOT failed: the engine hands
+# these packages off again on its next run, and the alert tells the human what is waiting.
+# The name list mirrors rebootBlockProcesses / Get-RebootBlockers (RebootState.ps1); this
+# script stays self-contained by design, so keep the two defaults in sync by hand.
+$blockersNow = @(Get-Process -Name @('claude') -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty ProcessName -Unique)
+if ($blockersNow.Count -gt 0) {
+  $blkList = $blockersNow -join ', '
+  Write-Both 'INFO' ("DEFERRED: blocker process(es) running ({0}) -- upgrading {1} would let Restart Manager kill them. Nothing attempted; the next run retries." -f $blkList, ($IdList -join ', '))
+  Write-Evt 2022 'Information' ("SunUp {0}: upgrade of {1} deferred -- {2} is running. Close or finish the session(s) and the next run will upgrade." -f $Label, ($IdList -join ', '), $blkList)
+  Raise-SysSentryAlert ("Upgrade of {0} deferred -- {1} is running. Finish or close the session(s); tomorrow's run retries." -f ($IdList -join ', '), $blkList)
+  $payload = [ordered]@{
+    finishedLocal  = (Get-Date).ToString('o')
+    ids            = $IdList
+    ok             = 0
+    failed         = 0
+    deferred       = $IdList
+    rebootRequired = $false
+    results        = @()
+  }
+  if (-not (Publish-Json $payload $SelfJson)) {
+    Write-Both 'WARN' ("could not write {0} -- this pass's results will not reach the next engine run" -f $SelfJson)
+  }
+  if ($TaskName -and -not $NoTask) { try { & schtasks.exe /delete /tn $TaskName /f | Out-Null } catch {} }
+  exit 0
+}
+
 $winget = Resolve-Winget
 $results = @()
 $rebootRequired = $false
@@ -203,7 +238,16 @@ if (-not $winget) {
   Write-Evt 2021 'Warning' 'SunUp self-host upgrade: winget not found.'
 } else {
   # Exit codes that mean "installed OK, but a reboot is needed" (MSI 3010 + winget's own).
+  # These hex literals compare correctly against $LASTEXITCODE as-is: PowerShell parses a
+  # 32-bit hex literal by BIT PATTERN into a negative Int32 (0x8A150077 IS -1978335113),
+  # exactly what GetExitCodeProcess hands back. Verified 2026-08-15; do not "fix" this with
+  # unsigned conversions.
   $rebootCodes = @(3010, 0x8A150077, 0x8A150078, 0x8A150079)
+  # "No applicable update found." Benign by construction: winget looked and had nothing to do,
+  # usually because the OTHER scope's pass won the mutex race and upgraded first (measured
+  # 2026-08-15: the user pass installed PowerShell 7.6.5 at 08:03:13, the SYSTEM pass then got
+  # 0x8A15002B and recorded a FAILED that toasted the user with a failure that never happened).
+  $benignCodes = @(0x8A15002B)
 
   # One SunUp winget pass at a time, machine-wide. The SYSTEM handoff and the interactive user's
   # handoff are this same script under two different principals, and winget refuses to run two
@@ -292,7 +336,7 @@ elseif ($winget) {
       }
       $txt = $out | Out-String
 
-      if ($launched -and $code -ne 0 -and ($rebootCodes -notcontains $code) -and -not (Test-InstallStarted $txt)) {
+      if ($launched -and $code -ne 0 -and ($rebootCodes -notcontains $code) -and ($benignCodes -notcontains $code) -and -not (Test-InstallStarted $txt)) {
         Write-Both 'WARN' ("{0} exited 0x{1:X8} before installing anything -- retrying without --custom" -f $id, $code)
         Write-Raw '--- retry without installer args ---'
         try {
@@ -311,11 +355,13 @@ elseif ($winget) {
       if ($launched) { Write-Raw ("exit: 0x{0:X8}, {1}s" -f $code, [int]$sw.Elapsed.TotalSeconds) }
       else           { Write-Raw ("NOT LAUNCHED, {0}s" -f [int]$sw.Elapsed.TotalSeconds) }
 
-      $isOk = ($launched -and ($code -eq 0 -or ($rebootCodes -contains $code)))
+      $isBenign = ($launched -and ($benignCodes -contains $code))
+      $isOk = ($launched -and ($code -eq 0 -or ($rebootCodes -contains $code) -or $isBenign))
       if ($isOk) {
         $ok++
         if ($rebootCodes -contains $code) { $rebootRequired = $true }
-        Write-Both 'INFO' ("{0} upgraded (exit 0x{1:X8}, {2}s)" -f $id, $code, [int]$sw.Elapsed.TotalSeconds)
+        if ($isBenign) { Write-Both 'INFO' ("{0} already up to date (exit 0x{1:X8}) -- nothing to install; a peer pass likely upgraded it first" -f $id, $code) }
+        else           { Write-Both 'INFO' ("{0} upgraded (exit 0x{1:X8}, {2}s)" -f $id, $code, [int]$sw.Elapsed.TotalSeconds) }
       } else {
         $fail++
         if ($launched) { Write-Both 'WARN' ("{0} FAILED (exit 0x{1:X8}) -- see {2}" -f $id, $code, $SelfLog) }
