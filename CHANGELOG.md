@@ -2,6 +2,64 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.19.1] - 2026-08-17
+
+### Fixed — the stale-reboot watchdog fired again, on the same signal, three releases after it was tamed
+
+At 08:01 on 2026-08-17 the alert toast read: *"Reboot has been pending 3.0 days but no run
+required it (File replacement) (rebootPolicy=ifRequired) — reboot when convenient."* Nothing on
+the box needed a restart. The 81 `PendingFileRenameOperations` entries behind "File replacement"
+were, in full: 78 `C:\Config.Msi\*.rbf` Windows Installer **rollback backups** — journals kept so
+a *failed* install can be undone, orphaned precisely because their installs had **committed** —
+plus two superseded `EdgeUpdate` version directories, a Visual Studio bootstrapper JSON, and
+Chrome's `old_chrome.exe`. Every one a bare delete. Not one rename.
+
+v0.16.0 established that PFRO's mere existence is not a reboot signal, but its classifier kept a
+residual fail-open: a delete **outside a temp directory** still counted. `C:\Config.Msi` is not a
+temp directory, so the same false positive walked straight back in through the residue — and
+latched, because the watchdog alerts once.
+
+The rule is now the mechanism, not the path:
+
+- An entry with an **empty destination** is `MoveFileEx(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`:
+  "unlink this at boot, it is locked now." That reports an open handle. It never reports a
+  half-configured system — wherever the file lives, which is exactly the thing a path list could
+  not distinguish. `C:\Config.Msi` was only ever going to be the next entry on a list with no
+  principled end. Deletes are dismissed, all of them.
+- A rename **into** a destination is a file being put in place. Still significant, always — it is
+  the only shape in the value that a restart is required to complete.
+- Dismissing deletes is safe because a genuine servicing hold never depended on this classifier:
+  CBS and Windows Update set their own registry keys, and all five are read directly. PFRO is the
+  proxy people consult when they are *not* reading those keys. A dismissed delete can therefore
+  never cost SunUp a servicing reboot — only a false one, which is the entire observed failure
+  history of this signal (2026-08-04, 2026-08-17).
+- Dismissed entries are still counted and now **classified** in `rebootIgnored` — *"94 files are
+  queued for deletion at the next boot (78 MSI rollback backups, 10 temp files, 5 updater
+  leftovers, 1 other locked file)"* — so a misclassification is a checkable claim, not a bare
+  number under a description ("under a temp directory") that had stopped being true.
+
+### Fixed — the watchdog alert now says something a person can act on
+
+The old sentence failed its reader in every clause, and that one sentence being read is the whole
+reason the watchdog exists:
+
+- **"3.0 days"** put a tenth of precision on a number that is a guess about when a signal first
+  became observable. Now whole days — and hours below one day, so a short
+  `pendingRebootAlertDays` cannot render every alert as "0 days".
+- It **led with the negative.** "No run required it" answers a question nobody asked and provokes
+  the only one they do — *then why is it pending?* The answer was already in hand
+  (`$rebootState.Labels`) and sat parenthesised behind the non-answer. The signal now leads.
+- **"(rebootPolicy=ifRequired)"** pasted a config key into a desktop toast: it names a setting
+  without stating its consequence, and the consequence is the entire point — nobody but the
+  reader is going to restart this box. The alert now derives *who is not acting, and why* from
+  what actually happened this run (a blocker deferral reaches this same path under any policy):
+
+> Restart pending 3 days — Windows servicing. SunUp restarts only for updates it installs itself,
+> and none of those asked, so this one is yours: restart when convenient.
+
+The `rebootPolicy=never` nudge got the same treatment. Config keys stay in the log, where the
+reader is someone debugging SunUp; the test suite now asserts no `Raise-Alert` line quotes one.
+
 ## [0.19.0] - 2026-08-15
 
 ### Added — SunUp speaks for itself: native alert toasts, no SysSentry

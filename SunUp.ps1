@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.19.0'
+$script:Version = '0.19.1'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -1517,11 +1517,35 @@ if ($rebootPending -and -not $willReboot) {
     $since   = ConvertTo-UtcTime $pendingSince
     $ageDays = if ($since) { ((Get-Date).ToUniversalTime() - $since).TotalDays } else { 0 }
     if ($ageDays -ge $alertDays) {
-      # Name what is asking. "A reboot is pending" with no attribution is what made the old alert
-      # impossible to act on: there was no way to tell a real servicing hold from a false positive.
-      $why = if ($rebootState.Labels.Count) { ' (' + ($rebootState.Labels -join ', ') + ')' } else { '' }
-      $m = ("Reboot has been pending {0:N1} days but no run required it" -f $ageDays) + $why +
-           " (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient."
+      # This sentence is the only thing most people will ever read about a pending restart, and
+      # every clause of the old one failed a reader who had not read the source:
+      #
+      #   "Reboot has been pending 3.0 days but no run required it (File replacement)
+      #    (rebootPolicy=ifRequired) - reboot when convenient."
+      #
+      #   * "3.0 days" spelled a tenth of precision onto a number that is a guess about when a
+      #     signal first became observable. Whole days -- and hours below one, so a short
+      #     pendingRebootAlertDays does not render every alert as "0 days".
+      #   * It LED with the negative. "no run required it" answers a question nobody asked and
+      #     provokes the only one they do: then why is it pending? The answer was already in hand
+      #     ($rebootState.Labels) and got parenthesised behind the non-answer.
+      #   * "(rebootPolicy=ifRequired)" is a config KEY pasted into a desktop toast. It names the
+      #     setting without stating its consequence, and the consequence is the entire point:
+      #     nobody but the reader is going to restart this box. Say that instead, and derive it
+      #     from what actually happened this run rather than from the policy name alone -- a
+      #     blocker deferral reaches this same code path under any policy.
+      $age = if ($ageDays -lt 1)      { "{0:N0} hours" -f [math]::Floor($ageDays * 24) }
+             elseif ($ageDays -lt 2)  { '1 day' }
+             else                     { "{0:N0} days" -f [math]::Floor($ageDays) }
+      $what = if ($rebootState.Labels.Count) { $rebootState.Labels -join ', ' } else { 'reason unknown' }
+      $who  = if ($rebootDeferredByBlocker) {
+                "SunUp is holding its own restart back while $($rebootBlockers -join ', ') is running"
+              } elseif ("$($cfg.rebootPolicy)" -eq 'ifRequired') {
+                'SunUp restarts only for updates it installs itself, and none of those asked'
+              } else {
+                'SunUp is set never to restart this box on its own'
+              }
+      $m = "Restart pending $age — $what. $who, so this one is yours: restart when convenient."
       Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-Alert $m
       $pendingAlerted = $true
     }
@@ -1678,12 +1702,17 @@ elseif ($rebootDeferredByBlocker) {
 elseif ($rebootPending) {
   # An OS pending flag is set but we're not rebooting. Two very different cases:
   if ("$($cfg.rebootPolicy)" -eq 'never') {
-    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge.
+    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge. Same rule
+    # as the watchdog alert above: the toast names what is asking and what SunUp will not do, in
+    # English. "rebootPolicy=never" stays in the log, where the reader is someone debugging SunUp,
+    # and goes nowhere near a desktop notification, where it names a setting without its consequence.
+    $whatPending = if ($rebootState.Labels.Count) { $rebootState.Labels -join ', ' } else { 'reason unknown' }
     Write-Log INFO 'Reboot pending but rebootPolicy=never — leaving box up.'
-    Raise-Alert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+    Raise-Alert "Restart pending — $whatPending. SunUp is set never to restart this box on its own, so this one is yours: restart when convenient."
   } else {
-    # ifRequired: the flag is set (e.g. a PnP driver's PendingFileRename) but no component this run
-    # demanded a reboot. That's benign background state — note it, don't raise a daily nag toast.
+    # ifRequired: the flag is set but no component this run demanded a reboot. That is benign
+    # background state — note it, don't raise a daily nag toast. The stale-pending watchdog above is
+    # what escalates it, once, if it is still there after pendingRebootAlertDays.
     Write-Log INFO 'OS reboot-pending flag set, but no component this run required a reboot (rebootPolicy=ifRequired) — not rebooting.'
   }
 }

@@ -261,6 +261,10 @@ function ConvertFrom-PfroValue {
 # Matched by PATTERN, not against $env:TEMP: the engine runs as SYSTEM (whose TEMP is
 # C:\Windows\TEMP) but the entries that matter here are usually under some *interactive* user's
 # profile, which SYSTEM's environment knows nothing about.
+#
+# As of v0.19.1 nothing DECIDES on this -- see Test-PfroEntrySignificant. It survives because
+# Get-PfroCleanupClass uses it to describe a dismissed entry in the audit line, and a wrong answer
+# there costs a slightly vaguer sentence rather than a false restart alert.
 function Test-PfroTempPath {
   param([string]$Path)
   if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -272,16 +276,50 @@ function Test-PfroTempPath {
   $false
 }
 
+# Names the KIND of housekeeping a dismissed delete represents, for the audit line only. Nothing
+# branches on the answer, so an unrecognised path simply reads as 'other locked files' -- which is
+# both true and the whole point: the class is a courtesy to the reader, not an input to a decision.
+function Get-PfroCleanupClass {
+  param([string]$Path)
+  $p = "$Path".Replace('/', '\')
+  if (Test-PfroTempPath $p) { return 'temp files' }
+  # Config.Msi holds .rbf/.rbs rollback journals. Windows Installer writes them so a FAILED install
+  # can be undone; once the install commits they are dead weight, and the ones it could not unlink
+  # (still mapped) get queued here. Their presence means an install SUCCEEDED -- the exact opposite
+  # of the half-configured state a restart would be needed to finish.
+  if ($p -match '(?i)^[a-z]:\\config\.msi\\') { return 'MSI rollback backups' }
+  if ($p -match '(?i)\\(edgeupdate|googleupdate|chrome\\temp|_bootstrapper)\\') { return 'updater leftovers' }
+  'other locked files'
+}
+
 # Does this one pair represent work that a restart is genuinely required to complete?
-# Fails OPEN on purpose: an unrecognised entry counts as significant. A spurious sunset icon costs a
-# glance; a missed servicing reboot leaves the box half-patched.
+#
+# Only a RENAME does. v0.16.0 got the first half of this right -- PFRO's mere existence is not a
+# reboot signal -- but it kept failing open on any delete outside a temp directory, and on
+# 2026-08-17 that fired the stale-reboot watchdog on this box for the SECOND time. The 81 entries
+# it called "File replacement" were 78 C:\Config.Msi\*.rbf rollback backups from installs that had
+# already committed, two superseded EdgeUpdate version directories, a Visual Studio bootstrapper
+# JSON and Chrome's old_chrome.exe. Not one rename among them. Nothing on the box was half-installed.
+#
+# So the rule is now the MECHANISM rather than a path heuristic. An entry with an empty destination
+# is MoveFileEx(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT): "unlink this at boot, it is locked now".
+# That says a file is still open. It never says the system is half-configured -- wherever the file
+# lives, which is exactly what the path could not distinguish. C:\Config.Msi was only ever going to
+# be the next entry on a list that had no principled end.
+#
+# This is NOT the fail-open being abandoned; it is fail-open moved to where it carries information.
+#   * A rename INTO a destination is a file being put in place. Still significant, always, and it
+#     is the only shape in this value that a restart is required to complete.
+#   * A genuine servicing hold never depended on this function anyway. CBS and Windows Update both
+#     set their own registry keys -- all five of which $script:SunUpRebootKeys reads DIRECTLY. PFRO
+#     is the PROXY people check when they are not reading those keys. SunUp reads them, so a
+#     dismissed delete cannot cost it a servicing reboot. It can only cost it a false one, which is
+#     the entire observed failure history of this signal: 2026-08-04, and again 2026-08-17.
+# Dismissed entries are not silently dropped -- Get-RebootState reports them, classified and
+# counted, under Advisory, which is what makes a misclassification visible rather than lost.
 function Test-PfroEntrySignificant {
   param($Entry)
-  # A rename INTO a destination is a file being put in place -- that is what servicing looks like.
-  if (-not [string]::IsNullOrWhiteSpace($Entry.Destination)) { return $true }
-  # A pure delete out of a scratch directory is an app cleaning up after itself.
-  if (Test-PfroTempPath $Entry.Source) { return $false }
-  $true
+  -not [string]::IsNullOrWhiteSpace($Entry.Destination)
 }
 
 function Get-PfroEntries {
@@ -568,14 +606,26 @@ function Get-RebootState {
     if ($significant.Count -gt 0) {
       $sources.Add('pendingRename')
       if (-not $labels.Contains('File replacement')) { $labels.Add('File replacement') }
-      $sample = ($significant | Select-Object -First 3 | ForEach-Object {
-        if ([string]::IsNullOrWhiteSpace($_.Destination)) { "delete $($_.Source)" } else { "$($_.Source) -> $($_.Destination)" } }) -join '; '
+      $sample = ($significant | Select-Object -First 3 | ForEach-Object { "$($_.Source) -> $($_.Destination)" }) -join '; '
       $more = if ($significant.Count -gt 3) { " (+$($significant.Count - 3) more)" } else { '' }
-      $reasons.Add("$($significant.Count) file operation(s) are queued for the next boot: $sample$more")
+      $verb = if ($significant.Count -eq 1) { 'file is' } else { 'files are' }
+      $reasons.Add("$($significant.Count) $verb staged to replace in-use files at the next boot: $sample$more")
     }
-    $dismissed = $pfro.Count - $significant.Count
-    if ($dismissed -gt 0) {
-      $advisory.Add("$dismissed queued file deletion(s) under a temp directory -- application cleanup, not a restart requirement")
+    # Dismissed entries are REPORTED, not discarded. This is the half of the fail-open that survives
+    # Test-PfroEntrySignificant's narrowing: if the classification is ever wrong, the evidence is on
+    # the record in result.json and in Status output rather than gone. Name the classes and not just
+    # a count -- "9 deletions dismissed" is unauditable, "78 MSI rollback backups" is a claim the
+    # reader can check against C:\Config.Msi with one command.
+    $dismissed = @($pfro | Where-Object { -not (Test-PfroEntrySignificant $_) })
+    if ($dismissed.Count -gt 0) {
+      # Every class name is a plural noun, so a count of one gets the 's' trimmed. Petty, except
+      # that this line exists to be read by a person who is deciding whether to trust it, and
+      # "1 other locked files" is exactly the tell that nobody read the output.
+      $classes = ($dismissed | Group-Object { Get-PfroCleanupClass $_.Source } |
+                    Sort-Object Count -Descending |
+                    ForEach-Object { "$($_.Count) $(if ($_.Count -eq 1) { $_.Name -replace 's$','' } else { $_.Name })" }) -join ', '
+      $noun = if ($dismissed.Count -eq 1) { 'file is' } else { 'files are' }
+      $advisory.Add("$($dismissed.Count) $noun queued for deletion at the next boot ($classes) -- locked files being released, not a restart requirement")
     }
   }
 

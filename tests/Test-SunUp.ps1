@@ -756,30 +756,58 @@ Check 'a REG_MULTI_SZ value parses into source/destination pairs' ($pairs.Count 
 Check 'the \??\ prefix and the * / ! markers are stripped from both halves' `
       ($pairs[0].Source -eq 'C:\Users\b\AppData\Local\Temp\.abc-0.node' -and $pairs[1].Destination -eq 'C:\Windows\System32\a.dll') `
       "$($pairs[0].Source) / $($pairs[1].Destination)"
-# An odd-length value is a source with no destination element at all; smss.exe deletes it, so a
-# parser that silently dropped the unpaired tail would lose a real signal.
+# An odd-length value is a source with no destination element at all; smss.exe deletes it. The
+# parser must still yield it -- it is dismissed as a delete downstream, but it has to be COUNTED
+# and classified in the advisory line, and a silently dropped tail would be missing from both.
 $odd = ConvertFrom-PfroValue @('\??\C:\Windows\Temp\x.tmp')
 Check 'an odd-length value yields a delete, not a dropped entry' ($odd.Count -eq 1 -and $odd[0].Destination -eq '')
 
 # --- classification -----------------------------------------------------------
-# The exact entry that fired the false watchdog alert on this box.
+# v0.19.1: the rule is the MECHANISM, not the path. An empty destination is
+# MoveFileEx(path, NULL, DELAY_UNTIL_REBOOT) -- "unlink this at boot, it is locked now" -- which
+# reports an open handle, never a half-configured system. v0.16.0 dismissed those only under a temp
+# directory, and on 2026-08-17 that let 78 C:\Config.Msi\*.rbf MSI rollback backups fire the
+# stale-reboot watchdog on a box with nothing outstanding.
 Check 'a delete-on-boot under a user temp dir is NOT a reboot signal' `
       (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Users\bradley\AppData\Local\Temp\.78eefce1f7f6b7d6-0.node'; Destination='' })))
 Check 'nor is one under C:\Windows\Temp' `
       (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\Temp\tmp1234.tmp'; Destination='' })))
-# The engine runs as SYSTEM, whose TEMP is C:\Windows\TEMP. Classifying against $env:TEMP would
-# therefore miss every entry left by an interactive user -- which is all of the ones that matter.
-Check 'a temp path is recognised for ANY user, not just the one we run as' `
-      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='D:\Users\someone.else\AppData\Local\Temp\x.node'; Destination='' })))
-# ...and the signals that must still count.
+# The entries that fired the SECOND false watchdog alert on this box.
+Check 'nor is an MSI rollback backup in C:\Config.Msi (2026-08-17 false positive)' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Config.Msi\f343d4e.rbf'; Destination='' })))
+Check 'nor is a superseded updater directory outside any temp path' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files (x86)\Microsoft\EdgeUpdate\1.3.251.23'; Destination='' })))
+Check 'nor is a delete of a locked binary under Program Files' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files\Vendor\driver.sys'; Destination='' })))
+# ...and the signal that must still count. A rename is a file being PUT IN PLACE, which is the only
+# shape in this value that a restart is required to complete.
 Check 'a rename INTO a destination is a reboot signal' `
       (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\WinSxS\Temp\a.dll'; Destination='C:\Windows\System32\a.dll' }))
-Check 'a delete outside any temp directory is a reboot signal' `
-      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files\Vendor\driver.sys'; Destination='' }))
-# Fails OPEN by design: a spurious sunset icon costs a glance, a missed servicing reboot leaves the
-# box half-patched. Anything unrecognised must land on the noisy side, never the silent one.
-Check 'an unrecognisable entry counts as significant (fails open)' `
-      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='not-a-path'; Destination='' }))
+Check 'a rename is significant regardless of where the source sits' `
+      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='not-a-path'; Destination='C:\Windows\System32\a.dll' }))
+# The narrowing is safe ONLY because the authoritative servicing keys are read directly and do not
+# depend on PFRO at all. If that ever stops being true, this test fails before the false negative
+# reaches a user.
+Check 'the servicing keys that make dismissing deletes safe are still read directly' `
+      ((@($script:SunUpRebootKeys | ForEach-Object { $_.key }) -join ',') -eq 'cbs,cbsInProgress,cbsPackages,windowsUpdate,wuPostReboot') `
+      "$(@($script:SunUpRebootKeys | ForEach-Object { $_.key }) -join ',')"
+
+# --- dismissed entries stay auditable ----------------------------------------
+# Narrowing the verdict is only defensible because nothing is silently dropped: a misclassification
+# has to be visible in result.json and Status output, which means classified and counted, not a
+# bare number under a label ("under a temp directory") that stopped being true.
+Check 'a dismissed delete is classified for the audit line' `
+      ((Get-PfroCleanupClass 'C:\Config.Msi\f343d4e.rbf') -eq 'MSI rollback backups') `
+      (Get-PfroCleanupClass 'C:\Config.Msi\f343d4e.rbf')
+Check 'a temp delete still reads as temp' `
+      ((Get-PfroCleanupClass 'C:\Users\b\AppData\Local\Temp\x.node') -eq 'temp files')
+# The engine runs as SYSTEM, whose TEMP is C:\Windows\TEMP. Classifying against $env:TEMP would
+# mislabel every entry left by an interactive user -- the v0.16.0 lesson, still asserted here even
+# though only the audit line depends on it now.
+Check 'a temp path is recognised for ANY user, not just the one we run as' `
+      ((Get-PfroCleanupClass 'D:\Users\someone.else\AppData\Local\Temp\x.node') -eq 'temp files')
+Check 'an unrecognised path gets a true, vague class rather than a wrong one' `
+      ((Get-PfroCleanupClass 'C:\Program Files\Vendor\driver.sys') -eq 'other locked files')
 
 # --- the verdict --------------------------------------------------------------
 $st = Get-RebootState -RunRequired $true
@@ -809,7 +837,27 @@ Check 'the stale-reboot tracker resets when the box has booted since the last ru
       ($engineText3 -match '\$carryTracker\s*=\s*\[bool\]\(\$stamp -and \$stamp\.pendingSince -and -not \$bootedSinceLastRun\)')
 Check 'and the once-only alert latch resets with it' `
       ($engineText3 -match '\$pendingAlerted = \[bool\]\(\$carryTracker -and \$stamp\.pendingAlerted\)')
-Check 'the alert names what is asking for the restart' ($engineText3 -match '\$why = if \(\$rebootState\.Labels\.Count\)')
+# The watchdog alert is the only sentence most people will ever read about a pending restart, so
+# v0.19.1 rewrote all three of its clauses. Assert the PROPERTIES, not the wording -- these are the
+# three complaints it was rebuilt to answer.
+Check 'the alert names what is asking for the restart' `
+      ($engineText3 -match '\$what\s*=\s*if \(\$rebootState\.Labels\.Count\)')
+# "3.0 days" spelled a tenth of precision onto a value that is a guess about when a signal became
+# observable. Whole days, and hours below one so a fractional pendingRebootAlertDays cannot render
+# every alert as "0 days".
+Check 'the age is whole days, never a decimal' `
+      (($engineText3 -notmatch 'pending \{0:N1\} days') -and ($engineText3 -match '\[math\]::Floor\(\$ageDays\)'))
+Check 'and reads as hours below a day, so it is never "0 days"' `
+      ($engineText3 -match '\$ageDays -lt 1\s*\)\s*\{\s*"\{0:N0\} hours"')
+# A config KEY in a desktop toast names a setting without stating its consequence, and the
+# consequence -- nobody but the reader is going to restart this box -- is the only actionable part.
+# Derived from what happened this run, because a blocker deferral reaches this path under ANY policy.
+$policyLeaks = @($engineText3 -split "`n" | Where-Object { $_ -match 'Raise-Alert' -and $_ -match 'rebootPolicy=' })
+Check 'no rebootPolicy= config key is pasted into a user-facing alert' `
+      ($policyLeaks.Count -eq 0) "$($policyLeaks.Count) alert(s) still quote the policy key"
+Check 'the alert says who is NOT going to restart the box, blocker case included' `
+      ($engineText3 -match '\$who\s*=\s*if \(\$rebootDeferredByBlocker\)' -and
+       $engineText3 -match 'restarts only for updates it installs itself')
 Check 'the run records which signals fired, for audit' `
       ($engineText3 -match 'rebootSources\s*=\s*@\(\$rebootState\.Sources\)' -and $engineText3 -match 'rebootIgnored\s*=\s*@\(\$rebootState\.Advisory\)')
 
