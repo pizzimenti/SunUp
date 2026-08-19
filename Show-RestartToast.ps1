@@ -464,6 +464,34 @@ function Show-RestartToast {
   } catch { Write-ToastLog ERROR "Show failed: $_"; $false }
 }
 
+# The stand-down notice for a countdown that found a blocker at expiry. A PLAIN toast, no
+# countdown bindings and no Restart button: this process is about to exit, so a button whose
+# command file nothing would ever poll is a lie in UI form. Untagged on purpose -- it must
+# survive in Action Center after Hide-RestartToast removes the countdown toast by tag.
+function Show-DeferredToast {
+  param([string]$Blockers)
+  try {
+    $xml = @"
+<toast scenario="reminder">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>Restart deferred</text>
+      <text>$(ConvertTo-XmlText ("A restart is still needed, but " + $Blockers + " is running and would have been killed. Restart from the Start menu when the session is done."))</text>
+    </binding>
+  </visual>
+  <actions>
+    <action content="Dismiss" arguments="dismiss" activationType="system"/>
+  </actions>
+</toast>
+"@
+    $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $doc.LoadXml($xml)
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AumId).Show($toast)
+    $true
+  } catch { Write-ToastLog ERROR "deferred-toast show failed: $_"; $false }
+}
+
 # Silent in-place refresh. 'Failed' means the toast is gone -- the user dismissed it, or Action
 # Center dropped it -- which the caller treats as a reason to re-Show rather than to keep counting
 # down against a notification nobody can see.
@@ -505,6 +533,27 @@ function Invoke-RestartNow {
   if ($Demo -or $SelfTest) {
     Write-ToastLog INFO "demo: restart suppressed (trigger=$Trigger)"
     return $true
+  }
+  # An expired countdown is a restart NOBODY approved -- the 300s window exists precisely for
+  # the case where no one is at the desk, which is also the case where a blocker process
+  # (a live Claude Code session) is least likely to have been closed. Re-check at the moment
+  # of truth: the engine's check ran minutes ago and a session may have started since.
+  # 'user-clicked' skips this on purpose -- a human pressing "Restart now" outranks the list.
+  if ($Trigger -ne 'user-clicked') {
+    $blk = @(Get-RebootBlockers)
+    if ($blk.Count -gt 0) {
+      $blkList = $blk -join ', '
+      Write-ToastLog WARN "restart DEFERRED at countdown expiry: blocker process(es) running: $blkList"
+      Hide-RestartToast
+      [void](Show-DeferredToast $blkList)
+      # History only, no queue: this process just showed its own deferred toast, and queueing
+      # would have Show-AlertToast.ps1 repeat it.
+      try {
+        ('- **{0:yyyy-MM-dd HH:mm}** [restart-toast] Restart countdown expired but stood down - {1} is running. Restart when the session is done.' -f (Get-Date), $blkList) |
+          Add-Content -Path 'C:\ProgramData\SunUp\notify\alerts-history.md' -Encoding UTF8
+      } catch {}
+      return $true
+    }
   }
   $rec = New-RestartRecord -RunStamp $RunStamp -RequestedBy 'toast' -Trigger $Trigger -Method 'Restart-Computer'
   if (-not (Save-RestartRecord $RestartStatePath $rec)) {

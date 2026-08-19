@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 # Removes the SunUp scheduled tasks. Leaves C:\ProgramData\SunUp (logs, REPORT.md, config)
 # in place unless -Purge is given. Also best-effort removes any leftover legacy 'AutoUpdate'
-# task/dir/source (e.g. after a partial migration). Refreshes the SysSentry baseline.
+# task/dir/source (e.g. after a partial migration).
 param([switch]$Purge)
 $ErrorActionPreference = 'Continue'
 
@@ -38,19 +38,21 @@ Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'"
 # SunUp-SelfHost is a one-shot that normally self-deletes; it is listed here in case a run was
 # interrupted between registering it and its own cleanup. Stop before unregistering: a task that is
 # mid-run survives being unregistered.
-foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-User", "$Name-Restart", "$Name-SelfHost", 'AutoUpdate', 'AutoUpdate-Notify')) {
+foreach ($t in @($Name, "$Name-Notify", "$Name-Tray", "$Name-User", "$Name-Restart", "$Name-Alerts", "$Name-SelfHost", 'AutoUpdate', 'AutoUpdate-Notify')) {
   try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
   Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
 }
-Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' + '$Name-User' + '$Name-Restart' + '$Name-SelfHost' (and any legacy AutoUpdate tasks)."
+Write-Host "Unregistered tasks '$Name' + '$Name-Notify' + '$Name-Tray' + '$Name-User' + '$Name-Restart' + '$Name-Alerts' + '$Name-SelfHost' (and any legacy AutoUpdate tasks)."
 
 # The restart toast's two HKCU footprints. Both are per-user, so this removes them for the user
 # running the uninstall -- the same account Install.ps1 registered them for. Leaving the AUMID
 # behind would keep a dead "SunUp" row in Settings > Notifications, and leaving the protocol behind
 # would leave sunup: links pointing at a script that no longer exists.
 foreach ($k in @("HKCU:\Software\Classes\AppUserModelId\$Name.Restart",
+                 "HKCU:\Software\Classes\AppUserModelId\$Name.Alerts",
                  'HKCU:\Software\Classes\sunup',
-                 "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\$Name.Restart")) {
+                 "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\$Name.Restart",
+                 "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\$Name.Alerts")) {
   if (Test-Path $k) { Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Write-Host 'Removed the toast AppUserModelID, its notification settings, and the sunup: protocol handler.'
@@ -93,6 +95,4 @@ if ($Purge) {
   }
 }
 
-$sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'
-if (Test-Path $sentry) { & (Get-Command pwsh).Source -NoProfile -ExecutionPolicy Bypass -File $sentry -Mode Baseline }
 Write-Host 'Done.'
