@@ -101,6 +101,9 @@ Copy-Item (Join-Path $PSScriptRoot 'VendorProfiles.ps1')   $Bin -Force
 # needs restarting or whether it already has. Two copies of that question is what restarted this box
 # three times on 2026-08-12.
 Copy-Item (Join-Path $PSScriptRoot 'RebootState.ps1')      $Bin -Force
+# The Windows Update policy SunUp's install ownership depends on. Shipped to bin so -Mode Status can
+# report it on a deployed box, not only in a checkout.
+Copy-Item (Join-Path $PSScriptRoot 'WuPolicy.ps1')         $Bin -Force
 # The restart toast and the protocol handler behind its buttons. Windows PowerShell 5.1 only -- the
 # WinRT toast APIs do not project into pwsh 7.
 Copy-Item (Join-Path $PSScriptRoot 'Show-RestartToast.ps1') $Bin -Force
@@ -193,6 +196,28 @@ try {
   Add-WUServiceManager -ServiceID '7971f918-a847-4430-9279-4a52d1efe18d' -Confirm:$false -ErrorAction Stop | Out-Null
   Write-Host 'Microsoft Update service registered.'
 } catch { Write-Warning "Could not register Microsoft Update service: $_" }
+
+# ---- Windows Update policy: SunUp owns install timing -----------------------
+# SunUp installs Windows updates itself, which only means something if Windows is not also installing
+# them on its own schedule -- and `windowsUpdate.notTitle` (the NVIDIA pin) exists ONLY on SunUp's
+# path, because Windows Update has no per-title exclusion at all. So the policy is a prerequisite of
+# the design, not a preference.
+#
+# It was applied by hand on 2026-08-12 and lived nowhere but README prose until v0.20.0, which meant
+# every box except this one ran a configuration the product was never tested against. Asserting it
+# here is the whole point; WuPolicy.ps1 carries the reasoning and the values.
+$wuPolicyScript = Join-Path $PSScriptRoot 'WuPolicy.ps1'
+if (Test-Path $wuPolicyScript) {
+  . $wuPolicyScript
+  Write-Host 'Windows Update policy (SunUp owns install timing, Windows notifications suppressed):'
+  Set-SunUpWuPolicy | ForEach-Object { Write-Host $_ }
+  $st = Get-SunUpWuPolicyState
+  if (-not $st.OwnsInstalls) {
+    Write-Warning "Windows Update policy did not take: $($st.Summary). Windows may install updates behind SunUp, and notTitle exclusions will not be enforced."
+  }
+} else {
+  Write-Warning 'WuPolicy.ps1 missing — Windows Update policy NOT asserted. Windows may install updates on its own schedule and notTitle exclusions will not be enforced.'
+}
 
 # ---- scheduled task: SYSTEM, three triggers ---------------------------------
 $pwsh      = (Get-Command pwsh).Source

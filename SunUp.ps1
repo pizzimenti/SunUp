@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.19.1'
+$script:Version = '0.20.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -86,6 +86,14 @@ $script:SelfHostPending = @()   # self-hosting packages Comp-Winget handed off (
 $script:VendorPolicy = @{ block = $false; vendor = $null; wuTitle = ''; winget = ''; note = '' }
 $VendorProfileScript = Join-Path $PSScriptRoot 'VendorProfiles.ps1'
 if (Test-Path $VendorProfileScript) { . $VendorProfileScript }
+
+# The Windows Update policy this design rests on -- read-only here, asserted by Install.ps1. Status
+# reports it because the policy is invisible from inside the repo otherwise, which is exactly how it
+# cost a morning on 2026-08-22: Windows' "updates are available" nag was read as a missed reboot
+# signal, and nothing on the box could say "that toast is the policy working as intended".
+# Missing file degrades to silence, never to an exception: this is reporting, not a decision.
+$WuPolicyScript = Join-Path $PSScriptRoot 'WuPolicy.ps1'
+if (Test-Path $WuPolicyScript) { . $WuPolicyScript }
 
 # Reboot detection, shared verbatim with the tray so the two can never disagree about whether this
 # box needs restarting (before v0.16.0 they each had their own copy, and both were wrong the same
@@ -1131,6 +1139,16 @@ if ($Mode -eq 'Status') {
   Write-Host ("  Reboot now    : {0}{1}" -f $rb.Required, $(if ($rb.Labels.Count) { " ($($rb.Labels -join ', '))" } else { '' }))
   foreach ($r in $rb.Reasons)  { Write-Host ("                    - {0}" -f $r) }
   foreach ($a in $rb.Advisory) { Write-Host ("                    ~ ignored: {0}" -f $a) }
+  # The Windows Update policy, stated out loud. Two different readers need this line: the one asking
+  # "why is Windows nagging me when SunUp says nothing?" (answer: because SunUp took the install job
+  # and this is what Windows does with what's left), and the one on a fresh box asking why SunUp and
+  # Windows both installed the same update (answer: the policy never got asserted — drift says so).
+  if (Get-Command Get-SunUpWuPolicyState -ErrorAction SilentlyContinue) {
+    $wp = Get-SunUpWuPolicyState
+    Write-Host ("  WU policy     : {0}" -f $wp.Summary)
+    foreach ($d in $wp.Drift) { Write-Host ("                    ! {0}" -f $d) }
+    if ($wp.Drift.Count) { Write-Host "                    -> re-run Install.ps1 to reassert" -ForegroundColor Yellow }
+  }
   if ($res) {
     Write-Host ("  Last run      : {0}  ({1}s, forced={2})" -f $res.date, $res.durationSec, $res.forced)
     Write-Host  "  Components    :"

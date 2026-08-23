@@ -56,6 +56,30 @@ foreach ($k in @("HKCU:\Software\Classes\AppUserModelId\$Name.Restart",
   if (Test-Path $k) { Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Write-Host 'Removed the toast AppUserModelID, its notification settings, and the sunup: protocol handler.'
+
+# The Windows Update policy MUST come back off, and this one is not tidiness.
+#
+# Install.ps1 sets AUOptions=3 -- "Windows downloads but never installs" -- because SunUp is the thing
+# that installs. Remove SunUp and leave that behind and NOTHING installs Windows updates: the box
+# downloads forever, raises no error, shows a green Windows Update page, and quietly stops patching
+# itself. That is a worse outcome than never having set the policy, and it is invisible precisely
+# because everything looks fine. Contrast the notification preferences below, which are shared with
+# other applications and are safe to leave asserted.
+#
+# Remove-SunUpWuPolicy removes only the values Install.ps1 wrote, and drops a key only when it is left
+# empty -- a real GPO or a management agent sharing the branch keeps its own values.
+$wuPolicyScript = @(
+  (Join-Path $PSScriptRoot 'WuPolicy.ps1'),
+  "C:\ProgramData\$Name\bin\WuPolicy.ps1"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($wuPolicyScript) {
+  . $wuPolicyScript
+  Write-Host 'Reverting the Windows Update policy (Windows resumes installing its own updates):'
+  Remove-SunUpWuPolicy | ForEach-Object { Write-Host $_ }
+} else {
+  Write-Warning "WuPolicy.ps1 not found — could NOT revert the Windows Update policy. If AUOptions=3 is still set under HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU, Windows will download updates and never install them. Delete that policy tree by hand and run: gpupdate /force"
+}
+
 # Deliberately NOT reverted: NOC_GLOBAL_SETTING_TOASTS_ENABLED and the NoQuietHours policy. Those are
 # machine-wide user preferences that the install asserted rather than owned, and other applications
 # depend on them too -- turning notifications back off on the way out would be a surprising thing for

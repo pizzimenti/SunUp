@@ -2,6 +2,105 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.20.0] - 2026-08-22
+
+### Fixed — a Windows Update toast was investigated as a missed reboot signal, and was the design working
+
+*"I got a notification from Windows Update that it needs to restart but SunUp is silent."* It did
+not need to restart, and SunUp was right. Pulled out of the notification store verbatim, the toast
+was:
+
+> **Updates are available** / Required updates need to be installed. / *Your organization manages
+> your update settings*
+
+Handler `Windows.SystemToast.WindowsUpdate.MoNotification2`, `scenario="reminder"` — the sticky kind
+that parks in Action Center until clicked, which is what made it read as urgent — and `<actions/>`,
+completely empty. **No restart button, because there was nothing to restart for.** A search of the
+whole notification database and its write-ahead log for `restart|reboot` returned zero toasts.
+Windows had never asked.
+
+Meanwhile the reboot state was clean four independent ways: all five keys in `$SunUpRebootKeys`
+absent (verified by *enumerating* the parent keys while elevated, because `Test-Path` returns
+`$false` for access-denied exactly as it does for absent — a silent false-negative on
+TrustedInstaller-owned CBS keys), the WUA COM API `Microsoft.Update.SystemInfo.RebootRequired`
+answering `False`, all eight CBS `SessionsPending` sessions marked `Complete`, and the 97
+`PendingFileRenameOperations` entries all bare deletes, dismissed by v0.19.1 exactly as designed.
+
+The toast was `AUOptions=3` doing its job. `AUOptions=3` is named *"auto download and **notify for
+install**"* — suppressing Windows' installs necessarily switches on Windows' nagging, because
+telling a human to press Install is the only other thing Windows Update is permitted to do. There is
+no value meaning "download it, don't install it, and stay quiet".
+
+Two things were actually wrong, and neither was the detector.
+
+### Added — the Windows Update policy is code now, not a paragraph of README
+
+The policy was applied **by hand** on 2026-08-12 at 11:30:35 (the key's own last-write timestamp) as
+part of v0.17.0, and recorded in exactly two places: a README paragraph and a PR body. It appeared
+in **no diff**. `Install.ps1` neither set it nor checked it.
+
+So every machine except this one ran a configuration the product had never been tested against —
+Windows auto-installing underneath SunUp, `notTitle` pins silently bypassed — and on this machine it
+produced a toast that nothing on the box could explain. Machine state the repo cannot see is machine
+state nobody can reason about.
+
+New `WuPolicy.ps1` is the single definition of those four values, with the reasoning attached:
+
+| Value | | Why |
+|---|---|---|
+| `AU\NoAutoUpdate` | `0` | Windows Update stays on and keeps downloading |
+| `AU\AUOptions` | `3` | download but don't install — SunUp owns install timing |
+| `SetUpdateNotificationLevel` | `1` | enables the notification policy below |
+| `UpdateNotificationLevel` | `1` | stop the "updates are available" nagging, **keep restart warnings** |
+
+- **`Install.ps1` asserts it** and warns if it did not take.
+- **`Uninstall.ps1` reverts it.** This is load-bearing, not tidiness: `AUOptions=3` left behind after
+  SunUp is gone means Windows downloads updates forever and installs none of them — no error, a green
+  Windows Update page, and a box that has quietly stopped patching itself. Only the four values SunUp
+  wrote are removed, and a key is dropped only when left empty, so a real GPO sharing that branch
+  keeps its own values.
+- **`-Mode Status` reports it**, next to the reboot state: `WU policy : SunUp owns install timing;
+  Windows notifications suppressed`. Drift lists every missing value with its consequence and
+  `-> re-run Install.ps1 to reassert`.
+- **The suite pins it** (21 checks). `Get-SunUpWuPolicyState` takes an optional `-Values` hashtable
+  so the classification is asserted without writing real Windows Update policy on whatever machine
+  runs the tests — the suite's contract is that it touches nothing outside its own folder, and a
+  test that had to edit HKLM to prove anything is a test nobody dares run.
+
+`NoAutoUpdate=1` gets its own verdict rather than being mistaken for a stricter `AUOptions=3`: it
+disables Windows Update outright, downloads included, starving the very pass SunUp runs. Reported as
+`Windows Update is DISABLED by policy — nothing will download`, never as ownership. A box that
+installs nothing at all, described as working exactly as designed, is the worst answer available.
+
+### Added — `UpdateNotificationLevel`, so the two stop duplicating each other
+
+v0.17.0 took the install job away from Windows and left the nagging half switched on. The sanctioned
+fix is the Windows Update for Business policy `UpdateNotificationLevel`, which exists precisely so a
+fleet whose updates are managed elsewhere doesn't nag its users about work already being done. SunUp
+is that management layer, population one — and by writing to the policy branch at all, this box was
+*already* claiming to be managed (that is where *"your organization manages your update settings"*
+comes from; `dsregcmd` reports no domain, no Entra join, no MDM). The claim was simply half-made.
+
+**Level 1, not 2.** Level 2 would also suppress restart warnings. SunUp owns restart messaging and
+does it better — the toast, the deferral, v0.18.0's live-session stand-down — but a Windows restart
+warning is an *independent* backstop for a SunUp that is broken, not running, or reporting clean
+while doing nothing. That is not hypothetical here: v0.13.1 is *"the Dell path was dead for four days,
+reporting clean."* Silence only the half that duplicates real work; keep the second opinion.
+
+### Changed — why SunUp owns Windows Update installs, restated on grounds that survive
+
+v0.17.0 justified the policy by the duplicate install of 2026-08-12. That argument no longer stands
+alone, and saying so matters: the same release **also** fixed that failure in code, at the
+`$skipWuForPending` pre-flight, which skips the Windows Update pass whenever a servicing restart is
+already outstanding. A reader comparing the two could reasonably conclude the policy is redundant
+belt-and-braces and delete it.
+
+It is not redundant, for a different reason. `windowsUpdate.notTitle` lets SunUp say *"everything
+except NVIDIA"* — a pin enforced on the vendor path too since v0.11.0 — and **Windows Update has no
+per-title exclusion mechanism at all**; the nearest thing, `ExcludeWUDriversInQualityUpdate`, is
+all-or-nothing on drivers. A capability the other system cannot express is a real division of labour.
+A scheduling preference is just a race that can be lost. README and `WuPolicy.ps1` now say this.
+
 ## [0.19.1] - 2026-08-17
 
 ### Fixed — the stale-reboot watchdog fired again, on the same signal, three releases after it was tamed
