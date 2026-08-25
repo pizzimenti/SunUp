@@ -3,7 +3,7 @@
 Deploys SunUp to C:\ProgramData\SunUp, ensures its dependencies (PSWindowsUpdate +
 Microsoft Update service), registers the SYSTEM 'SunUp'
 task with three triggers (Daily 08:00, Boot+1h, Resume+1h) and the interactive 'SunUp-Notify'
-dialog task, and refreshes the SysSentry baseline so the tasks don't read as security drift.
+dialog task, plus the restart-toast and alert-toast tasks in the interactive session.
 
 If a previous 'AutoUpdate' install is detected (v0.4.x and earlier), it is migrated in place:
 its data dir, logs, history and config are moved to the SunUp name and the old tasks/event
@@ -101,10 +101,15 @@ Copy-Item (Join-Path $PSScriptRoot 'VendorProfiles.ps1')   $Bin -Force
 # needs restarting or whether it already has. Two copies of that question is what restarted this box
 # three times on 2026-08-12.
 Copy-Item (Join-Path $PSScriptRoot 'RebootState.ps1')      $Bin -Force
+# The Windows Update policy SunUp's install ownership depends on. Shipped to bin so -Mode Status can
+# report it on a deployed box, not only in a checkout.
+Copy-Item (Join-Path $PSScriptRoot 'WuPolicy.ps1')         $Bin -Force
 # The restart toast and the protocol handler behind its buttons. Windows PowerShell 5.1 only -- the
 # WinRT toast APIs do not project into pwsh 7.
 Copy-Item (Join-Path $PSScriptRoot 'Show-RestartToast.ps1') $Bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'Invoke-ToastAction.ps1') $Bin -Force
+# SunUp's own alert toasts (SysSentry, which used to render them, retired 2026-08-15).
+Copy-Item (Join-Path $PSScriptRoot 'Show-AlertToast.ps1')  $Bin -Force
 # Drop the old-named engine if it rode along in a migrated bin (Move-Item brought the whole tree).
 Remove-Item (Join-Path $Bin "$OldName.ps1") -Force -ErrorAction SilentlyContinue
 
@@ -162,7 +167,7 @@ if (-not (Test-Path $ReportFile)) {
 # SunUp REPORT — caldera
 
 Per-run digests appended by `bin\SunUp.ps1` (newest at bottom, trimmed to ~900 lines).
-Full detail in `logs\sunup.log`; failures also surface in SysSentry ALERTS.md and the
+Full detail in `logs\sunup.log`; failures also surface as alert toasts (notify\alerts-history.md) and in the
 Application event log (source SunUp, IDs 2000=start 2001=clean 2005=reboot 2010=errors).
 
 ---
@@ -191,6 +196,28 @@ try {
   Add-WUServiceManager -ServiceID '7971f918-a847-4430-9279-4a52d1efe18d' -Confirm:$false -ErrorAction Stop | Out-Null
   Write-Host 'Microsoft Update service registered.'
 } catch { Write-Warning "Could not register Microsoft Update service: $_" }
+
+# ---- Windows Update policy: SunUp owns install timing -----------------------
+# SunUp installs Windows updates itself, which only means something if Windows is not also installing
+# them on its own schedule -- and `windowsUpdate.notTitle` (the NVIDIA pin) exists ONLY on SunUp's
+# path, because Windows Update has no per-title exclusion at all. So the policy is a prerequisite of
+# the design, not a preference.
+#
+# It was applied by hand on 2026-08-12 and lived nowhere but README prose until v0.20.0, which meant
+# every box except this one ran a configuration the product was never tested against. Asserting it
+# here is the whole point; WuPolicy.ps1 carries the reasoning and the values.
+$wuPolicyScript = Join-Path $PSScriptRoot 'WuPolicy.ps1'
+if (Test-Path $wuPolicyScript) {
+  . $wuPolicyScript
+  Write-Host 'Windows Update policy (SunUp owns install timing, Windows notifications suppressed):'
+  Set-SunUpWuPolicy | ForEach-Object { Write-Host $_ }
+  $st = Get-SunUpWuPolicyState
+  if (-not $st.OwnsInstalls) {
+    Write-Warning "Windows Update policy did not take: $($st.Summary). Windows may install updates behind SunUp, and notTitle exclusions will not be enforced."
+  }
+} else {
+  Write-Warning 'WuPolicy.ps1 missing — Windows Update policy NOT asserted. Windows may install updates on its own schedule and notTitle exclusions will not be enforced.'
+}
 
 # ---- scheduled task: SYSTEM, three triggers ---------------------------------
 $pwsh      = (Get-Command pwsh).Source
@@ -254,6 +281,23 @@ $rSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfG
 Register-ScheduledTask -TaskName $RestartTask -Action $rAction -Principal $rPrincipal -Settings $rSettings -Force `
   -Description 'Shows the SunUp "Restarting Soon" toast and owns the restart countdown (Restart now / Pause). Windows PowerShell 5.1 because the toast APIs are WinRT-only. Fired on demand by the engine; exits 2 if a toast cannot be shown so the caller falls back to the summary dialog.' | Out-Null
 Write-Host "Registered task '$RestartTask' (interactive, on-demand, WinPS 5.1) as $nUser."
+
+# ---- alert toast task: SunUp's own voice, in the interactive session --------
+# Drains notify\alerts.jsonl into persistent toasts. SYSTEM has no desktop and pwsh has no WinRT,
+# so this is the same interactive + WinPS 5.1 shape as the restart toast. AtLogon so alerts queued
+# while signed out surface at the next sign-in; on-demand via Start-ScheduledTask from any writer.
+# RunLevel Limited: showing a notification needs no privilege, so it gets none.
+$AlertsTask = "$Name-Alerts"
+$aAction    = New-ScheduledTaskAction -Execute $ps51 -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Bin\Show-AlertToast.ps1`""
+$aPrincipal = New-ScheduledTaskPrincipal -UserId $nUser -LogonType Interactive -RunLevel Limited
+# IgnoreNew is safe BECAUSE the queue is the source of truth: a start dropped while an instance is
+# live costs nothing -- the live instance (or the next fire) drains what was queued.
+$aSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+$aLogon     = New-ScheduledTaskTrigger -AtLogOn -User $nUser
+Register-ScheduledTask -TaskName $AlertsTask -Action $aAction -Principal $aPrincipal -Settings $aSettings -Trigger $aLogon -Force `
+  -Description 'Drains SunUp''s alert queue (notify\alerts.jsonl) into persistent desktop toasts. Windows PowerShell 5.1 because the toast APIs are WinRT-only. Fired on demand by any Raise-Alert writer; AtLogon catches alerts queued while signed out.' | Out-Null
+Write-Host "Registered task '$AlertsTask' (interactive, on-demand + AtLogon, WinPS 5.1) as $nUser."
 
 # ---- sunup: protocol, so the toast's buttons can reach us -------------------
 # A toast button can activate three ways: "foreground" and "background" both require a COM activator
@@ -325,13 +369,6 @@ try { Start-ScheduledTask -TaskName $TrayTask -ErrorAction Stop; Write-Host "Sta
 
 # ---- remove the old AutoUpdate tasks/source now that SunUp's are live --------
 Remove-OldInstall
-
-# ---- refresh SysSentry baseline so the renamed tasks aren't flagged as drift ----
-$sentry = 'C:\ProgramData\SysSentry\bin\Sentry.ps1'
-if (Test-Path $sentry) {
-  Write-Host 'Refreshing SysSentry baseline…'
-  & $pwsh -NoProfile -ExecutionPolicy Bypass -File $sentry -Mode Baseline | Out-Null
-}
 
 Write-Host ''
 Write-Host 'SunUp installed. Verify:  pwsh -File C:\ProgramData\SunUp\bin\Status.ps1'

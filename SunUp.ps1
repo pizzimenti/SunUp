@@ -37,10 +37,10 @@ LOGGING (the point of v0.2.0 — three tiers so failures are trivial to find):
         selfhost.log / selfhost.json   ONLY if self-hosting packages (PowerShell, winget itself)
                                        were upgraded — written AFTER this run ends, by SelfHost.ps1
                                        under Windows PowerShell 5.1; see its header for why
-  Plus Application event log (source SunUp) + SysSentry ALERTS.md on failure.
+  Plus Application event log (source SunUp) + its own alert toast queue on failure.
 
 Query: Status.ps1, or  SunUp.ps1 -Mode Errors  /  -Mode Tail.
-Companion to ProcWatch (realtime CPU) and SysSentry (security drift).
+Companion to ProcWatch (realtime CPU). (SysSentry, the old drift monitor, retired 2026-08-15.)
 #>
 param(
   # Run = do the update; Status = overview; Errors = last failures + log pointers; Tail = last run.log tail.
@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.17.1'
+$script:Version = '0.20.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -73,7 +73,8 @@ $NotifyDir     = Join-Path $Root 'notify'                       # user-writable 
 $NotifyPayload = Join-Path $NotifyDir 'latest-updates.json'     # drives the dialog; carries pendingShow
 $NotifyRestart = Join-Path $NotifyDir 'restart-state.json'      # proof a restart was issued; survives the boot
 $EvtSource     = $Name
-$SysSentryAlerts = 'C:\ProgramData\SysSentry\ALERTS.md'
+$AlertsTask  = "$Name-Alerts"                    # interactive toast drain (Show-AlertToast.ps1)
+$AlertsQueue = "C:\ProgramData\$Name\notify\alerts.jsonl"
 
 $script:RunDir = $null   # set in Run mode once we create the per-run dir
 $script:RunLog = $null
@@ -85,6 +86,14 @@ $script:SelfHostPending = @()   # self-hosting packages Comp-Winget handed off (
 $script:VendorPolicy = @{ block = $false; vendor = $null; wuTitle = ''; winget = ''; note = '' }
 $VendorProfileScript = Join-Path $PSScriptRoot 'VendorProfiles.ps1'
 if (Test-Path $VendorProfileScript) { . $VendorProfileScript }
+
+# The Windows Update policy this design rests on -- read-only here, asserted by Install.ps1. Status
+# reports it because the policy is invisible from inside the repo otherwise, which is exactly how it
+# cost a morning on 2026-08-22: Windows' "updates are available" nag was read as a missed reboot
+# signal, and nothing on the box could say "that toast is the policy working as intended".
+# Missing file degrades to silence, never to an exception: this is reporting, not a decision.
+$WuPolicyScript = Join-Path $PSScriptRoot 'WuPolicy.ps1'
+if (Test-Path $WuPolicyScript) { . $WuPolicyScript }
 
 # Reboot detection, shared verbatim with the tray so the two can never disagree about whether this
 # box needs restarting (before v0.16.0 they each had their own copy, and both were wrong the same
@@ -149,6 +158,16 @@ else {
     if (-not $Sources) { return @() }
     @($Sources | Where-Object { @('cbs','cbsInProgress','cbsPackages','windowsUpdate','wuPostReboot') -contains $_ })
   }
+  # Same fallback duty as the timestamp helpers: the reboot decision now calls this
+  # unconditionally, so a stale bin without it must degrade, not die. Mirrors the shared
+  # default (claude) rather than returning @(), because "cannot check" must not quietly
+  # become "clear to restart" — the whole point is to fail toward not interrupting.
+  function Get-RebootBlockers {
+    param([string[]]$Names = @('claude'))
+    if (-not $Names -or @($Names).Count -eq 0) { return @() }
+    @(Get-Process -Name $Names -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty ProcessName -Unique)
+  }
   function Get-RebootState {
     param([bool]$RunRequired = $false, [bool]$HandoffRequired = $false)
     $src = [System.Collections.Generic.List[string]]::new()
@@ -176,6 +195,12 @@ $DefaultConfig = [ordered]@{
   # forever unnoticed. 0 disables. (Under rebootPolicy=always this never triggers — the flag clears.)
   pendingRebootAlertDays = 3
   rebootGraceInteractiveSec = 300    # countdown the dialog shows when a user IS logged in
+  # Processes an UNATTENDED restart must never interrupt (see Get-RebootBlockers in
+  # RebootState.ps1). While any of these run, the engine defers its reboot and raises a
+  # notification instead, and an expiring countdown re-checks and stands down. A live Claude
+  # Code session is hours of conversation state; 2026-08-15 showed what "restart anyway"
+  # costs. "Restart now" clicked by a human is always honored.
+  rebootBlockProcesses = @('claude')
   keepRuns           = 30            # how many per-run log dirs to retain
   # Win11 summary dialog after a run. The dialog also lists the past `historyDays` of updates
   # (greyed out, below the current run); historyCollapse keeps only the latest per package so
@@ -327,7 +352,7 @@ function Flush-Report {
 
 # ---- crashed-run detection --------------------------------------------------
 # A run killed mid-flight (its host process terminated, power loss, a hard reset) is otherwise
-# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the SysSentry
+# COMPLETELY SILENT: every alert path — result.json, history.jsonl, events 2001/2010, the alert
 # echo, the summary dialog — lives after the component loop, and lastrun.json is never stamped, so
 # the next run just looks like a normal first-run-of-the-day. The 2026-07-22 run died that way
 # (Restart Manager killed the engine during winget's own PowerShell 7 upgrade) and nothing reported
@@ -457,7 +482,7 @@ function Report-CrashedRuns {
       $m = "Previous run $($d.Name) never finished — no result.json, so the engine was killed mid-run. Last log line: $last"
       Write-Log WARN $m
       Write-Evt 2011 Warning $m
-      Raise-SysSentryAlert $m
+      Raise-Alert $m
       # reported=true is written LAST and is what turns a claim into a finished report: if we die
       # before this, the marker stays unreported and a later run retakes it rather than losing it.
       # Written through the locked handle — a temp-file-and-rename publish cannot replace a file we
@@ -479,9 +504,19 @@ function Report-CrashedRuns {
   }
 }
 
-function Raise-SysSentryAlert { param($Msg)
-  if (-not (Test-Path $SysSentryAlerts)) { return }
-  try { "- **{0:yyyy-MM-dd HH:mm}** `[$($Name.ToUpper())`] {1}" -f (Get-Date), $Msg | Add-Content $SysSentryAlerts } catch {}
+# SunUp's own voice. Until v0.19.0 this appended to SysSentry's ALERTS.md and rode that tool's
+# notifier; SysSentry is retired, and an update manager should not need a second product installed
+# to tell its user something. Queue + fire-and-forget task start; the QUEUE is the delivery
+# contract (Show-AlertToast.ps1 drains it, AtLogon catches a signed-out gap), so a dropped start
+# here is harmless and a notification problem can never break the run.
+function Raise-Alert { param($Msg)
+  try {
+    $dir = Split-Path $AlertsQueue
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    ([pscustomobject]@{ ts = (Get-Date).ToString('o'); src = 'engine'; msg = "$Msg" } |
+      ConvertTo-Json -Compress) | Add-Content -Path $AlertsQueue -Encoding UTF8
+  } catch {}
+  try { Start-ScheduledTask -TaskName $AlertsTask -ErrorAction Stop } catch {}
 }
 
 # ---- per-day stamp ----------------------------------------------------------
@@ -1104,6 +1139,16 @@ if ($Mode -eq 'Status') {
   Write-Host ("  Reboot now    : {0}{1}" -f $rb.Required, $(if ($rb.Labels.Count) { " ($($rb.Labels -join ', '))" } else { '' }))
   foreach ($r in $rb.Reasons)  { Write-Host ("                    - {0}" -f $r) }
   foreach ($a in $rb.Advisory) { Write-Host ("                    ~ ignored: {0}" -f $a) }
+  # The Windows Update policy, stated out loud. Two different readers need this line: the one asking
+  # "why is Windows nagging me when SunUp says nothing?" (answer: because SunUp took the install job
+  # and this is what Windows does with what's left), and the one on a fresh box asking why SunUp and
+  # Windows both installed the same update (answer: the policy never got asserted — drift says so).
+  if (Get-Command Get-SunUpWuPolicyState -ErrorAction SilentlyContinue) {
+    $wp = Get-SunUpWuPolicyState
+    Write-Host ("  WU policy     : {0}" -f $wp.Summary)
+    foreach ($d in $wp.Drift) { Write-Host ("                    ! {0}" -f $d) }
+    if ($wp.Drift.Count) { Write-Host "                    -> re-run Install.ps1 to reassert" -ForegroundColor Yellow }
+  }
   if ($res) {
     Write-Host ("  Last run      : {0}  ({1}s, forced={2})" -f $res.date, $res.durationSec, $res.forced)
     Write-Host  "  Components    :"
@@ -1431,8 +1476,20 @@ $willReboot       = switch ("$($cfg.rebootPolicy)") {
   'ifRequired' { $rebootRequiredByRun }
   default      { $false }
 }
-if ($willReboot)        { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
-elseif ($rebootPending) { $result.rebootAction = 'suppressed' }
+# A restart the policy allows can still be one the box cannot afford right now: a process on
+# the blocklist (a live Claude Code session, by default) holds unsaved conversation state that
+# a reboot — or the countdown nobody is watching — would destroy. Defer, notify, and let the
+# stale-pending watchdog below keep the debt visible. The countdown paths re-check this
+# themselves; this check just avoids arming a countdown we already know must stand down.
+$rebootBlockers = @(Get-RebootBlockers -Names $cfg.rebootBlockProcesses)
+$rebootDeferredByBlocker = $false
+if ($willReboot -and $rebootBlockers.Count -gt 0) {
+  $willReboot = $false
+  $rebootDeferredByBlocker = $true
+}
+if ($willReboot)                  { $result.rebootAction = if ($interactive) { 'dialog-countdown' } else { 'reboot' } }
+elseif ($rebootDeferredByBlocker) { $result.rebootAction = 'deferred-blocker' }
+elseif ($rebootPending)           { $result.rebootAction = 'suppressed' }
 
 # The marker may only be dropped once result.json is REALLY on disk. $ErrorActionPreference is
 # 'Continue', so a transient lock or I/O error would let Set-Content fail quietly — and clearing the
@@ -1478,12 +1535,36 @@ if ($rebootPending -and -not $willReboot) {
     $since   = ConvertTo-UtcTime $pendingSince
     $ageDays = if ($since) { ((Get-Date).ToUniversalTime() - $since).TotalDays } else { 0 }
     if ($ageDays -ge $alertDays) {
-      # Name what is asking. "A reboot is pending" with no attribution is what made the old alert
-      # impossible to act on: there was no way to tell a real servicing hold from a false positive.
-      $why = if ($rebootState.Labels.Count) { ' (' + ($rebootState.Labels -join ', ') + ')' } else { '' }
-      $m = ("Reboot has been pending {0:N1} days but no run required it" -f $ageDays) + $why +
-           " (rebootPolicy=$($cfg.rebootPolicy)) — reboot when convenient."
-      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-SysSentryAlert $m
+      # This sentence is the only thing most people will ever read about a pending restart, and
+      # every clause of the old one failed a reader who had not read the source:
+      #
+      #   "Reboot has been pending 3.0 days but no run required it (File replacement)
+      #    (rebootPolicy=ifRequired) - reboot when convenient."
+      #
+      #   * "3.0 days" spelled a tenth of precision onto a number that is a guess about when a
+      #     signal first became observable. Whole days -- and hours below one, so a short
+      #     pendingRebootAlertDays does not render every alert as "0 days".
+      #   * It LED with the negative. "no run required it" answers a question nobody asked and
+      #     provokes the only one they do: then why is it pending? The answer was already in hand
+      #     ($rebootState.Labels) and got parenthesised behind the non-answer.
+      #   * "(rebootPolicy=ifRequired)" is a config KEY pasted into a desktop toast. It names the
+      #     setting without stating its consequence, and the consequence is the entire point:
+      #     nobody but the reader is going to restart this box. Say that instead, and derive it
+      #     from what actually happened this run rather than from the policy name alone -- a
+      #     blocker deferral reaches this same code path under any policy.
+      $age = if ($ageDays -lt 1)      { "{0:N0} hours" -f [math]::Floor($ageDays * 24) }
+             elseif ($ageDays -lt 2)  { '1 day' }
+             else                     { "{0:N0} days" -f [math]::Floor($ageDays) }
+      $what = if ($rebootState.Labels.Count) { $rebootState.Labels -join ', ' } else { 'reason unknown' }
+      $who  = if ($rebootDeferredByBlocker) {
+                "SunUp is holding its own restart back while $($rebootBlockers -join ', ') is running"
+              } elseif ("$($cfg.rebootPolicy)" -eq 'ifRequired') {
+                'SunUp restarts only for updates it installs itself, and none of those asked'
+              } else {
+                'SunUp is set never to restart this box on its own'
+              }
+      $m = "Restart pending $age — $what. $who, so this one is yours: restart when convenient."
+      Write-Log WARN $m; Write-Evt 2006 Warning $m; Raise-Alert $m
       $pendingAlerted = $true
     }
   }
@@ -1514,7 +1595,7 @@ Add-Report "- Summary: $summary; rebootPending=$rebootPending; rebootAction=$($r
 if ($errors.Count -gt 0) {
   $msg = "$Name run $runStamp finished with errors: " + (($errors | ForEach-Object { $_.name }) -join ', ') + ". Drill in: $Name.ps1 -Mode Errors"
   Write-Evt 2010 Warning $msg
-  Raise-SysSentryAlert $msg
+  Raise-Alert $msg
 } elseif ($warns.Count -gt 0) {
   # A warn is a component that did LESS than it was asked to — an incomplete winget upgrade list, a
   # package the handoff failed to upgrade. Logging event 2001 "clean" for those made a partly blocked
@@ -1627,15 +1708,29 @@ elseif ($willReboot) {
   Write-Log INFO "Reboot pending — headless reboot in $($cfg.rebootDelaySeconds)s (no user logged in); summary shows at next logon."
   Write-Evt 2005 Warning "${Name}: headless reboot in $($cfg.rebootDelaySeconds)s."
 }
+elseif ($rebootDeferredByBlocker) {
+  # The restart the policy called for is NOT happening this run. Say so everywhere a human
+  # might look — log, event log, alert toast — because a deferred reboot that nobody
+  # hears about is just a reboot that happens later, still on top of someone's session.
+  $blkList = $rebootBlockers -join ', '
+  Write-Log INFO "Reboot required but DEFERRED — blocker process(es) running: $blkList. Restart manually when they are done; the pending-reboot watchdog keeps score."
+  Write-Evt 2012 Warning "${Name}: restart required but deferred — $blkList is running. Restart when your session is done."
+  Raise-Alert "Restart required but deferred — $blkList is running. Finish or close the session(s), then restart when convenient."
+}
 elseif ($rebootPending) {
   # An OS pending flag is set but we're not rebooting. Two very different cases:
   if ("$($cfg.rebootPolicy)" -eq 'never') {
-    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge.
+    # User opted out of auto-reboot entirely — a genuine pending state is worth a nudge. Same rule
+    # as the watchdog alert above: the toast names what is asking and what SunUp will not do, in
+    # English. "rebootPolicy=never" stays in the log, where the reader is someone debugging SunUp,
+    # and goes nowhere near a desktop notification, where it names a setting without its consequence.
+    $whatPending = if ($rebootState.Labels.Count) { $rebootState.Labels -join ', ' } else { 'reason unknown' }
     Write-Log INFO 'Reboot pending but rebootPolicy=never — leaving box up.'
-    Raise-SysSentryAlert 'A reboot is pending (rebootPolicy=never) — reboot when convenient.'
+    Raise-Alert "Restart pending — $whatPending. SunUp is set never to restart this box on its own, so this one is yours: restart when convenient."
   } else {
-    # ifRequired: the flag is set (e.g. a PnP driver's PendingFileRename) but no component this run
-    # demanded a reboot. That's benign background state — note it, don't nag SysSentry every day.
+    # ifRequired: the flag is set but no component this run demanded a reboot. That is benign
+    # background state — note it, don't raise a daily nag toast. The stale-pending watchdog above is
+    # what escalates it, once, if it is still there after pendingRebootAlertDays.
     Write-Log INFO 'OS reboot-pending flag set, but no component this run required a reboot (rebootPolicy=ifRequired) — not rebooting.'
   }
 }
@@ -1745,11 +1840,11 @@ if (@($script:SelfHostPending).Count -gt 0) {
         # The start was a no-op, so nothing was handed anywhere — say that, instead of logging a
         # handoff and raising 2020 for an upgrade that will never happen.
         $m = "self-host: $SelfHostTask did NOT start — $($shStart.reason). $($shIds -join ', ') left for the next run."
-        Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+        Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-Alert $m
       }
     } catch {
       $m = "self-host: could not start ${SelfHostTask}: $_ — $($shIds -join ', ') left for the next run."
-      Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-SysSentryAlert $m
+      Write-Log WARN $m; Write-Evt 2021 Warning $m; Raise-Alert $m
     }
   }
 }

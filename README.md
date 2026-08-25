@@ -30,6 +30,56 @@ Nothing here is vendor- or hardware-specific — every component ships with Wind
 SunUp runs on any Windows box. (v0.14.0 removed the Dell Command Update integration; see the
 CHANGELOG for the evidence behind that.)
 
+### Who installs Windows updates — and why Windows goes quiet
+
+SunUp installs Windows updates itself, so `Install.ps1` sets a policy telling Windows Update to
+**download but not install**. Four values, under
+`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`:
+
+| Value | | Why |
+|---|---|---|
+| `AU\NoAutoUpdate` | `0` | Windows Update stays **on** and keeps delivering everything |
+| `AU\AUOptions` | `3` | download, but don't install — SunUp owns install timing |
+| `SetUpdateNotificationLevel` | `1` | enables the notification policy below |
+| `UpdateNotificationLevel` | `1` | stop "updates are available" nagging, **keep restart warnings** |
+
+**Why SunUp takes the install step at all.** Not for scheduling — that argument is handled in code by
+the pre-flight skip described [below](#if-a-restart-is-already-pending-sunup-doesnt-install-on-top-of-it).
+It's for **selectivity**. `windowsUpdate.notTitle` lets you say *"everything except NVIDIA"*, and
+Windows Update has no per-title exclusion mechanism at all — the nearest thing,
+`ExcludeWUDriversInQualityUpdate`, is all-or-nothing on drivers. Let Windows install on its own
+schedule and every pin you've set is silently bypassed.
+
+**Why the notification half is needed.** `AUOptions=3` is named *"auto download and notify for
+install"*, and that second clause is not optional — telling a human to press Install is the only
+other thing Windows Update is allowed to do. There's no value meaning *"download it, don't install
+it, and stay quiet"*. So suppressing Windows' installs necessarily switches on Windows' nagging:
+
+> **Updates are available**
+> Required updates need to be installed.
+> *Your organization manages your update settings*
+
+That toast is Windows working exactly as configured, **not** a missed reboot signal — it says
+*install*, never *restart*. `UpdateNotificationLevel` is the Windows Update for Business setting that
+exists precisely so a fleet whose updates are managed elsewhere doesn't nag its users about work
+already being done. SunUp is that manager, population one.
+
+It's set to **1, not 2**, deliberately. Level 2 would also suppress restart warnings. SunUp owns
+restart messaging and does it better — but a Windows restart warning is an *independent* backstop for
+a SunUp that's broken, not running, or reporting clean while doing nothing, which is not hypothetical
+(v0.13.1: *"the Dell path was dead for four days, reporting clean"*). Keep the second opinion.
+
+Writing any value under this branch is also what makes Windows say *"your organization manages your
+update settings"* — on a standalone box with no domain, no Entra join and no MDM. That wording is
+about the policy branch, not about your machine being enrolled in anything.
+
+`WuPolicy.ps1` holds the values and the reasoning; `Install.ps1` asserts them, `Uninstall.ps1`
+reverts them, `-Mode Status` reports them, and the test suite pins them.
+
+> **If you uninstall SunUp, the policy must come off with it** — and `Uninstall.ps1` does that. Left
+> behind, `AUOptions=3` means Windows downloads updates forever and installs none of them: no error,
+> a green Windows Update page, and a box that has quietly stopped patching itself.
+
 ## How it's scheduled
 
 One SYSTEM scheduled task (`SunUp`) with three triggers, de-duplicated to **once per calendar day**
@@ -109,9 +159,12 @@ at that point is to get the machine restarted, not to pile more on top. The skip
 restart, so it lasts one cycle at most, and it never applies under `rebootPolicy: "never"` — where
 no restart is coming and skipping would mean never installing at all.
 
-> Windows Update's own auto-install was the other half of this. On this machine it is now set to
-> **download but notify** (`AUOptions=3`) so SunUp owns install timing. Windows still delivers
-> everything; it just stops installing behind SunUp's back.
+> Windows Update's own auto-install was the other half of this, and `Install.ps1` now sets it to
+> **download but notify** — see [Who installs Windows updates](#who-installs-windows-updates--and-why-windows-goes-quiet).
+> Note that the pre-flight skip above fixes this failure *on its own*: the policy is not what keeps
+> the duplicate install away, it's what keeps your `notTitle` pins enforceable. Until v0.20.0 the
+> policy was a manual registry edit documented only here, so every machine except the author's ran a
+> configuration the product had never been tested against.
 
 ### How "pending" is decided
 
@@ -163,8 +216,8 @@ Three tiers, so failures are trivial to find, under `C:\ProgramData\SunUp\`:
   structured `result.json`.
 
 A run that is killed mid-flight never writes `result.json`, and every other alert path runs after the
-updates — so the **next** run detects the orphaned dir, reports it once (event 2011 + a SysSentry
-alert naming the last line it logged) and marks it with `incomplete.json`. A run still in progress
+updates — so the **next** run detects the orphaned dir, reports it once (event 2011 + an alert
+toast naming the last line it logged) and marks it with `incomplete.json`. A run still in progress
 looks the same from outside, so each run drops a `running.json` liveness marker (PID + process start
 time) while it works: a concurrent manual `-Force` run is recognised as alive and left alone.
 
@@ -188,6 +241,12 @@ pwsh -File .\Uninstall.ps1    # removes the tasks (add -Purge to also delete dat
 `Install.ps1` is idempotent and also **migrates a previous `AutoUpdate` install** in place (moves its
 data/logs/history/config to the SunUp name, swaps the tasks and event source) without losing history.
 
+Install also sets the [Windows Update policy](#who-installs-windows-updates--and-why-windows-goes-quiet)
+that hands install timing to SunUp, and **`Uninstall.ps1` reverts it** — with or without `-Purge`, since
+leaving it behind would stop the machine installing Windows updates at all. Only the four values
+SunUp wrote are removed, and a key is deleted only if it's left empty, so a real Group Policy sharing
+that branch is untouched.
+
 ## Manage / diagnose
 
 ```powershell
@@ -200,6 +259,20 @@ pwsh -File C:\ProgramData\SunUp\bin\SunUp.ps1 -Mode Run -Force   # run now, bypa
 > Heads-up: a forced run **will reboot** if an update this run installs requires it (`rebootPolicy`
 > `ifRequired`, the default), or if any reboot is pending under `rebootPolicy: "always"`. To test
 > safely, set `rebootPolicy: "never"` first.
+
+`Status.ps1` reports the [Windows Update policy](#who-installs-windows-updates--and-why-windows-goes-quiet)
+alongside the reboot state, so the split of responsibility is visible on the box rather than only in
+this file:
+
+```
+  Reboot now    : False
+  WU policy     : SunUp owns install timing; Windows notifications suppressed
+```
+
+If the policy has drifted — a re-imaged box, a competing GPO, an install that never ran — each missing
+value is listed with its consequence, followed by `-> re-run Install.ps1 to reassert`. The line worth
+knowing on sight is `Windows Update is DISABLED by policy`: that's `NoAutoUpdate=1`, which is *not* a
+stricter version of what SunUp wants — it stops the downloads SunUp then has nothing to install.
 
 ## Configuration
 

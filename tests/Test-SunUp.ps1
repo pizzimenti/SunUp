@@ -23,7 +23,7 @@ Check 'SunUp.ps1 parses with no errors' ($errs.Count -eq 0) ($errs | Out-String)
 # Every script that ships. A syntax error in one of these is invisible until the task that runs it
 # fails silently in production -- UserScope.ps1 and Uninstall.ps1 had no parse coverage at all.
 $repoRoot = Split-Path $PSScriptRoot -Parent
-foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1') {
+foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','WuPolicy.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1','Show-AlertToast.ps1') {
   $p = Join-Path $repoRoot $f
   $e = $null
   if (Test-Path $p) {
@@ -65,7 +65,7 @@ $script:logged = @(); $script:events = @(); $script:alerts = @()
 function Write-Log { param($Level, $Msg) $script:logged += "$Level|$Msg" }
 function Write-Evt { param([int]$Id, [string]$Type = 'Information', [string]$Msg) $script:events += $Id }
 $script:claimedAtAlert = @()
-function Raise-SysSentryAlert { param($Msg)
+function Raise-Alert { param($Msg)
   $script:alerts += $Msg
   # A report must be CLAIMED (incomplete.json created) before it is emitted, or two concurrent
   # scanners would both alert on the same dead run. Record what was true at alert time.
@@ -134,7 +134,7 @@ Check 'flags the dead runs (incl. recycled-PID marker), not the peer' ($script:e
 Check 'never flags a concurrent run that is still working' (-not ($script:alerts -match 'peer')) ($script:alerts -join ' | ')
 Check 'no incomplete.json written for the live peer' (-not (Test-Path (Join-Path $RunsDir 'peer\incomplete.json')))
 Check 'uses event id 2011' (($script:events | Sort-Object -Unique) -join ',' -eq '2011')
-Check 'raises a SysSentry alert per dead run' ($script:alerts.Count -eq 3)
+Check 'raises an alert per dead run' ($script:alerts.Count -eq 3)
 Check 'ignores the finished run' (-not ($script:alerts -match 'good'))
 Check 'ignores the run dir with no run.log' (-not ($script:alerts -match 'empty'))
 Check 'never flags the live run dir' (-not ($script:alerts -match 'live'))
@@ -756,30 +756,58 @@ Check 'a REG_MULTI_SZ value parses into source/destination pairs' ($pairs.Count 
 Check 'the \??\ prefix and the * / ! markers are stripped from both halves' `
       ($pairs[0].Source -eq 'C:\Users\b\AppData\Local\Temp\.abc-0.node' -and $pairs[1].Destination -eq 'C:\Windows\System32\a.dll') `
       "$($pairs[0].Source) / $($pairs[1].Destination)"
-# An odd-length value is a source with no destination element at all; smss.exe deletes it, so a
-# parser that silently dropped the unpaired tail would lose a real signal.
+# An odd-length value is a source with no destination element at all; smss.exe deletes it. The
+# parser must still yield it -- it is dismissed as a delete downstream, but it has to be COUNTED
+# and classified in the advisory line, and a silently dropped tail would be missing from both.
 $odd = ConvertFrom-PfroValue @('\??\C:\Windows\Temp\x.tmp')
 Check 'an odd-length value yields a delete, not a dropped entry' ($odd.Count -eq 1 -and $odd[0].Destination -eq '')
 
 # --- classification -----------------------------------------------------------
-# The exact entry that fired the false watchdog alert on this box.
+# v0.19.1: the rule is the MECHANISM, not the path. An empty destination is
+# MoveFileEx(path, NULL, DELAY_UNTIL_REBOOT) -- "unlink this at boot, it is locked now" -- which
+# reports an open handle, never a half-configured system. v0.16.0 dismissed those only under a temp
+# directory, and on 2026-08-17 that let 78 C:\Config.Msi\*.rbf MSI rollback backups fire the
+# stale-reboot watchdog on a box with nothing outstanding.
 Check 'a delete-on-boot under a user temp dir is NOT a reboot signal' `
       (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Users\bradley\AppData\Local\Temp\.78eefce1f7f6b7d6-0.node'; Destination='' })))
 Check 'nor is one under C:\Windows\Temp' `
       (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\Temp\tmp1234.tmp'; Destination='' })))
-# The engine runs as SYSTEM, whose TEMP is C:\Windows\TEMP. Classifying against $env:TEMP would
-# therefore miss every entry left by an interactive user -- which is all of the ones that matter.
-Check 'a temp path is recognised for ANY user, not just the one we run as' `
-      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='D:\Users\someone.else\AppData\Local\Temp\x.node'; Destination='' })))
-# ...and the signals that must still count.
+# The entries that fired the SECOND false watchdog alert on this box.
+Check 'nor is an MSI rollback backup in C:\Config.Msi (2026-08-17 false positive)' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Config.Msi\f343d4e.rbf'; Destination='' })))
+Check 'nor is a superseded updater directory outside any temp path' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files (x86)\Microsoft\EdgeUpdate\1.3.251.23'; Destination='' })))
+Check 'nor is a delete of a locked binary under Program Files' `
+      (-not (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files\Vendor\driver.sys'; Destination='' })))
+# ...and the signal that must still count. A rename is a file being PUT IN PLACE, which is the only
+# shape in this value that a restart is required to complete.
 Check 'a rename INTO a destination is a reboot signal' `
       (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Windows\WinSxS\Temp\a.dll'; Destination='C:\Windows\System32\a.dll' }))
-Check 'a delete outside any temp directory is a reboot signal' `
-      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='C:\Program Files\Vendor\driver.sys'; Destination='' }))
-# Fails OPEN by design: a spurious sunset icon costs a glance, a missed servicing reboot leaves the
-# box half-patched. Anything unrecognised must land on the noisy side, never the silent one.
-Check 'an unrecognisable entry counts as significant (fails open)' `
-      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='not-a-path'; Destination='' }))
+Check 'a rename is significant regardless of where the source sits' `
+      (Test-PfroEntrySignificant ([pscustomobject]@{ Source='not-a-path'; Destination='C:\Windows\System32\a.dll' }))
+# The narrowing is safe ONLY because the authoritative servicing keys are read directly and do not
+# depend on PFRO at all. If that ever stops being true, this test fails before the false negative
+# reaches a user.
+Check 'the servicing keys that make dismissing deletes safe are still read directly' `
+      ((@($script:SunUpRebootKeys | ForEach-Object { $_.key }) -join ',') -eq 'cbs,cbsInProgress,cbsPackages,windowsUpdate,wuPostReboot') `
+      "$(@($script:SunUpRebootKeys | ForEach-Object { $_.key }) -join ',')"
+
+# --- dismissed entries stay auditable ----------------------------------------
+# Narrowing the verdict is only defensible because nothing is silently dropped: a misclassification
+# has to be visible in result.json and Status output, which means classified and counted, not a
+# bare number under a label ("under a temp directory") that stopped being true.
+Check 'a dismissed delete is classified for the audit line' `
+      ((Get-PfroCleanupClass 'C:\Config.Msi\f343d4e.rbf') -eq 'MSI rollback backups') `
+      (Get-PfroCleanupClass 'C:\Config.Msi\f343d4e.rbf')
+Check 'a temp delete still reads as temp' `
+      ((Get-PfroCleanupClass 'C:\Users\b\AppData\Local\Temp\x.node') -eq 'temp files')
+# The engine runs as SYSTEM, whose TEMP is C:\Windows\TEMP. Classifying against $env:TEMP would
+# mislabel every entry left by an interactive user -- the v0.16.0 lesson, still asserted here even
+# though only the audit line depends on it now.
+Check 'a temp path is recognised for ANY user, not just the one we run as' `
+      ((Get-PfroCleanupClass 'D:\Users\someone.else\AppData\Local\Temp\x.node') -eq 'temp files')
+Check 'an unrecognised path gets a true, vague class rather than a wrong one' `
+      ((Get-PfroCleanupClass 'C:\Program Files\Vendor\driver.sys') -eq 'other locked files')
 
 # --- the verdict --------------------------------------------------------------
 $st = Get-RebootState -RunRequired $true
@@ -809,7 +837,27 @@ Check 'the stale-reboot tracker resets when the box has booted since the last ru
       ($engineText3 -match '\$carryTracker\s*=\s*\[bool\]\(\$stamp -and \$stamp\.pendingSince -and -not \$bootedSinceLastRun\)')
 Check 'and the once-only alert latch resets with it' `
       ($engineText3 -match '\$pendingAlerted = \[bool\]\(\$carryTracker -and \$stamp\.pendingAlerted\)')
-Check 'the alert names what is asking for the restart' ($engineText3 -match '\$why = if \(\$rebootState\.Labels\.Count\)')
+# The watchdog alert is the only sentence most people will ever read about a pending restart, so
+# v0.19.1 rewrote all three of its clauses. Assert the PROPERTIES, not the wording -- these are the
+# three complaints it was rebuilt to answer.
+Check 'the alert names what is asking for the restart' `
+      ($engineText3 -match '\$what\s*=\s*if \(\$rebootState\.Labels\.Count\)')
+# "3.0 days" spelled a tenth of precision onto a value that is a guess about when a signal became
+# observable. Whole days, and hours below one so a fractional pendingRebootAlertDays cannot render
+# every alert as "0 days".
+Check 'the age is whole days, never a decimal' `
+      (($engineText3 -notmatch 'pending \{0:N1\} days') -and ($engineText3 -match '\[math\]::Floor\(\$ageDays\)'))
+Check 'and reads as hours below a day, so it is never "0 days"' `
+      ($engineText3 -match '\$ageDays -lt 1\s*\)\s*\{\s*"\{0:N0\} hours"')
+# A config KEY in a desktop toast names a setting without stating its consequence, and the
+# consequence -- nobody but the reader is going to restart this box -- is the only actionable part.
+# Derived from what happened this run, because a blocker deferral reaches this path under ANY policy.
+$policyLeaks = @($engineText3 -split "`n" | Where-Object { $_ -match 'Raise-Alert' -and $_ -match 'rebootPolicy=' })
+Check 'no rebootPolicy= config key is pasted into a user-facing alert' `
+      ($policyLeaks.Count -eq 0) "$($policyLeaks.Count) alert(s) still quote the policy key"
+Check 'the alert says who is NOT going to restart the box, blocker case included' `
+      ($engineText3 -match '\$who\s*=\s*if \(\$rebootDeferredByBlocker\)' -and
+       $engineText3 -match 'restarts only for updates it installs itself')
 Check 'the run records which signals fired, for audit' `
       ($engineText3 -match 'rebootSources\s*=\s*@\(\$rebootState\.Sources\)' -and $engineText3 -match 'rebootIgnored\s*=\s*@\(\$rebootState\.Advisory\)')
 
@@ -1045,7 +1093,9 @@ function Get-ToastTexts { param($Xml) @($Xml.toast.visual.binding.SelectNodes('t
 
 # The toast host runs under 5.1 because WinRT has no projection in .NET Core. Same ASCII trap as
 # SelfHost.ps1, and the same consequence: a task that dies at parse time, silently.
-foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}) {
+$alertToastSrc  = Join-Path $repoRoot 'Show-AlertToast.ps1'
+$alertToastText = Get-Content $alertToastSrc -Raw
+foreach ($f in @{n='Show-RestartToast.ps1'; p=$toastSrc; t=$toastText}, @{n='Invoke-ToastAction.ps1'; p=$actSrc; t=$actText}, @{n='Show-AlertToast.ps1'; p=$alertToastSrc; t=$alertToastText}) {
   $na = @($f.t.ToCharArray() | Where-Object { [int]$_ -gt 127 })
   Check "  $($f.n) is pure ASCII" ($na.Count -eq 0) "$($na.Count) non-ASCII char(s)"
   $r = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "
@@ -1192,6 +1242,90 @@ Check 'results are cached per update set, so each one is researched once ever' `
       ($toastCode -match 'function Get-WhyCacheKey' -and $toastCode -match 'Save-CachedWhy \$key \$text')
 Check 'and enrichment happens only once a toast is definitely going up' `
       ($toastCode -match '(?s)if \(\$restart\.Mode -ne .countdown.\).{0,200}\$why = Get-ExplainedWhy')
+
+Write-Host "`n[14] the Windows Update policy (v0.20.0)"
+# The policy that makes SunUp's install ownership real. Before v0.20.0 it existed only as a manual
+# registry edit and a README paragraph -- so every box but the author's ran an untested
+# configuration, and on the author's box it produced a Windows nag that was investigated as a SunUp
+# bug. These checks exist so it can never go back to being invisible.
+#
+# NOTHING here touches the live registry. Get-SunUpWuPolicyState takes -Values precisely so the
+# classification can be asserted without writing real Windows Update policy on the machine running
+# the suite -- which would be an appalling side effect for a test, and would make this the one
+# section nobody dared run.
+$wuPolicyPath = Join-Path $repoRoot 'WuPolicy.ps1'
+. $wuPolicyPath
+$wuText  = Get-Content $wuPolicyPath -Raw
+$insText = Get-Content (Join-Path $repoRoot 'Install.ps1') -Raw
+$uniText = Get-Content (Join-Path $repoRoot 'Uninstall.ps1') -Raw
+$srcText = Get-Content $src -Raw
+
+$want = @{}
+foreach ($d in $script:SunUpWuPolicyDesired) { $want[$d.name] = $d.value }
+
+Check 'the desired policy is exactly the four values, defined once' `
+      ($script:SunUpWuPolicyDesired.Count -eq 4 -and $want.Count -eq 4) "got $($script:SunUpWuPolicyDesired.Count)"
+Check 'AUOptions=3 — download but do not install, so SunUp owns install timing' `
+      ($want['AUOptions'] -eq 3) "got $($want['AUOptions'])"
+Check 'NoAutoUpdate=0 — Windows Update stays on and keeps downloading' `
+      ($want['NoAutoUpdate'] -eq 0) "got $($want['NoAutoUpdate'])"
+# Level 1, not 2, is a decision and not an accident: 2 would also suppress restart warnings, and a
+# Windows restart warning is the independent backstop for a SunUp that is broken or not running.
+# v0.13.1 ("the Dell path was dead for four days, reporting clean") is why that backstop is kept.
+Check 'UpdateNotificationLevel=1 keeps Windows restart warnings as a backstop (2 would suppress them)' `
+      ($want['UpdateNotificationLevel'] -eq 1) "got $($want['UpdateNotificationLevel'])"
+Check 'SetUpdateNotificationLevel=1 — the WUfB knob needs both values, not just the level' `
+      ($want['SetUpdateNotificationLevel'] -eq 1) "got $($want['SetUpdateNotificationLevel'])"
+
+$full    = Get-SunUpWuPolicyState -Values @{ NoAutoUpdate = 0; AUOptions = 3; SetUpdateNotificationLevel = 1; UpdateNotificationLevel = 1 }
+$none    = Get-SunUpWuPolicyState -Values @{}
+$autoIns = Get-SunUpWuPolicyState -Values @{ NoAutoUpdate = 0; AUOptions = 4; SetUpdateNotificationLevel = 1; UpdateNotificationLevel = 1 }
+$noisy   = Get-SunUpWuPolicyState -Values @{ NoAutoUpdate = 0; AUOptions = 3 }
+$off     = Get-SunUpWuPolicyState -Values @{ NoAutoUpdate = 1; AUOptions = 3; SetUpdateNotificationLevel = 1; UpdateNotificationLevel = 1 }
+
+Check 'a fully-asserted policy reports owned + quiet with no drift' `
+      ($full.OwnsInstalls -and $full.Quiet -and $full.Drift.Count -eq 0) ($full.Drift -join '; ')
+Check 'an unset policy reports NOT owned, and names all four missing values' `
+      ((-not $none.OwnsInstalls) -and (-not $none.Quiet) -and $none.Drift.Count -eq 4) ($none.Drift -join '; ')
+Check 'the unset summary says Windows may install on its own and notTitle is not enforced' `
+      ($none.Summary -match 'own schedule' -and $none.Summary -match 'notTitle') $none.Summary
+Check 'AUOptions=4 (Windows auto-installs) is NOT ownership, however quiet the box is' `
+      ((-not $autoIns.OwnsInstalls) -and $autoIns.Quiet) $autoIns.Summary
+Check 'owning installs without the notification policy reports owned-but-noisy' `
+      ($noisy.OwnsInstalls -and -not $noisy.Quiet -and $noisy.Summary -match 'nag') $noisy.Summary
+# NoAutoUpdate=1 is not a stricter AUOptions=3 -- it disables Windows Update outright, downloads
+# included, which starves the pass SunUp runs. Reporting it as ownership would be the worst possible
+# answer: a box that installs nothing at all, described as working exactly as designed.
+Check 'NoAutoUpdate=1 is reported as Windows Update DISABLED, never as ownership' `
+      ((-not $off.OwnsInstalls) -and $off.Summary -match 'DISABLED') $off.Summary
+Check 'and it says so in drift, in the words of the consequence' `
+      (@($off.Drift | Where-Object { $_ -match 'never downloads' }).Count -eq 1) ($off.Drift -join '; ')
+
+# The three consumers. Each one is a place the policy stopped being invisible.
+Check 'Install.ps1 ships WuPolicy.ps1 to bin' `
+      ($insText -match "Copy-Item \(Join-Path \`$PSScriptRoot 'WuPolicy\.ps1'\)")
+Check 'Install.ps1 asserts the policy rather than assuming it' `
+      ($insText -match 'Set-SunUpWuPolicy')
+Check 'Install.ps1 warns when the policy did not take' `
+      ($insText -match '(?s)Get-SunUpWuPolicyState.{0,400}Write-Warning')
+# The uninstall revert is load-bearing: AUOptions=3 left behind after SunUp is gone means Windows
+# downloads updates forever and installs none of them, with no error anywhere.
+Check 'Uninstall.ps1 reverts the policy so the box does not stop patching itself' `
+      ($uniText -match 'Remove-SunUpWuPolicy')
+Check 'and warns with manual steps if it cannot find WuPolicy.ps1' `
+      ($uniText -match '(?s)WuPolicy\.ps1 not found.{0,400}gpupdate /force')
+Check '-Mode Status reports the policy' `
+      ($srcText -match 'Get-SunUpWuPolicyState' -and $srcText -match 'WU policy')
+Check 'the engine dot-sources WuPolicy.ps1 but degrades to silence if it is missing' `
+      ($srcText -match "\`$WuPolicyScript = Join-Path \`$PSScriptRoot 'WuPolicy\.ps1'" -and
+       $srcText -match 'if \(Test-Path \$WuPolicyScript\) \{ \. \$WuPolicyScript \}')
+
+# Removal must be surgical. The branch is shared with real Group Policy on a managed box, and an
+# uninstaller that deleted the whole tree would take an employer's update policy with it.
+Check 'Remove-SunUpWuPolicy deletes named values, never the branch wholesale' `
+      ($wuText -match 'Remove-ItemProperty' -and $wuText -notmatch 'Remove-Item \$script:SunUpWuPolicyRoot -Recurse')
+Check 'and drops a key only when it is left empty' `
+      ($wuText -match '\$props\.Count -eq 0 -and \$subs\.Count -eq 0')
 
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)

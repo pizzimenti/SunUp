@@ -2,6 +2,249 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.20.0] - 2026-08-22
+
+### Fixed — a Windows Update toast was investigated as a missed reboot signal, and was the design working
+
+*"I got a notification from Windows Update that it needs to restart but SunUp is silent."* It did
+not need to restart, and SunUp was right. Pulled out of the notification store verbatim, the toast
+was:
+
+> **Updates are available** / Required updates need to be installed. / *Your organization manages
+> your update settings*
+
+Handler `Windows.SystemToast.WindowsUpdate.MoNotification2`, `scenario="reminder"` — the sticky kind
+that parks in Action Center until clicked, which is what made it read as urgent — and `<actions/>`,
+completely empty. **No restart button, because there was nothing to restart for.** A search of the
+whole notification database and its write-ahead log for `restart|reboot` returned zero toasts.
+Windows had never asked.
+
+Meanwhile the reboot state was clean four independent ways: all five keys in `$SunUpRebootKeys`
+absent (verified by *enumerating* the parent keys while elevated, because `Test-Path` returns
+`$false` for access-denied exactly as it does for absent — a silent false-negative on
+TrustedInstaller-owned CBS keys), the WUA COM API `Microsoft.Update.SystemInfo.RebootRequired`
+answering `False`, all eight CBS `SessionsPending` sessions marked `Complete`, and the 97
+`PendingFileRenameOperations` entries all bare deletes, dismissed by v0.19.1 exactly as designed.
+
+The toast was `AUOptions=3` doing its job. `AUOptions=3` is named *"auto download and **notify for
+install**"* — suppressing Windows' installs necessarily switches on Windows' nagging, because
+telling a human to press Install is the only other thing Windows Update is permitted to do. There is
+no value meaning "download it, don't install it, and stay quiet".
+
+Two things were actually wrong, and neither was the detector.
+
+### Added — the Windows Update policy is code now, not a paragraph of README
+
+The policy was applied **by hand** on 2026-08-12 at 11:30:35 (the key's own last-write timestamp) as
+part of v0.17.0, and recorded in exactly two places: a README paragraph and a PR body. It appeared
+in **no diff**. `Install.ps1` neither set it nor checked it.
+
+So every machine except this one ran a configuration the product had never been tested against —
+Windows auto-installing underneath SunUp, `notTitle` pins silently bypassed — and on this machine it
+produced a toast that nothing on the box could explain. Machine state the repo cannot see is machine
+state nobody can reason about.
+
+New `WuPolicy.ps1` is the single definition of those four values, with the reasoning attached:
+
+| Value | | Why |
+|---|---|---|
+| `AU\NoAutoUpdate` | `0` | Windows Update stays on and keeps downloading |
+| `AU\AUOptions` | `3` | download but don't install — SunUp owns install timing |
+| `SetUpdateNotificationLevel` | `1` | enables the notification policy below |
+| `UpdateNotificationLevel` | `1` | stop the "updates are available" nagging, **keep restart warnings** |
+
+- **`Install.ps1` asserts it** and warns if it did not take.
+- **`Uninstall.ps1` reverts it.** This is load-bearing, not tidiness: `AUOptions=3` left behind after
+  SunUp is gone means Windows downloads updates forever and installs none of them — no error, a green
+  Windows Update page, and a box that has quietly stopped patching itself. Only the four values SunUp
+  wrote are removed, and a key is dropped only when left empty, so a real GPO sharing that branch
+  keeps its own values.
+- **`-Mode Status` reports it**, next to the reboot state: `WU policy : SunUp owns install timing;
+  Windows notifications suppressed`. Drift lists every missing value with its consequence and
+  `-> re-run Install.ps1 to reassert`.
+- **The suite pins it** (21 checks). `Get-SunUpWuPolicyState` takes an optional `-Values` hashtable
+  so the classification is asserted without writing real Windows Update policy on whatever machine
+  runs the tests — the suite's contract is that it touches nothing outside its own folder, and a
+  test that had to edit HKLM to prove anything is a test nobody dares run.
+
+`NoAutoUpdate=1` gets its own verdict rather than being mistaken for a stricter `AUOptions=3`: it
+disables Windows Update outright, downloads included, starving the very pass SunUp runs. Reported as
+`Windows Update is DISABLED by policy — nothing will download`, never as ownership. A box that
+installs nothing at all, described as working exactly as designed, is the worst answer available.
+
+### Added — `UpdateNotificationLevel`, so the two stop duplicating each other
+
+v0.17.0 took the install job away from Windows and left the nagging half switched on. The sanctioned
+fix is the Windows Update for Business policy `UpdateNotificationLevel`, which exists precisely so a
+fleet whose updates are managed elsewhere doesn't nag its users about work already being done. SunUp
+is that management layer, population one — and by writing to the policy branch at all, this box was
+*already* claiming to be managed (that is where *"your organization manages your update settings"*
+comes from; `dsregcmd` reports no domain, no Entra join, no MDM). The claim was simply half-made.
+
+**Level 1, not 2.** Level 2 would also suppress restart warnings. SunUp owns restart messaging and
+does it better — the toast, the deferral, v0.18.0's live-session stand-down — but a Windows restart
+warning is an *independent* backstop for a SunUp that is broken, not running, or reporting clean
+while doing nothing. That is not hypothetical here: v0.13.1 is *"the Dell path was dead for four days,
+reporting clean."* Silence only the half that duplicates real work; keep the second opinion.
+
+### Changed — why SunUp owns Windows Update installs, restated on grounds that survive
+
+v0.17.0 justified the policy by the duplicate install of 2026-08-12. That argument no longer stands
+alone, and saying so matters: the same release **also** fixed that failure in code, at the
+`$skipWuForPending` pre-flight, which skips the Windows Update pass whenever a servicing restart is
+already outstanding. A reader comparing the two could reasonably conclude the policy is redundant
+belt-and-braces and delete it.
+
+It is not redundant, for a different reason. `windowsUpdate.notTitle` lets SunUp say *"everything
+except NVIDIA"* — a pin enforced on the vendor path too since v0.11.0 — and **Windows Update has no
+per-title exclusion mechanism at all**; the nearest thing, `ExcludeWUDriversInQualityUpdate`, is
+all-or-nothing on drivers. A capability the other system cannot express is a real division of labour.
+A scheduling preference is just a race that can be lost. README and `WuPolicy.ps1` now say this.
+
+## [0.19.1] - 2026-08-17
+
+### Fixed — the stale-reboot watchdog fired again, on the same signal, three releases after it was tamed
+
+At 08:01 on 2026-08-17 the alert toast read: *"Reboot has been pending 3.0 days but no run
+required it (File replacement) (rebootPolicy=ifRequired) — reboot when convenient."* Nothing on
+the box needed a restart. The 81 `PendingFileRenameOperations` entries behind "File replacement"
+were, in full: 78 `C:\Config.Msi\*.rbf` Windows Installer **rollback backups** — journals kept so
+a *failed* install can be undone, orphaned precisely because their installs had **committed** —
+plus two superseded `EdgeUpdate` version directories, a Visual Studio bootstrapper JSON, and
+Chrome's `old_chrome.exe`. Every one a bare delete. Not one rename.
+
+v0.16.0 established that PFRO's mere existence is not a reboot signal, but its classifier kept a
+residual fail-open: a delete **outside a temp directory** still counted. `C:\Config.Msi` is not a
+temp directory, so the same false positive walked straight back in through the residue — and
+latched, because the watchdog alerts once.
+
+The rule is now the mechanism, not the path:
+
+- An entry with an **empty destination** is `MoveFileEx(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`:
+  "unlink this at boot, it is locked now." That reports an open handle. It never reports a
+  half-configured system — wherever the file lives, which is exactly the thing a path list could
+  not distinguish. `C:\Config.Msi` was only ever going to be the next entry on a list with no
+  principled end. Deletes are dismissed, all of them.
+- A rename **into** a destination is a file being put in place. Still significant, always — it is
+  the only shape in the value that a restart is required to complete.
+- Dismissing deletes is safe because a genuine servicing hold never depended on this classifier:
+  CBS and Windows Update set their own registry keys, and all five are read directly. PFRO is the
+  proxy people consult when they are *not* reading those keys. A dismissed delete can therefore
+  never cost SunUp a servicing reboot — only a false one, which is the entire observed failure
+  history of this signal (2026-08-04, 2026-08-17).
+- Dismissed entries are still counted and now **classified** in `rebootIgnored` — *"94 files are
+  queued for deletion at the next boot (78 MSI rollback backups, 10 temp files, 5 updater
+  leftovers, 1 other locked file)"* — so a misclassification is a checkable claim, not a bare
+  number under a description ("under a temp directory") that had stopped being true.
+
+### Fixed — the watchdog alert now says something a person can act on
+
+The old sentence failed its reader in every clause, and that one sentence being read is the whole
+reason the watchdog exists:
+
+- **"3.0 days"** put a tenth of precision on a number that is a guess about when a signal first
+  became observable. Now whole days — and hours below one day, so a short
+  `pendingRebootAlertDays` cannot render every alert as "0 days".
+- It **led with the negative.** "No run required it" answers a question nobody asked and provokes
+  the only one they do — *then why is it pending?* The answer was already in hand
+  (`$rebootState.Labels`) and sat parenthesised behind the non-answer. The signal now leads.
+- **"(rebootPolicy=ifRequired)"** pasted a config key into a desktop toast: it names a setting
+  without stating its consequence, and the consequence is the entire point — nobody but the
+  reader is going to restart this box. The alert now derives *who is not acting, and why* from
+  what actually happened this run (a blocker deferral reaches this same path under any policy):
+
+> Restart pending 3 days — Windows servicing. SunUp restarts only for updates it installs itself,
+> and none of those asked, so this one is yours: restart when convenient.
+
+The `rebootPolicy=never` nudge got the same treatment. Config keys stay in the log, where the
+reader is someone debugging SunUp; the test suite now asserts no `Raise-Alert` line quotes one.
+
+## [0.19.0] - 2026-08-15
+
+### Added — SunUp speaks for itself: native alert toasts, no SysSentry
+
+SysSentry was retired from this box on 2026-08-15 (its monitoring scope had crept into a
+do-everything suite and was descoped wholesale). SunUp's alerts rode that tool's plumbing —
+`Raise-SysSentryAlert` appended to `ALERTS.md` and SysSentry's notifier toasted it — which meant
+the update manager could not tell its user "a restart is waiting on you" without a second product
+installed. Backwards, and now gone:
+
+- **`Show-AlertToast.ps1`** (new, task `SunUp-Alerts`): drains `notify\alerts.jsonl` into
+  persistent toasts. Interactive user + Windows PowerShell 5.1 + pure ASCII, the same shape as the
+  restart toast, for the same reasons (SYSTEM has no desktop; pwsh has no WinRT; 5.1 reads BOM-less
+  as ANSI). The design is inherited from the retired notifier because it was measured to work:
+  queue is the source of truth, history (`notify\alerts-history.md`) is written before toasting,
+  the queue truncates before toasting, >3 alerts collapse to a summary, AtLogon catches alerts
+  raised while signed out.
+- **`Raise-SysSentryAlert` → `Raise-Alert`** in the engine, SelfHost, and UserScope (each keeps
+  its self-contained copy, per this repo's rule that detached passes must not depend on the engine
+  being loadable): queue append + fire-and-forget `Start-ScheduledTask`, so a notification problem
+  can never break a run.
+- The v0.18.0 countdown-expiry stand-downs write `alerts-history.md` directly and do NOT queue —
+  each already shows its own UI, and queueing would toast a duplicate.
+- Install registers the task (RunLevel Limited — a toast needs no privilege) and no longer
+  refreshes a SysSentry baseline; Uninstall removes the task and the `SunUp.Alerts` AUMID.
+
+## [0.18.0] - 2026-08-15
+
+### Added — unattended restarts stand down for blocker processes
+
+On 2026-08-15 08:01 the self-host pass upgraded PowerShell 7.6.5 while two live Claude Code
+sessions sat in terminal pwsh tabs; Restart Manager closed both mid-conversation. No reboot was
+even involved — but the incident made the adjacent gap obvious: under `rebootPolicy=ifRequired`
+with a user logged in, the only thing between a required reboot and those same sessions was a
+300-second countdown that nobody away from the desk would ever see.
+
+A restart now distinguishes *approved* from *merely unopposed*. `Get-RebootBlockers`
+(RebootState.ps1, shared; config key `rebootBlockProcesses`, default `claude`) is consulted at
+three places:
+
+- **the engine's reboot decision** — a policy-allowed reboot with a blocker running becomes
+  `rebootAction=deferred-blocker`: no countdown is armed, event 2012 is written, and a
+  `[SUNUP]` alert tells the human a restart is waiting on them;
+- **the restart toast at countdown expiry** — the moment of truth re-checks, because the
+  engine's check ran minutes earlier and a session may have started since. On a hit the
+  countdown toast is replaced by a plain "Restart deferred" toast (no Restart button: the
+  process showing it is about to exit, so the button's command file would have no reader);
+- **the summary dialog at countdown expiry** — same stand-down, same alert line.
+
+`user-clicked` restarts skip all three checks on purpose: the human pressing "Restart now"
+owns the sessions the list exists to protect. Known limit: a deferred *run-signal* reboot
+(one that sets no OS flag) survives only as the alert and event — the stale-pending watchdog
+tracks OS-flagged states only.
+
+### Added — SelfHost defers self-hosting upgrades while a blocker runs
+
+Disabling Restart Manager from inside the pass measurably does not work (v0.11.0, removed
+v0.12.0), so the only real protection for processes RM would close is to not run the installer
+while they exist. After its engine/user-pass waits, `SelfHost.ps1` now checks the blocker list
+and, on a hit, records the whole handoff as **deferred** (`selfhost.json` gains a `deferred`
+field; ok=0, failed=0), writes event 2022 and a `[SUNUP]` alert, and exits 0. The engine hands
+the packages off again next run. Deferred is not failed: yesterday's "0 ok, 1 failed" toast
+for an upgrade that was going to kill two sessions was wrong twice over.
+
+The blocker default is duplicated in SelfHost by design (the script is self-contained,
+5.1-only, ASCII-only); the comment at both sites says to keep them in sync by hand.
+
+### Fixed — the mutex-race loser no longer reports the peer's success as its own failure
+
+Both scopes' handoffs can carry `Microsoft.PowerShell`. On 2026-08-15 the user pass won the
+winget lock and installed 7.6.5 (exit 0, 129s); the SYSTEM pass then ran, found nothing to do,
+got `0x8A15002B` ("No applicable update found"), retried without `--custom`, got it again, and
+recorded **FAILED** — event 2021, a failure toast, and a `selfhost.log` that says an upgrade
+failed on the very run where it succeeded. `0x8A15002B` is now a benign no-op ("already up to
+date -- a peer pass likely upgraded it first"): counted as ok, never retried, never alerted.
+
+Note recorded while verifying the fix: PowerShell parses 32-bit hex literals by bit pattern
+into negative Int32s (`0x8A150077` *is* `-1978335113`), so the existing `-contains
+$LASTEXITCODE` comparisons were always correct. Do not "fix" them with unsigned conversions.
+
+### Fixed — SelfHost's ALERTS.md lines now use the shared format
+
+`SelfHost.ps1` wrote `- <ts> SunUp: <msg>` — un-bolded, un-categorised — so SysSentry's parser
+filed it under the fallback category and the toast said "SysSentry: ALERT" with no hint of the
+source. It now writes the same `- **<ts>** [SUNUP] <msg>` shape as the engine.
+
 ## [0.17.1] - 2026-08-12
 
 ### Fixed — the installer force-killed any PowerShell that merely mentioned the tray script
