@@ -23,7 +23,7 @@ Check 'SunUp.ps1 parses with no errors' ($errs.Count -eq 0) ($errs | Out-String)
 # Every script that ships. A syntax error in one of these is invisible until the task that runs it
 # fails silently in production -- UserScope.ps1 and Uninstall.ps1 had no parse coverage at all.
 $repoRoot = Split-Path $PSScriptRoot -Parent
-foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','WuPolicy.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1','Show-AlertToast.ps1') {
+foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','WuPolicy.ps1','Hygiene.ps1','Install.ps1','Uninstall.ps1','Show-UpdateDialog.ps1','SunUp-Tray.ps1','Status.ps1','Show-AlertToast.ps1') {
   $p = Join-Path $repoRoot $f
   $e = $null
   if (Test-Path $p) {
@@ -31,6 +31,17 @@ foreach ($f in 'SelfHost.ps1','UserScope.ps1','VendorProfiles.ps1','WuPolicy.ps1
     Check "$f parses with no errors" ($e.Count -eq 0) ($e | Out-String)
   } else { Check "$f exists" $false }
 }
+
+# The engine's version is hardcoded in SunUp.ps1 AND kept in the VERSION file, so a release has two
+# places to change and no way to notice missing one. Caught in the act on 2026-08-24: VERSION said
+# 0.21.0 while the engine still reported v0.20.0, so a freshly deployed box would have described
+# itself as the previous release in Status, every log header, history.jsonl and the summary dialog.
+# Nothing breaks -- it just lies about which code is running, which is the worst kind of bug to have
+# in the tool you use to work out what is running.
+$versionFile = (Get-Content (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+$srcVersion  = ([regex]::Match((Get-Content $src -Raw), "\`$script:Version\s*=\s*'([^']+)'")).Groups[1].Value
+Check "VERSION file and the engine's hardcoded version agree (both '$versionFile')" `
+      ($versionFile -eq $srcVersion) "VERSION=$versionFile but SunUp.ps1=$srcVersion"
 
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
 
@@ -1326,6 +1337,78 @@ Check 'Remove-SunUpWuPolicy deletes named values, never the branch wholesale' `
       ($wuText -match 'Remove-ItemProperty' -and $wuText -notmatch 'Remove-Item \$script:SunUpWuPolicyRoot -Recurse')
 Check 'and drops a key only when it is left empty' `
       ($wuText -match '\$props\.Count -eq 0 -and \$subs\.Count -eq 0')
+
+Write-Host "`n[15] hygiene checks (v0.21.0)"
+# Read-only checks folded into the engine on 2026-08-24, after the account rename was found to have
+# left seven registry values pointing at a vanished profile path for seven weeks. Nothing noticed
+# because every affected installer FAILED WITH EXIT CODE 0 -- winget installed Python side-by-side
+# instead of upgrading, and reported success. These checks exist so that class of silent rot is
+# surfaced by the one thing on this box that already runs every morning.
+#
+# NOTHING here writes anything. The component is read-only by construction, and the assertions below
+# are the guard rails on that promise: the day someone adds a "fix it while we're here" branch, the
+# test that says it never modifies should fail loudly.
+$hygPath = Join-Path $repoRoot 'Hygiene.ps1'
+. $hygPath
+$hygText = Get-Content $hygPath -Raw
+
+Check 'Get-HygieneFindings is defined once Hygiene.ps1 is dot-sourced' `
+      ([bool](Get-Command Get-HygieneFindings -ErrorAction SilentlyContinue))
+
+# The contract the engine depends on: an array, empty when the box is clean.
+$hygResult = @(Get-HygieneFindings -MinFreeGB 0)
+Check 'it returns an array, and -MinFreeGB 0 can never trip the free-space check' `
+      ($hygResult -is [array] -and -not ($hygResult -join '' -match 'GB free'))
+
+# SILENT WHEN CLEAN is the whole design rule. A check that chatters gets ignored, which is how
+# SysSentry's ALERTS.md became worthless before it was retired 2026-08-15.
+Check 'a threshold that cannot trip yields no free-space finding' `
+      (-not ($hygResult | Where-Object { $_ -like '*threshold*' }))
+
+# Framework packages ship x86+x64 under ONE winget Id and winget exposes no architecture column, so
+# without this list the check reported 12 duplicates on a healthy box -- every one of them false.
+Check 'side-by-side framework Ids are excluded from the duplicate check' `
+      ($hygText -match 'Microsoft\.VCLibs\.\*' -and $hygText -match 'Microsoft\.WindowsAppRuntime\*')
+# .Contains, not -match: the strings being searched for are 'ARP\*' and 'MSIX\*', which are a
+# backslash and a star -- an escape character and a quantifier. Writing that as a regex needs three
+# layers of escaping and was wrong on the first attempt. Literal comparison has no layers.
+Check 'ARP\ and MSIX\ pseudo-Ids are excluded too' `
+      ($hygText.Contains("-like 'ARP\*'") -and $hygText.Contains("-like 'MSIX\*'"))
+
+# winget's table is width-adaptive and drops columns on a narrow console. Fixed offsets would parse
+# garbage silently -- the same failure mode these checks are meant to catch.
+Check 'winget output is parsed by header index, not fixed columns' `
+      ($hygText -match "IndexOf\('Id'\)" -and $hygText -match "IndexOf\('Version'\)")
+
+# Windows paths are the worst possible regex input: 'C:\Users\user\' throws on \U at MATCH time,
+# per item, inside the pipeline. Every path comparison here must use wildcards.
+Check 'path comparisons use -like, never -match against a literal Windows path' `
+      ($hygText -notmatch "-match '[A-Za-z]:\\\\")
+
+Check 'the file never writes: no Remove/Set/New/Copy against the live system' `
+      ($hygText -notmatch '\b(Remove-Item|Set-ItemProperty|New-Item|Copy-Item|Remove-ItemProperty)\b')
+
+# Same degrade-to-silence contract as VendorProfiles/WuPolicy/RebootState: a partially-updated bin
+# must not take down a whole run.
+Check 'the engine dot-sources Hygiene.ps1 but degrades if it is missing' `
+      ($srcText -match "\`$HygieneScript = Join-Path \`$PSScriptRoot 'Hygiene\.ps1'" -and
+       $srcText -match 'if \(Test-Path \$HygieneScript\) \{ \. \$HygieneScript \}')
+Check 'Comp-Hygiene reports warn (not error) when Hygiene.ps1 did not load' `
+      ($srcText -match "Get-Command Get-HygieneFindings" -and $srcText -match "status = 'warn'; detail = 'Hygiene\.ps1 did not load")
+
+# A finding is something for a human to look at, not a failed update run. 'error' would make the
+# engine cry wolf about work it was never asked to do.
+Check 'findings are warn, never error' `
+      ($srcText -match '"\$\(\$findings\.Count\) finding\(s\)')
+Check 'Comp-Hygiene never requests a reboot' `
+      (($srcText -split 'function Comp-Hygiene')[1].Split('#')[0] -notmatch 'reboot\s*=\s*\$true')
+
+Check 'hygiene is dispatched from the component block and gated on config' `
+      ($srcText -match "if \(\`$cfg\.hygiene\.enabled\)\s+\{ \`$results\.Add\( \(Invoke-Component 'hygiene'")
+Check 'hygiene has a config default so an older config.json still resolves it' `
+      ($srcText -match "hygiene\s+= \[ordered\]@\{ enabled = \`$true; minFreeGB = 25 \}")
+Check 'Install.ps1 ships Hygiene.ps1 to bin' `
+      ($insText -match "Copy-Item \(Join-Path \`$PSScriptRoot 'Hygiene\.ps1'\)")
 
 } catch {
   # Without this, a terminating error inside a Check's CONDITION (an invalid regex, a missing file)

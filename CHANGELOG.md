@@ -2,6 +2,70 @@
 
 All notable changes to SunUp (formerly AutoUpdate). Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.21.0] - 2026-08-24
+
+### Added — hygiene checks, because the rot that breaks updates is invisible to an updater
+
+An audit on 2026-08-24 found that the 2026-07-03 account rename had left **seven registry values**
+still pointing at the vanished `C:\Users\user`: four on Python 3.13.14 (`BundleCachePath`,
+`UninstallString`, `QuietUninstallString`, `DisplayIcon`) and three on LM Studio 0.4.16+2. The files
+had all moved correctly. Only the strings were stale.
+
+That had been true for **seven weeks**, and nothing noticed, because the failure mode was not a
+crash — it was **success**:
+
+- winget could not read Python's bundle cache, so rather than upgrading in place it installed
+  3.13.15 **side-by-side**. Two interpreters on PATH, the older one winning.
+- The pair then deadlocked. Both share Burn provider key `CPython-3.13`, and 3.13.14 was registered
+  as a **dependent of** 3.13.15, so uninstalling *either* printed nothing and returned `0`
+  (`w210: Plan skipped due to 1 remaining dependents`).
+- LM Studio's `UninstallString` was broken identically. Its pending upgrade — **a SunUp concern** —
+  would have failed exactly the same way, and would have looked exactly as much like nothing
+  happening.
+
+This is squarely an updater's problem. A stale `UninstallString` is *precisely* what turns an
+in-place upgrade into a silent side-by-side install, and SunUp had no way to see it.
+
+`Hygiene.ps1` adds four read-only checks, run last so they audit the state the run just produced:
+
+1. **Duplicate winget package Ids** — the only thing that exposed the double Python. Neither install
+   looked anomalous on disk; both were normal-sized and internally intact. Two rows sharing one Id
+   was the entire tell.
+2. **PATH entries that fail `Test-Path`**, plus duplicated entries.
+3. **Uninstall / `BundleCachePath` / `DisplayIcon` values whose target is missing** — the check that
+   would have caught the rename damage seven weeks earlier.
+4. **Free space**, default 25 GB.
+
+Config: `hygiene.enabled` (default `true`), `hygiene.minFreeGB` (default 25). Findings report as
+**`warn`, never `error`** — a stale registry value is something for a human to look at, not a failed
+update run, and an updater that reports failure over work it was never asked to do is crying wolf.
+The component can never request a reboot, and the file contains no write cmdlet at all; the suite
+asserts both, so a future "fix it while we're here" branch fails loudly.
+
+**Why it is folded in here rather than shipped as its own tool.** SunUp already runs every morning,
+already owns the report/dialog/history plumbing, and is already the one thing that knows what is
+installed. A separate tool meant a second scheduled task, a second config and a second place to
+look — which is the exact path SysSentry took from "drift monitor" to "do-everything suite" before
+being retired on 2026-08-15. This costs no new task and no new surface.
+
+**Silent when clean is the design rule**, and it is what makes the checks worth running unattended.
+Size heuristics were considered and **rejected**: the two largest directories on this box are
+`.rustup\toolchains` (3.9 GB) and `.nuget\packages` (2.3 GB), and both are deliberate — the `1.97.1`
+toolchain is pinned by `eth-link-tester\rust-toolchain.toml` *specifically so SunUp cannot move it
+underneath the project*. A size threshold would fire every run against intentional state, which is
+the alert fatigue that made SysSentry's `ALERTS.md` worthless. Free space is the sole exception,
+because a full disk is an emergency rather than a matter of taste.
+
+Two calibration notes worth keeping. Framework redistributables (`Microsoft.VCLibs.*`,
+`UI.Xaml.*`, `WindowsAppRuntime*`, `DotNet.Native.*`) ship x86 and x64 under **one** winget Id and
+winget exposes no architecture column — before they were excluded, the check reported **12
+duplicates on a healthy box, every one false**. One real finding buried in twelve false ones is
+worse than no check at all. And winget's table is width-adaptive and silently drops columns on a
+narrow console, so its output is parsed by **header index**, never fixed offsets.
+
+`Hygiene.ps1` is also runnable on its own for an on-demand audit:
+`pwsh -File C:\ProgramData\SunUp\bin\Hygiene.ps1` (exit 0 clean, 1 findings).
+
 ## [0.20.0] - 2026-08-22
 
 ### Fixed — a Windows Update toast was investigated as a missed reboot signal, and was the design working

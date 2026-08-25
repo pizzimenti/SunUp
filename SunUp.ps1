@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:Version = '0.20.0'
+$script:Version = '0.21.0'
 
 # One name to rule them all — every path, task name, event source, and the dialog title
 # derive from $Name, so a future rename is a one-line change (and a half-rename is impossible).
@@ -94,6 +94,14 @@ if (Test-Path $VendorProfileScript) { . $VendorProfileScript }
 # Missing file degrades to silence, never to an exception: this is reporting, not a decision.
 $WuPolicyScript = Join-Path $PSScriptRoot 'WuPolicy.ps1'
 if (Test-Path $WuPolicyScript) { . $WuPolicyScript }
+
+# Read-only hygiene checks (v0.21.0). Same degrade-to-silence contract as the two above: this is
+# reporting, never a decision, so a missing file must not take down a run. It earns its place in an
+# UPDATER specifically because the rot it looks for is what makes updates fail quietly — a stale
+# UninstallString is exactly why winget installed Python side-by-side instead of upgrading in place
+# on this box, and reported success doing it. See Hygiene.ps1's header for the full post-mortem.
+$HygieneScript = Join-Path $PSScriptRoot 'Hygiene.ps1'
+if (Test-Path $HygieneScript) { . $HygieneScript }
 
 # Reboot detection, shared verbatim with the tray so the two can never disagree about whether this
 # box needs restarting (before v0.16.0 they each had their own copy, and both were wrong the same
@@ -243,6 +251,10 @@ $DefaultConfig = [ordered]@{
   }
   defender           = [ordered]@{ enabled = $true }
   psModules          = [ordered]@{ enabled = $true; everyDays = 7 }   # PSGallery modules: weekly, not daily (slow + rarely changes)
+  # hygiene: read-only checks that report, never act. Silent on a healthy box, so leaving it on
+  # costs nothing but a line in the report. minFreeGB is the ONE size threshold here — see
+  # Hygiene.ps1 for why size heuristics were rejected everywhere else.
+  hygiene            = [ordered]@{ enabled = $true; minFreeGB = 25 }
   pip                = [ordered]@{ enabled = $false }
   npm                = [ordered]@{ enabled = $false }
 }
@@ -648,6 +660,30 @@ function Invoke-Component { param([string]$Name, [scriptblock]$Body)
   Write-Log $lvl ("{0}: {1} ({2}s) {3}" -f $Name, $r.status, $r.durationSec, $r.detail)
   Add-Report ("- {0}: **{1}** ({2}s) {3}{4}" -f $Name, $r.status, $r.durationSec, $r.detail, $(if ($r.error) { " — $($r.error)" } else { '' }))
   return [pscustomobject]$r
+}
+
+# =====================  read-only components  ================================
+
+function Comp-Hygiene { param($Cfg)
+  # Deliberately NOT an update component: it changes nothing and can never request a reboot. It
+  # rides the same Invoke-Component plumbing purely so its result lands in the report, the dialog
+  # and the 30-day history alongside everything else — one place to look, which was the whole point
+  # of folding it in here instead of building a second tool.
+  if (-not (Get-Command Get-HygieneFindings -ErrorAction SilentlyContinue)) {
+    return @{ status = 'warn'; detail = 'Hygiene.ps1 did not load — checks skipped' }
+  }
+  $minFree = if ($Cfg.hygiene.minFreeGB) { [int]$Cfg.hygiene.minFreeGB } else { 25 }
+  $findings = @(Get-HygieneFindings -MinFreeGB $minFree)
+  if ($findings.Count -eq 0) {
+    Write-CompLog 'hygiene' 'No findings — winget Ids unique, PATH resolves, uninstall targets present, free space OK.'
+    return @{ status = 'ok'; detail = 'clean' }
+  }
+  Write-CompLog 'hygiene' $findings
+  # 'warn', never 'error'. A finding is something for a human to look at, not a failed run — and an
+  # updater that reports failure because the box has a stale registry value would be crying wolf
+  # about work it was never asked to do.
+  $head = if ($findings.Count -le 2) { ' — ' + ($findings -join '; ') } else { '' }
+  return @{ status = 'warn'; detail = "$($findings.Count) finding(s)$head — see hygiene.log" }
 }
 
 # =====================  update components  ===================================
@@ -1326,6 +1362,10 @@ if ($cfg.psModules.enabled) {
     Write-Log INFO "psModules: not due (runs every $psEvery days) — skipping this run."
   }
 }
+# Hygiene runs LAST, on purpose: it then audits the state this run just produced, so a duplicate
+# install or a broken uninstall target created by today's winget pass is caught today rather than
+# tomorrow. It never sets reboot, so its position cannot affect the restart decision below.
+if ($cfg.hygiene.enabled)       { $results.Add( (Invoke-Component 'hygiene'       { Comp-Hygiene $cfg }) ) }
 
 # The detached passes started by the LAST run finished after its result.json was written. Fold them
 # in HERE — before the reboot decision and before updates[] is built — so an upgrade they made shows
