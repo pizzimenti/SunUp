@@ -23,8 +23,15 @@ All toggleable in `config.json`, run in one coordinated pass:
 | **Windows + Microsoft Update** | OS + Office/other MS products | via PSWindowsUpdate; can exclude by title (e.g. pinned `NVIDIA` drivers) |
 | **winget** | Desktop app upgrades | per-package, capturing old→new version, duration, and download size; plus a per-user pass for the HKCU packages SYSTEM cannot see |
 | **PowerShell modules** | PSGallery modules | weekly (`psModules.everyDays`), not daily |
+| **Hygiene** *(read-only)* | Duplicate winget Ids, dead/duplicated PATH entries, uninstall targets that no longer exist, free space | Reports only — never changes anything. Runs last, so it audits the state the run just produced. Findings are `warn`, never `error` |
 
 `pip` / `npm` stubs are present but off by default.
+
+The hygiene component is the one thing here that doesn't update anything. It's included because the
+rot it looks for is what makes updates fail *quietly*: a stale `UninstallString` is exactly why
+winget installed Python **side-by-side** on this box instead of upgrading in place — and reported
+success doing it. See the v0.21.0 CHANGELOG entry for the full post-mortem. It's runnable on its own
+too: `pwsh -File C:\ProgramData\SunUp\bin\Hygiene.ps1` (exit 0 clean, 1 findings).
 
 Nothing here is vendor- or hardware-specific — every component ships with Windows or with winget, so
 SunUp runs on any Windows box. (v0.14.0 removed the Dell Command Update integration; see the
@@ -298,6 +305,8 @@ defaults):
 | `winget.selfHostPattern` | `Microsoft\.PowerShell\|Microsoft\.DesktopAppInstaller` | packages that host the engine's own process. The engine does **not** upgrade these — it hands them to `SelfHost.ps1` (see below) |
 | `winget.selfHostInstallerArgs` | `MSIRESTARTMANAGERCONTROL=Disable REBOOT=ReallySuppress` | **unused since v0.12.0**, retained so existing configs load. Passing this via `--custom` did not stop Restart Manager (measured 2026-07-28) |
 | `psModules.everyDays` | `7` | run PowerShell-module updates at most this often |
+| `hygiene.enabled` | `true` | read-only hygiene checks. Silent on a healthy box, so leaving it on costs one report line |
+| `hygiene.minFreeGB` | `25` | free-space threshold — the **only** size check here. Size heuristics were rejected everywhere else: the biggest directories on a dev box are usually deliberate (a pinned Rust toolchain, a NuGet cache), and a threshold that fires every run against intentional state is how an alert log becomes wallpaper |
 
 ### Per-user packages (`SunUp-User`)
 

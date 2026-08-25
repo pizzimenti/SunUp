@@ -104,6 +104,9 @@ Copy-Item (Join-Path $PSScriptRoot 'RebootState.ps1')      $Bin -Force
 # The Windows Update policy SunUp's install ownership depends on. Shipped to bin so -Mode Status can
 # report it on a deployed box, not only in a checkout.
 Copy-Item (Join-Path $PSScriptRoot 'WuPolicy.ps1')         $Bin -Force
+# Read-only hygiene checks (v0.21.0). Also runnable on its own from bin for an on-demand audit:
+#   pwsh -File C:\ProgramData\SunUp\bin\Hygiene.ps1
+Copy-Item (Join-Path $PSScriptRoot 'Hygiene.ps1')          $Bin -Force
 # The restart toast and the protocol handler behind its buttons. Windows PowerShell 5.1 only -- the
 # WinRT toast APIs do not project into pwsh 7.
 Copy-Item (Join-Path $PSScriptRoot 'Show-RestartToast.ps1') $Bin -Force
